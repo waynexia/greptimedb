@@ -482,6 +482,9 @@ pub enum Error {
         violated: String,
         location: Location,
     },
+
+    #[snafu(display("Unsupported gRPC request, kind: {}, location: {}", kind, location))]
+    UnsupportedGrpcRequest { kind: String, location: Location },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -570,7 +573,9 @@ impl ErrorExt for Error {
             OpenLogStore { source, .. } => source.status_code(),
             RuntimeResource { .. } => StatusCode::RuntimeResourcesExhausted,
             MetaClientInit { source, .. } => source.status_code(),
-            TableIdProviderNotFound { .. } => StatusCode::Unsupported,
+            TableIdProviderNotFound { .. } | UnsupportedGrpcRequest { .. } => {
+                StatusCode::Unsupported
+            }
             BumpTableId { source, .. } => source.status_code(),
             ColumnDefaultValue { source, .. } => source.status_code(),
             UnrecognizedTableOption { .. } => StatusCode::InvalidArguments,
