@@ -17,11 +17,15 @@
 use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_compat::CompatExt;
 use async_trait::async_trait;
 use bytes::Bytes;
+use common_telemetry::{debug, info};
 use common_time::range::TimestampRange;
+use datafusion::datasource::physical_plan::ParquetFileMetrics;
+use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datatypes::arrow::record_batch::RecordBatch;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
@@ -45,6 +49,7 @@ use crate::error::{
 use crate::read::{Batch, BatchReader};
 use crate::sst::file::{FileHandle, FileId};
 use crate::sst::parquet::format::ReadFormat;
+use crate::sst::parquet::page_prune::PagePruningPredicateBuilder;
 use crate::sst::parquet::stats::RowGroupPruningStats;
 use crate::sst::parquet::PARQUET_METADATA_KEY;
 
@@ -180,8 +185,8 @@ impl ParquetReaderBuilder {
             }
         );
 
-        // Prune row groups by metadata.
         if let Some(predicate) = &self.predicate {
+            // Prune row groups.
             let stats = RowGroupPruningStats::new(
                 builder.metadata().row_groups(),
                 &read_format,
@@ -193,9 +198,30 @@ impl ParquetReaderBuilder {
                 .enumerate()
                 .filter_map(|(idx, valid)| if valid { Some(idx) } else { None })
                 .collect::<Vec<_>>();
-            builder = builder.with_row_groups(pruned_row_groups);
-        }
+            builder = builder.with_row_groups(pruned_row_groups.clone());
 
+            // Prune pages.
+            if let Some(page_predicate) =
+                PagePruningPredicateBuilder::build(predicate.clone(), read_format.clone())
+            {
+                // TODO: Pass metrics from the execution plan.
+                let empty_metrics =
+                    ParquetFileMetrics::new(0, "placeholder", &ExecutionPlanMetricsSet::new());
+                let now = Instant::now();
+                let pruned = page_predicate
+                    .prune(&pruned_row_groups, builder.metadata(), &empty_metrics)
+                    .map_err(|e| {
+                        debug!("Failed to prune pages: {}", e);
+                    })
+                    .ok()
+                    .flatten();
+                let elapsed = now.elapsed();
+                info!("[DEBUG] prune takes {:?}, result: {:?}", elapsed, pruned);
+                if let Some(row_selection) = pruned {
+                    builder = builder.with_row_selection(row_selection);
+                }
+            }
+        }
         let parquet_schema_desc = builder.metadata().file_metadata().schema_descr();
         if let Some(column_ids) = self.projection.as_ref() {
             let indices = read_format.projection_indices(column_ids.iter().copied());

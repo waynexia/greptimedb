@@ -15,6 +15,7 @@
 //! SST in parquet format.
 
 mod format;
+mod page_prune;
 pub mod reader;
 mod stats;
 pub mod writer;

@@ -113,6 +113,7 @@ impl WriteFormat {
 }
 
 /// Helper for reading the SST format.
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ReadFormat {
     metadata: RegionMetadataRef,
     /// SST file schema.
@@ -146,6 +147,14 @@ impl ReadFormat {
     /// Gets the metadata of the SST.
     pub(crate) fn metadata(&self) -> &RegionMetadataRef {
         &self.metadata
+    }
+
+    /// Check if the semantic type of `col` is Tag
+    pub(crate) fn is_tag_column(&self, col: &str) -> bool {
+        self.metadata
+            .column_by_name(col)
+            .map(|c| c.semantic_type == SemanticType::Tag)
+            .unwrap_or(false)
     }
 
     /// Gets sorted projection indices to read `columns` from parquet files.
@@ -472,12 +481,12 @@ impl ReadFormat {
     }
 
     /// Field index of the primary key.
-    fn primary_key_position(&self) -> usize {
+    pub(crate) fn primary_key_position(&self) -> usize {
         self.arrow_schema.fields.len() - 3
     }
 
     /// Field index of the time index.
-    fn time_index_position(&self) -> usize {
+    pub(crate) fn time_index_position(&self) -> usize {
         self.arrow_schema.fields.len() - FIXED_POS_COLUMN_NUM
     }
 }

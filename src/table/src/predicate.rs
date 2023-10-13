@@ -38,9 +38,9 @@ mod stats;
 #[derive(Clone)]
 pub struct Predicate {
     /// The schema of the table that the expressions being applied.
-    schema: SchemaRef,
+    pub schema: SchemaRef,
     /// Physical expressions of this predicate.
-    exprs: Vec<Arc<dyn PhysicalExpr>>,
+    pub exprs: Vec<Arc<dyn PhysicalExpr>>,
 }
 
 impl Predicate {

@@ -47,7 +47,7 @@ pub trait RowCodec {
     fn decode(&self, bytes: &[u8]) -> Result<Vec<Value>>;
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct SortField {
     data_type: ConcreteDataType,
 }
@@ -210,7 +210,7 @@ impl SortField {
 }
 
 /// A memory-comparable row [Value] encoder/decoder.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct McmpRowCodec {
     fields: Vec<SortField>,
 }
