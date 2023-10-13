@@ -20,16 +20,18 @@ use std::fmt::Display;
 use std::hash::Hash;
 use std::sync::Arc;
 
+use common_telemetry::info;
 use datafusion::arrow::array::DictionaryArray;
 use datafusion::arrow::datatypes::{DataType as DfDataType, Schema, UInt16Type};
 use datafusion::datasource::physical_plan::parquet::page_filter::PagePruningPredicate;
 use datafusion::error::{DataFusionError, Result as DfResult};
-use datafusion::physical_plan::expressions::{BinaryExpr, Column};
+use datafusion::physical_plan::expressions::{BinaryExpr, Column, Literal};
 use datafusion::physical_plan::PhysicalExpr;
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::ScalarValue;
 use datafusion_expr::{ColumnarValue, Operator};
 use datatypes::prelude::{ConcreteDataType, DataType};
+use datatypes::value::ValueRef;
 use store_api::storage::consts::PRIMARY_KEY_COLUMN_NAME;
 use table::predicate::Predicate;
 
@@ -110,6 +112,8 @@ impl PhysicalExpr for DecodePrimaryKey {
     fn evaluate(&self, batch: &common_recordbatch::DfRecordBatch) -> DfResult<ColumnarValue> {
         let encoded_col = self.encoded_column.evaluate(batch)?;
 
+        info!("[DEBUG] encoded_col: {:?}", encoded_col);
+
         match encoded_col {
             ColumnarValue::Array(array) => {
                 let array = array
@@ -174,13 +178,14 @@ impl std::fmt::Debug for DecodePrimaryKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DecodePrimaryKey")
             .field("column", &self.required_column_name)
+            .field("child", &self.encoded_column)
             .finish()
     }
 }
 
 impl Display for DecodePrimaryKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.required_column_name)
+        write!(f, "{} @ {}", self.required_column_name, self.encoded_column)
     }
 }
 
@@ -213,15 +218,19 @@ impl PagePruningPredicateBuilder {
     pub(crate) fn build(
         predicate: Predicate,
         read_format: ReadFormat,
+        file_schema: &Arc<Schema>,
     ) -> Option<PagePruningPredicate> {
+        info!("[DEBUG] original predicates: {:?}", predicate.exprs);
         let page_filter_exprs = Self::filter_map_physical_expr(predicate, &read_format);
+        info!("[DEBUG] page filter exprs: {:?}", page_filter_exprs);
         if page_filter_exprs.is_empty() {
             return None;
         }
         let conjoined = Self::conjoin_exprs(page_filter_exprs);
         PagePruningPredicate::try_new(
             &conjoined,
-            read_format.metadata().schema.arrow_schema().clone(),
+            // read_format.metadata().schema.arrow_schema().clone(),
+            file_schema.clone(),
         )
         .ok()
     }
@@ -243,6 +252,7 @@ impl PagePruningPredicateBuilder {
             .primary_key
             .get(0)
             .and_then(|id| read_format.metadata().column_by_id(*id));
+        info!("[DEBUG] first primary key: {:?}", first_primary_key);
         let valid_set = read_format
             .metadata()
             .field_columns()
@@ -250,25 +260,45 @@ impl PagePruningPredicateBuilder {
             .chain(Some(read_format.metadata().time_index_column()))
             .map(|c| c.column_schema.name.clone())
             .collect::<HashSet<_>>();
+        info!("[DEBUG] valid columns: {:?}", valid_set);
 
         // transform exprs
         predicate
             .exprs
             .into_iter()
             .filter_map(|e| {
-                e.transform(&|e| {
-                    if let Some(c) = e.as_any().downcast_ref::<Column>() {
-                        if valid_set.contains(c.name()) {
-                            Ok(Self::transform_expr(read_format, c.clone()))
-                        } else {
-                            // Just throw a whatever error to indicate that this column is not valid.
-                            Err(DataFusionError::Internal("not a valid column".to_string()))
-                        }
-                    } else {
-                        Ok(Transformed::No(e))
+                // e.transform(&|e| {
+                //     if let Some(c) = e.as_any().downcast_ref::<Column>() {
+                //         if valid_set.contains(c.name()) {
+                //             Ok(Self::transform_expr(read_format, c.clone(), e.clone()))
+                //         } else {
+                //             info!("[DEBUG] not a valid column: {:?}", c);
+                //             // Just throw a whatever error to indicate that this column is not valid.
+                //             Err(DataFusionError::Internal("not a valid column".to_string()))
+                //         }
+                //     } else {
+                //         Ok(Transformed::No(e))
+                //     }
+                // })
+                // .ok()
+                let Some(binary_expr) = e.as_any().downcast_ref::<BinaryExpr>() else {
+                    return Some(e);
+                };
+                // assume col is on the left
+                let Some(col) = binary_expr.left().as_any().downcast_ref::<Column>() else {
+                    return Some(e);
+                };
+                // if valid_set.contains(c.name())
+                if let Some(first_pk) = first_primary_key && first_pk.column_schema.name == col.name(){
+                    // return Some(Self::rewrite_primary_key_eq(&read_format, e.clone()))
+                    let transformed = Self::rewrite_primary_key_eq(&read_format, e.clone());
+                    if let Transformed::Yes(e) = transformed {
+                        return Some(e);
+                    } else{
+                        return None;
                     }
-                })
-                .ok()
+                }
+                Some(e)
             })
             .collect()
     }
@@ -280,16 +310,59 @@ impl PagePruningPredicateBuilder {
     fn transform_expr(
         read_format: &ReadFormat,
         original: Column,
+        outermost: Arc<dyn PhysicalExpr>,
     ) -> Transformed<Arc<dyn PhysicalExpr>> {
         // only transform primary keys
         if !read_format.is_tag_column(original.name()) {
             return Transformed::No(Arc::new(original));
         }
 
+        info!("[DEBUG] transformed column: {:?}", original);
+
         Transformed::Yes(Arc::new(DecodePrimaryKey::new(
             read_format.clone(),
             original.name(),
         )))
+    }
+
+    fn rewrite_primary_key_eq(
+        read_format: &ReadFormat,
+        outermost: Arc<dyn PhysicalExpr>,
+    ) -> Transformed<Arc<dyn PhysicalExpr>> {
+        let Some(binary_expr) = outermost.as_any().downcast_ref::<BinaryExpr>() else {
+            return Transformed::No(outermost);
+        };
+        // assume literal is on the right
+        let Some(lit) = binary_expr.right().as_any().downcast_ref::<Literal>() else {
+            return Transformed::No(outermost);
+        };
+        let ScalarValue::Utf8(Some(lit)) = lit.value() else {
+            return Transformed::No(outermost);
+        };
+
+        let encoder = McmpRowCodec::new(vec![SortField::new(ConcreteDataType::string_datatype())]);
+        let lower_bound = encoder.encode([ValueRef::String(lit)].into_iter()).unwrap();
+        let upper_bound = get_prefix_end_key(&lower_bound);
+
+        let pk_col = Arc::new(Column::new(
+            PRIMARY_KEY_COLUMN_NAME,
+            read_format.primary_key_position(),
+        ));
+        let transformed = Arc::new(BinaryExpr::new(
+            Arc::new(BinaryExpr::new(
+                pk_col.clone(),
+                Operator::GtEq,
+                Arc::new(Literal::new(ScalarValue::Binary(Some(lower_bound)))),
+            )),
+            Operator::And,
+            Arc::new(BinaryExpr::new(
+                pk_col.clone(),
+                Operator::Lt,
+                Arc::new(Literal::new(ScalarValue::Binary(Some(upper_bound)))),
+            )),
+        ));
+        info!("[DEBUG] transformed pk eq expr: {:?}", transformed);
+        Transformed::Yes(transformed)
     }
 
     /// Conjoin exprs with `AND`
@@ -304,4 +377,17 @@ impl PagePruningPredicateBuilder {
             Arc::new(BinaryExpr::new(acc, Operator::And, e))
         })
     }
+}
+
+pub fn get_prefix_end_key(key: &[u8]) -> Vec<u8> {
+    for (i, v) in key.iter().enumerate().rev() {
+        if *v < 0xFF {
+            let mut end = Vec::from(&key[..=i]);
+            end[i] = *v + 1;
+            return end;
+        }
+    }
+
+    // next prefix does not exist (e.g., 0xffff);
+    vec![0]
 }

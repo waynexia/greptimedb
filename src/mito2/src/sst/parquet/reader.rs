@@ -22,7 +22,7 @@ use std::time::Instant;
 use async_compat::CompatExt;
 use async_trait::async_trait;
 use bytes::Bytes;
-use common_telemetry::{debug, info};
+use common_telemetry::{debug, error, info};
 use common_time::range::TimestampRange;
 use datafusion::datasource::physical_plan::ParquetFileMetrics;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
@@ -201,9 +201,14 @@ impl ParquetReaderBuilder {
             builder = builder.with_row_groups(pruned_row_groups.clone());
 
             // Prune pages.
-            if let Some(page_predicate) =
-                PagePruningPredicateBuilder::build(predicate.clone(), read_format.clone())
-            {
+            if let Some(page_predicate) = PagePruningPredicateBuilder::build(
+                predicate.clone(),
+                read_format.clone(),
+                builder.schema(),
+            ) {
+                info!("[DEBUG] transformed predicate: {:?}", page_predicate);
+                info!("[DEBUG] pruned row groups: {:?}", pruned_row_groups);
+
                 // TODO: Pass metrics from the execution plan.
                 let empty_metrics =
                     ParquetFileMetrics::new(0, "placeholder", &ExecutionPlanMetricsSet::new());
@@ -211,7 +216,7 @@ impl ParquetReaderBuilder {
                 let pruned = page_predicate
                     .prune(&pruned_row_groups, builder.metadata(), &empty_metrics)
                     .map_err(|e| {
-                        debug!("Failed to prune pages: {}", e);
+                        error!("Failed to prune pages: {}", e);
                     })
                     .ok()
                     .flatten();
