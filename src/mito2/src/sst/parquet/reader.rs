@@ -31,6 +31,7 @@ use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use futures::{FutureExt, TryStreamExt};
 use object_store::ObjectStore;
+use parquet::arrow::arrow_reader::ArrowReaderOptions;
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::errors::ParquetError;
@@ -150,7 +151,8 @@ impl ParquetReaderBuilder {
             region_id: self.file_handle.region_id(),
             file_id: self.file_handle.file_id(),
         };
-        let mut builder = ParquetRecordBatchStreamBuilder::new(reader)
+        let reader_options = ArrowReaderOptions::new().with_page_index(true);
+        let mut builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, reader_options)
             .await
             .context(ReadParquetSnafu { path: file_path })?;
 
