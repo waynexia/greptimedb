@@ -112,8 +112,6 @@ impl PhysicalExpr for DecodePrimaryKey {
     fn evaluate(&self, batch: &common_recordbatch::DfRecordBatch) -> DfResult<ColumnarValue> {
         let encoded_col = self.encoded_column.evaluate(batch)?;
 
-        info!("[DEBUG] encoded_col: {:?}", encoded_col);
-
         match encoded_col {
             ColumnarValue::Array(array) => {
                 let array = array
@@ -220,9 +218,7 @@ impl PagePruningPredicateBuilder {
         read_format: ReadFormat,
         file_schema: &Arc<Schema>,
     ) -> Option<PagePruningPredicate> {
-        info!("[DEBUG] original predicates: {:?}", predicate.exprs);
         let page_filter_exprs = Self::filter_map_physical_expr(predicate, &read_format);
-        info!("[DEBUG] page filter exprs: {:?}", page_filter_exprs);
         if page_filter_exprs.is_empty() {
             return None;
         }
@@ -252,7 +248,6 @@ impl PagePruningPredicateBuilder {
             .primary_key
             .get(0)
             .and_then(|id| read_format.metadata().column_by_id(*id));
-        info!("[DEBUG] first primary key: {:?}", first_primary_key);
         let valid_set = read_format
             .metadata()
             .field_columns()
@@ -260,7 +255,6 @@ impl PagePruningPredicateBuilder {
             .chain(Some(read_format.metadata().time_index_column()))
             .map(|c| c.column_schema.name.clone())
             .collect::<HashSet<_>>();
-        info!("[DEBUG] valid columns: {:?}", valid_set);
 
         // transform exprs
         predicate
@@ -317,8 +311,6 @@ impl PagePruningPredicateBuilder {
             return Transformed::No(Arc::new(original));
         }
 
-        info!("[DEBUG] transformed column: {:?}", original);
-
         Transformed::Yes(Arc::new(DecodePrimaryKey::new(
             read_format.clone(),
             original.name(),
@@ -361,7 +353,6 @@ impl PagePruningPredicateBuilder {
                 Arc::new(Literal::new(ScalarValue::Binary(Some(upper_bound)))),
             )),
         ));
-        info!("[DEBUG] transformed pk eq expr: {:?}", transformed);
         Transformed::Yes(transformed)
     }
 

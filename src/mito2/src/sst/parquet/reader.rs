@@ -208,9 +208,6 @@ impl ParquetReaderBuilder {
                 read_format.clone(),
                 builder.schema(),
             ) {
-                info!("[DEBUG] transformed predicate: {:?}", page_predicate);
-                info!("[DEBUG] pruned row groups: {:?}", pruned_row_groups);
-
                 // TODO: Pass metrics from the execution plan.
                 let empty_metrics =
                     ParquetFileMetrics::new(0, "placeholder", &ExecutionPlanMetricsSet::new());
@@ -223,7 +220,6 @@ impl ParquetReaderBuilder {
                     .ok()
                     .flatten();
                 let elapsed = now.elapsed();
-                info!("[DEBUG] prune takes {:?}, result: {:?}", elapsed, pruned);
                 if let Some(row_selection) = pruned {
                     builder = builder.with_row_selection(row_selection);
                 }
