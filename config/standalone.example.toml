@@ -82,6 +82,8 @@ enable = true
 
 # WAL options.
 [wal]
+# WAL data directory
+# dir = "/tmp/greptimedb/wal"
 # WAL file size in bytes.
 file_size = "256MB"
 # WAL purge threshold.
@@ -93,8 +95,8 @@ read_batch_size = 128
 # Whether to sync log file after every write.
 sync_write = false
 
-# Kv options.
-[kv_store]
+# Metadata storage options.
+[metadata_store]
 # Kv file size in bytes.
 file_size = "256MB"
 # Kv purge threshold.
@@ -118,7 +120,7 @@ type = "File"
 # Cache configuration for object storage such as 'S3' etc.
 # cache_path = "/path/local_cache"
 # The local file cache capacity in bytes.
-# cache_capacity = "256Mib"
+# cache_capacity = "256MB"
 
 # Compaction options.
 [storage.compaction]

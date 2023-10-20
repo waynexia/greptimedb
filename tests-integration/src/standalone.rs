@@ -74,7 +74,7 @@ impl GreptimeDbStandaloneBuilder {
         .await
         .unwrap();
 
-        let plugins = Arc::new(self.plugin.unwrap_or_default());
+        let plugins = self.plugin.unwrap_or_default();
 
         let datanode = DatanodeBuilder::new(opts.clone(), Some(kv_store.clone()), plugins.clone())
             .build()
@@ -92,7 +92,7 @@ impl GreptimeDbStandaloneBuilder {
             .init()
             .await
             .unwrap();
-
+        procedure_manager.start().await.unwrap();
         let instance = Instance::try_new_standalone(
             kv_store,
             procedure_manager,

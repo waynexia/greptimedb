@@ -204,7 +204,7 @@ checksum = "8f1f8f5a6f3d50d89e3797d7593a50f96bb2aaa20ca0cc7be1fb673232c91d72"
 
 [[package]]
 name = "api"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "common-base",
  "common-error",
@@ -666,7 +666,7 @@ dependencies = [
 
 [[package]]
 name = "auth"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "api",
  "async-trait",
@@ -839,11 +839,13 @@ dependencies = [
 
 [[package]]
 name = "benchmarks"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "arrow",
+ "chrono",
  "clap 4.4.1",
  "client",
+ "futures-util",
  "indicatif",
  "itertools 0.10.5",
  "parquet",
@@ -1220,7 +1222,7 @@ checksum = "37b2a672a2cb129a2e41c10b1224bb368f9f37a2b16b612598138befd7b37eb5"
 
 [[package]]
 name = "catalog"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "api",
  "arc-swap",
@@ -1504,7 +1506,7 @@ checksum = "cd7cc57abe963c6d3b9d8be5b06ba7c8957a930305ca90304f24ef040aa6f961"
 
 [[package]]
 name = "client"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "api",
  "arrow-flight",
@@ -1534,7 +1536,7 @@ dependencies = [
  "rand",
  "session",
  "snafu",
- "substrait 0.4.0-nightly",
+ "substrait 0.4.1",
  "substrait 0.7.5",
  "tokio",
  "tokio-stream",
@@ -1571,7 +1573,7 @@ dependencies = [
 
 [[package]]
 name = "cmd"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "anymap",
  "async-trait",
@@ -1607,6 +1609,7 @@ dependencies = [
  "mito2",
  "nu-ansi-term",
  "partition",
+ "plugins",
  "prost",
  "query",
  "rand",
@@ -1618,7 +1621,7 @@ dependencies = [
  "servers",
  "session",
  "snafu",
- "substrait 0.4.0-nightly",
+ "substrait 0.4.1",
  "table",
  "temp-env",
  "tikv-jemallocator",
@@ -1651,7 +1654,7 @@ checksum = "55b672471b4e9f9e95499ea597ff64941a309b2cdbffcc46f2cc5e2d971fd335"
 
 [[package]]
 name = "common-base"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "anymap",
  "bitvec",
@@ -1666,7 +1669,7 @@ dependencies = [
 
 [[package]]
 name = "common-catalog"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "chrono",
  "common-error",
@@ -1679,7 +1682,7 @@ dependencies = [
 
 [[package]]
 name = "common-config"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "common-base",
  "humantime-serde",
@@ -1688,7 +1691,7 @@ dependencies = [
 
 [[package]]
 name = "common-datasource"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -1717,7 +1720,7 @@ dependencies = [
 
 [[package]]
 name = "common-error"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "snafu",
  "strum 0.25.0",
@@ -1725,7 +1728,7 @@ dependencies = [
 
 [[package]]
 name = "common-function"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "arc-swap",
  "chrono-tz 0.6.3",
@@ -1748,7 +1751,7 @@ dependencies = [
 
 [[package]]
 name = "common-greptimedb-telemetry"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "common-error",
@@ -1767,7 +1770,7 @@ dependencies = [
 
 [[package]]
 name = "common-grpc"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "api",
  "arrow-flight",
@@ -1797,7 +1800,7 @@ dependencies = [
 
 [[package]]
 name = "common-grpc-expr"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "api",
  "async-trait",
@@ -1816,7 +1819,7 @@ dependencies = [
 
 [[package]]
 name = "common-macro"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "arc-swap",
  "backtrace",
@@ -1833,7 +1836,7 @@ dependencies = [
 
 [[package]]
 name = "common-mem-prof"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "common-error",
  "common-macro",
@@ -1846,12 +1849,14 @@ dependencies = [
 
 [[package]]
 name = "common-meta"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "api",
  "arrow-flight",
  "async-stream",
  "async-trait",
+ "base64 0.21.3",
+ "bytes",
  "chrono",
  "common-catalog",
  "common-error",
@@ -1882,7 +1887,7 @@ dependencies = [
 
 [[package]]
 name = "common-procedure"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1906,7 +1911,7 @@ dependencies = [
 
 [[package]]
 name = "common-procedure-test"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "common-procedure",
@@ -1914,7 +1919,7 @@ dependencies = [
 
 [[package]]
 name = "common-query"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "api",
  "async-trait",
@@ -1937,7 +1942,7 @@ dependencies = [
 
 [[package]]
 name = "common-recordbatch"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "common-error",
  "common-macro",
@@ -1954,7 +1959,7 @@ dependencies = [
 
 [[package]]
 name = "common-runtime"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "common-error",
@@ -1971,7 +1976,7 @@ dependencies = [
 
 [[package]]
 name = "common-telemetry"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "backtrace",
  "common-error",
@@ -1998,7 +2003,7 @@ dependencies = [
 
 [[package]]
 name = "common-test-util"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "once_cell",
  "rand",
@@ -2007,7 +2012,7 @@ dependencies = [
 
 [[package]]
 name = "common-time"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "arrow",
  "chrono",
@@ -2022,7 +2027,7 @@ dependencies = [
 
 [[package]]
 name = "common-version"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "build-data",
 ]
@@ -2476,7 +2481,7 @@ dependencies = [
 [[package]]
 name = "datafusion"
 version = "27.0.0"
-source = "git+https://github.com/waynexia/arrow-datafusion.git?rev=c0b0fca548e99d020c76e1a1cd7132aab26000e1#c0b0fca548e99d020c76e1a1cd7132aab26000e1"
+source = "git+https://github.com/waynexia/arrow-datafusion.git?rev=b6f3b28b6fe91924cc8dd3d83726b766f2a706ec#b6f3b28b6fe91924cc8dd3d83726b766f2a706ec"
 dependencies = [
  "ahash 0.8.3",
  "arrow",
@@ -2524,7 +2529,7 @@ dependencies = [
 [[package]]
 name = "datafusion-common"
 version = "27.0.0"
-source = "git+https://github.com/waynexia/arrow-datafusion.git?rev=c0b0fca548e99d020c76e1a1cd7132aab26000e1#c0b0fca548e99d020c76e1a1cd7132aab26000e1"
+source = "git+https://github.com/waynexia/arrow-datafusion.git?rev=b6f3b28b6fe91924cc8dd3d83726b766f2a706ec#b6f3b28b6fe91924cc8dd3d83726b766f2a706ec"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -2538,7 +2543,7 @@ dependencies = [
 [[package]]
 name = "datafusion-execution"
 version = "27.0.0"
-source = "git+https://github.com/waynexia/arrow-datafusion.git?rev=c0b0fca548e99d020c76e1a1cd7132aab26000e1#c0b0fca548e99d020c76e1a1cd7132aab26000e1"
+source = "git+https://github.com/waynexia/arrow-datafusion.git?rev=b6f3b28b6fe91924cc8dd3d83726b766f2a706ec#b6f3b28b6fe91924cc8dd3d83726b766f2a706ec"
 dependencies = [
  "dashmap",
  "datafusion-common",
@@ -2555,7 +2560,7 @@ dependencies = [
 [[package]]
 name = "datafusion-expr"
 version = "27.0.0"
-source = "git+https://github.com/waynexia/arrow-datafusion.git?rev=c0b0fca548e99d020c76e1a1cd7132aab26000e1#c0b0fca548e99d020c76e1a1cd7132aab26000e1"
+source = "git+https://github.com/waynexia/arrow-datafusion.git?rev=b6f3b28b6fe91924cc8dd3d83726b766f2a706ec#b6f3b28b6fe91924cc8dd3d83726b766f2a706ec"
 dependencies = [
  "ahash 0.8.3",
  "arrow",
@@ -2569,7 +2574,7 @@ dependencies = [
 [[package]]
 name = "datafusion-optimizer"
 version = "27.0.0"
-source = "git+https://github.com/waynexia/arrow-datafusion.git?rev=c0b0fca548e99d020c76e1a1cd7132aab26000e1#c0b0fca548e99d020c76e1a1cd7132aab26000e1"
+source = "git+https://github.com/waynexia/arrow-datafusion.git?rev=b6f3b28b6fe91924cc8dd3d83726b766f2a706ec#b6f3b28b6fe91924cc8dd3d83726b766f2a706ec"
 dependencies = [
  "arrow",
  "async-trait",
@@ -2586,7 +2591,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-expr"
 version = "27.0.0"
-source = "git+https://github.com/waynexia/arrow-datafusion.git?rev=c0b0fca548e99d020c76e1a1cd7132aab26000e1#c0b0fca548e99d020c76e1a1cd7132aab26000e1"
+source = "git+https://github.com/waynexia/arrow-datafusion.git?rev=b6f3b28b6fe91924cc8dd3d83726b766f2a706ec#b6f3b28b6fe91924cc8dd3d83726b766f2a706ec"
 dependencies = [
  "ahash 0.8.3",
  "arrow",
@@ -2621,7 +2626,7 @@ dependencies = [
 [[package]]
 name = "datafusion-row"
 version = "27.0.0"
-source = "git+https://github.com/waynexia/arrow-datafusion.git?rev=c0b0fca548e99d020c76e1a1cd7132aab26000e1#c0b0fca548e99d020c76e1a1cd7132aab26000e1"
+source = "git+https://github.com/waynexia/arrow-datafusion.git?rev=b6f3b28b6fe91924cc8dd3d83726b766f2a706ec#b6f3b28b6fe91924cc8dd3d83726b766f2a706ec"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -2632,7 +2637,7 @@ dependencies = [
 [[package]]
 name = "datafusion-sql"
 version = "27.0.0"
-source = "git+https://github.com/waynexia/arrow-datafusion.git?rev=c0b0fca548e99d020c76e1a1cd7132aab26000e1#c0b0fca548e99d020c76e1a1cd7132aab26000e1"
+source = "git+https://github.com/waynexia/arrow-datafusion.git?rev=b6f3b28b6fe91924cc8dd3d83726b766f2a706ec#b6f3b28b6fe91924cc8dd3d83726b766f2a706ec"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -2645,7 +2650,7 @@ dependencies = [
 [[package]]
 name = "datafusion-substrait"
 version = "27.0.0"
-source = "git+https://github.com/waynexia/arrow-datafusion.git?rev=c0b0fca548e99d020c76e1a1cd7132aab26000e1#c0b0fca548e99d020c76e1a1cd7132aab26000e1"
+source = "git+https://github.com/waynexia/arrow-datafusion.git?rev=b6f3b28b6fe91924cc8dd3d83726b766f2a706ec#b6f3b28b6fe91924cc8dd3d83726b766f2a706ec"
 dependencies = [
  "async-recursion",
  "chrono",
@@ -2660,7 +2665,7 @@ dependencies = [
 
 [[package]]
 name = "datanode"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "api",
  "arrow-flight",
@@ -2719,7 +2724,7 @@ dependencies = [
  "sql",
  "storage",
  "store-api",
- "substrait 0.4.0-nightly",
+ "substrait 0.4.1",
  "table",
  "tokio",
  "tokio-stream",
@@ -2733,7 +2738,7 @@ dependencies = [
 
 [[package]]
 name = "datatypes"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3196,7 +3201,7 @@ dependencies = [
 
 [[package]]
 name = "file-engine"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "api",
  "async-trait",
@@ -3306,7 +3311,7 @@ dependencies = [
 
 [[package]]
 name = "frontend"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "api",
  "arc-swap",
@@ -3370,7 +3375,7 @@ dependencies = [
  "storage",
  "store-api",
  "strfmt",
- "substrait 0.4.0-nightly",
+ "substrait 0.4.1",
  "table",
  "tokio",
  "toml 0.7.6",
@@ -5001,7 +5006,7 @@ checksum = "b5e6163cb8c49088c2c36f57875e58ccd8c87c7427f7fbd50ea6710b2f3f2e8f"
 
 [[package]]
 name = "log-store"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -5271,7 +5276,7 @@ dependencies = [
 
 [[package]]
 name = "meta-client"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "api",
  "async-trait",
@@ -5284,6 +5289,7 @@ dependencies = [
  "datatypes",
  "etcd-client",
  "futures",
+ "humantime-serde",
  "meta-srv",
  "rand",
  "serde",
@@ -5300,7 +5306,7 @@ dependencies = [
 
 [[package]]
 name = "meta-srv"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "anymap",
  "api",
@@ -5492,11 +5498,12 @@ dependencies = [
 
 [[package]]
 name = "mito2"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "anymap",
  "api",
  "aquamarine",
+ "arc-swap",
  "async-channel",
  "async-compat",
  "async-stream",
@@ -5953,7 +5960,7 @@ dependencies = [
 
 [[package]]
 name = "object-store"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6177,7 +6184,7 @@ dependencies = [
 
 [[package]]
 name = "operator"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "api",
  "async-compat",
@@ -6222,7 +6229,7 @@ dependencies = [
  "sqlparser 0.34.0",
  "storage",
  "store-api",
- "substrait 0.4.0-nightly",
+ "substrait 0.4.1",
  "table",
  "tokio",
  "tonic 0.9.2",
@@ -6442,7 +6449,7 @@ dependencies = [
 
 [[package]]
 name = "partition"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "api",
  "async-trait",
@@ -6767,6 +6774,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "plugins"
+version = "0.4.1"
+dependencies = [
+ "auth",
+ "common-base",
+ "datanode",
+ "frontend",
+ "meta-srv",
+ "snafu",
+]
+
+[[package]]
 name = "pmutil"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7006,7 +7025,7 @@ dependencies = [
 
 [[package]]
 name = "promql"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -7020,6 +7039,7 @@ dependencies = [
  "datatypes",
  "futures",
  "greptime-proto",
+ "metrics",
  "promql-parser",
  "prost",
  "query",
@@ -7267,7 +7287,7 @@ dependencies = [
 
 [[package]]
 name = "query"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "ahash 0.8.3",
  "api",
@@ -7324,7 +7344,7 @@ dependencies = [
  "stats-cli",
  "store-api",
  "streaming-stats",
- "substrait 0.4.0-nightly",
+ "substrait 0.4.1",
  "table",
  "tokio",
  "tokio-stream",
@@ -8523,7 +8543,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "script"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "api",
  "arc-swap",
@@ -8803,7 +8823,7 @@ dependencies = [
 
 [[package]]
 name = "servers"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "aide",
  "api",
@@ -8897,7 +8917,7 @@ dependencies = [
 
 [[package]]
 name = "session"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "api",
  "arc-swap",
@@ -9175,7 +9195,7 @@ dependencies = [
 
 [[package]]
 name = "sql"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "api",
  "common-base",
@@ -9226,7 +9246,7 @@ dependencies = [
 
 [[package]]
 name = "sqlness-runner"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "clap 4.4.1",
@@ -9246,13 +9266,13 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.34.0"
-source = "git+https://github.com/GreptimeTeam/sqlparser-rs.git?rev=296a4f6c73b129d6f565a42a2e5e53c6bc2b9da4#296a4f6c73b129d6f565a42a2e5e53c6bc2b9da4"
+source = "git+https://github.com/GreptimeTeam/sqlparser-rs.git?rev=6cf9d23d5b8fbecd65efc1d9afb7e80ad7a424da#6cf9d23d5b8fbecd65efc1d9afb7e80ad7a424da"
 dependencies = [
  "lazy_static",
  "log",
  "regex",
  "sqlparser 0.35.0",
- "sqlparser_derive 0.1.1 (git+https://github.com/GreptimeTeam/sqlparser-rs.git?rev=296a4f6c73b129d6f565a42a2e5e53c6bc2b9da4)",
+ "sqlparser_derive 0.1.1 (git+https://github.com/GreptimeTeam/sqlparser-rs.git?rev=6cf9d23d5b8fbecd65efc1d9afb7e80ad7a424da)",
 ]
 
 [[package]]
@@ -9279,7 +9299,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.1.1"
-source = "git+https://github.com/GreptimeTeam/sqlparser-rs.git?rev=296a4f6c73b129d6f565a42a2e5e53c6bc2b9da4#296a4f6c73b129d6f565a42a2e5e53c6bc2b9da4"
+source = "git+https://github.com/GreptimeTeam/sqlparser-rs.git?rev=6cf9d23d5b8fbecd65efc1d9afb7e80ad7a424da#6cf9d23d5b8fbecd65efc1d9afb7e80ad7a424da"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -9432,7 +9452,7 @@ dependencies = [
 
 [[package]]
 name = "storage"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "api",
  "arc-swap",
@@ -9486,7 +9506,7 @@ dependencies = [
 
 [[package]]
 name = "store-api"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "api",
  "aquamarine",
@@ -9505,6 +9525,7 @@ dependencies = [
  "serde",
  "serde_json",
  "snafu",
+ "strum 0.25.0",
  "tokio",
 ]
 
@@ -9623,7 +9644,7 @@ dependencies = [
 
 [[package]]
 name = "substrait"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -9781,7 +9802,7 @@ dependencies = [
 
 [[package]]
 name = "table"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "anymap",
  "async-trait",
@@ -9887,7 +9908,7 @@ dependencies = [
 
 [[package]]
 name = "tests-integration"
-version = "0.4.0-nightly"
+version = "0.4.1"
 dependencies = [
  "api",
  "async-trait",
@@ -9940,7 +9961,7 @@ dependencies = [
  "sql",
  "sqlx",
  "store-api",
- "substrait 0.4.0-nightly",
+ "substrait 0.4.1",
  "table",
  "tempfile",
  "tokio",

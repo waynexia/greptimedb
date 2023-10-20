@@ -37,6 +37,18 @@ pub enum Error {
         source: common_meta::error::Error,
     },
 
+    #[snafu(display("Failed to start procedure manager"))]
+    StartProcedureManager {
+        location: Location,
+        source: common_procedure::error::Error,
+    },
+
+    #[snafu(display("Failed to stop procedure manager"))]
+    StopProcedureManager {
+        location: Location,
+        source: common_procedure::error::Error,
+    },
+
     #[snafu(display("Failed to start datanode"))]
     StartDatanode {
         location: Location,
@@ -84,12 +96,6 @@ pub enum Error {
 
     #[snafu(display("Illegal config: {}", msg))]
     IllegalConfig { msg: String, location: Location },
-
-    #[snafu(display("Illegal auth config"))]
-    IllegalAuthConfig {
-        location: Location,
-        source: auth::error::Error,
-    },
 
     #[snafu(display("Unsupported selector type: {}", selector_type))]
     UnsupportedSelectorType {
@@ -180,11 +186,44 @@ pub enum Error {
         location: Location,
     },
 
+    #[snafu(display("Failed to connect server at {addr}"))]
+    ConnectServer {
+        addr: String,
+        source: client::error::Error,
+        location: Location,
+    },
+
     #[snafu(display("Failed to serde json"))]
     SerdeJson {
         #[snafu(source)]
         error: serde_json::error::Error,
         location: Location,
+    },
+
+    #[snafu(display("Expect data from output, but got another thing"))]
+    NotDataFromOutput { location: Location },
+
+    #[snafu(display("Empty result from output"))]
+    EmptyResult { location: Location },
+
+    #[snafu(display("Failed to manipulate file"))]
+    FileIo {
+        location: Location,
+        #[snafu(source)]
+        error: std::io::Error,
+    },
+
+    #[snafu(display("Invalid database name: {}", database))]
+    InvalidDatabaseName {
+        location: Location,
+        database: String,
+    },
+
+    #[snafu(display("Failed to create directory {}", dir))]
+    CreateDir {
+        dir: String,
+        #[snafu(source)]
+        error: std::io::Error,
     },
 }
 
@@ -204,13 +243,18 @@ impl ErrorExt for Error {
             Error::IterStream { source, .. } | Error::InitMetadata { source, .. } => {
                 source.status_code()
             }
+            Error::ConnectServer { source, .. } => source.status_code(),
             Error::MissingConfig { .. }
             | Error::LoadLayeredConfig { .. }
             | Error::IllegalConfig { .. }
             | Error::InvalidReplCommand { .. }
-            | Error::IllegalAuthConfig { .. }
-            | Error::ConnectEtcd { .. } => StatusCode::InvalidArguments,
-
+            | Error::ConnectEtcd { .. }
+            | Error::NotDataFromOutput { .. }
+            | Error::CreateDir { .. }
+            | Error::EmptyResult { .. }
+            | Error::InvalidDatabaseName { .. } => StatusCode::InvalidArguments,
+            Error::StartProcedureManager { source, .. }
+            | Error::StopProcedureManager { source, .. } => source.status_code(),
             Error::ReplCreation { .. } | Error::Readline { .. } => StatusCode::Internal,
             Error::RequestDatabase { source, .. } => source.status_code(),
             Error::CollectRecordBatches { source, .. }
@@ -222,7 +266,7 @@ impl ErrorExt for Error {
             Error::SubstraitEncodeLogicalPlan { source, .. } => source.status_code(),
             Error::StartCatalogManager { source, .. } => source.status_code(),
 
-            Error::SerdeJson { .. } => StatusCode::Unexpected,
+            Error::SerdeJson { .. } | Error::FileIo { .. } => StatusCode::Unexpected,
         }
     }
 

@@ -31,6 +31,10 @@ pub struct Instance {
 
 impl Instance {
     pub async fn start(&mut self) -> Result<()> {
+        plugins::start_datanode_plugins(self.datanode.plugins())
+            .await
+            .context(StartDatanodeSnafu)?;
+
         self.datanode.start().await.context(StartDatanodeSnafu)
     }
 
@@ -92,6 +96,8 @@ struct StartCommand {
     #[clap(long)]
     data_home: Option<String>,
     #[clap(long)]
+    wal_dir: Option<String>,
+    #[clap(long)]
     http_addr: Option<String>,
     #[clap(long)]
     http_timeout: Option<u64>,
@@ -145,6 +151,10 @@ impl StartCommand {
             opts.storage.data_home = data_home.clone();
         }
 
+        if let Some(wal_dir) = &self.wal_dir {
+            opts.wal.dir = Some(wal_dir.clone());
+        }
+
         if let Some(http_addr) = &self.http_addr {
             opts.http.addr = http_addr.clone();
         }
@@ -159,11 +169,15 @@ impl StartCommand {
         Ok(Options::Datanode(Box::new(opts)))
     }
 
-    async fn build(self, opts: DatanodeOptions) -> Result<Instance> {
+    async fn build(self, mut opts: DatanodeOptions) -> Result<Instance> {
+        let plugins = plugins::setup_datanode_plugins(&mut opts)
+            .await
+            .context(StartDatanodeSnafu)?;
+
         logging::info!("Datanode start command: {:#?}", self);
         logging::info!("Datanode options: {:#?}", opts);
 
-        let datanode = DatanodeBuilder::new(opts, None, Default::default())
+        let datanode = DatanodeBuilder::new(opts, None, plugins)
             .build()
             .await
             .context(StartDatanodeSnafu)?;
@@ -180,6 +194,7 @@ mod tests {
     use common_base::readable_size::ReadableSize;
     use common_test_util::temp_dir::create_named_temp_file;
     use datanode::config::{CompactionConfig, FileConfig, ObjectStoreConfig, RegionManifestConfig};
+    use servers::heartbeat_options::HeartbeatOptions;
     use servers::Mode;
 
     use super::*;
@@ -196,11 +211,14 @@ mod tests {
             rpc_hostname = "127.0.0.1"
             rpc_runtime_size = 8
 
+            [heartbeat]
+            interval = "300ms"
+
             [meta_client]
             metasrv_addrs = ["127.0.0.1:3002"]
-            timeout_millis = 3000
-            connect_timeout_millis = 5000
-            ddl_timeout_millis= 10000
+            timeout = "3s"
+            connect_timeout = "5s"
+            ddl_timeout = "10s"
             tcp_nodelay = true
 
             [wal]
@@ -243,25 +261,33 @@ mod tests {
 
         assert_eq!("127.0.0.1:3001".to_string(), options.rpc_addr);
         assert_eq!(Some(42), options.node_id);
+        assert_eq!("/other/wal", options.wal.dir.unwrap());
 
         assert_eq!(Duration::from_secs(600), options.wal.purge_interval);
         assert_eq!(1024 * 1024 * 1024, options.wal.file_size.0);
         assert_eq!(1024 * 1024 * 1024 * 50, options.wal.purge_threshold.0);
         assert!(!options.wal.sync_write);
 
+        let HeartbeatOptions {
+            interval: heart_beat_interval,
+            ..
+        } = options.heartbeat;
+
+        assert_eq!(300, heart_beat_interval.as_millis());
+
         let MetaClientOptions {
             metasrv_addrs: metasrv_addr,
-            timeout_millis,
-            connect_timeout_millis,
+            timeout,
+            connect_timeout,
+            ddl_timeout,
             tcp_nodelay,
-            ddl_timeout_millis,
             ..
         } = options.meta_client.unwrap();
 
         assert_eq!(vec!["127.0.0.1:3002".to_string()], metasrv_addr);
-        assert_eq!(5000, connect_timeout_millis);
-        assert_eq!(10000, ddl_timeout_millis);
-        assert_eq!(3000, timeout_millis);
+        assert_eq!(5000, connect_timeout.as_millis());
+        assert_eq!(10000, ddl_timeout.as_millis());
+        assert_eq!(3000, timeout.as_millis());
         assert!(tcp_nodelay);
         assert_eq!("/tmp/greptimedb/", options.storage.data_home);
         assert!(matches!(
@@ -355,8 +381,8 @@ mod tests {
             rpc_runtime_size = 8
 
             [meta_client]
-            timeout_millis = 3000
-            connect_timeout_millis = 5000
+            timeout = "3s"
+            connect_timeout = "5s"
             tcp_nodelay = true
 
             [wal]
@@ -420,6 +446,7 @@ mod tests {
             || {
                 let command = StartCommand {
                     config_file: Some(file.path().to_str().unwrap().to_string()),
+                    wal_dir: Some("/other/wal/dir".to_string()),
                     env_prefix: env_prefix.to_string(),
                     ..Default::default()
                 };
@@ -446,6 +473,9 @@ mod tests {
 
                 // Should be read from config file, config file > env > default values.
                 assert_eq!(opts.storage.compaction.max_purge_tasks, 32);
+
+                // Should be read from cli, cli > config file > env > default values.
+                assert_eq!(opts.wal.dir.unwrap(), "/other/wal/dir");
 
                 // Should be default value.
                 assert_eq!(

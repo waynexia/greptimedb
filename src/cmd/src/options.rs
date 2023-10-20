@@ -30,7 +30,7 @@ pub const ENV_LIST_SEP: &str = ",";
 pub struct MixOptions {
     pub data_home: String,
     pub procedure: ProcedureConfig,
-    pub kv_store: KvStoreConfig,
+    pub metadata_store: KvStoreConfig,
     pub frontend: FrontendOptions,
     pub datanode: DatanodeOptions,
     pub logging: LoggingOptions,
@@ -144,8 +144,8 @@ mod tests {
             mysql_runtime_size = 2
 
             [meta_client]
-            timeout_millis = 3000
-            connect_timeout_millis = 5000
+            timeout = "3s"
+            connect_timeout = "5s"
             tcp_nodelay = true
 
             [wal]
@@ -262,6 +262,9 @@ mod tests {
                         "127.0.0.1:3003".to_string()
                     ]
                 );
+
+                // Should be the values from config file, not environment variables.
+                assert_eq!(opts.wal.dir.unwrap(), "/tmp/greptimedb/wal");
 
                 // Should be default values.
                 assert_eq!(opts.node_id, None);
