@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["TOPIC_NAME_PREFIX"],"struct":["KafkaConfig","KafkaOptions"],"type":["Topic"]};

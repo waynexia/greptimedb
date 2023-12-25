@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["BUILD_INFO","COLUMNS","COLUMN_PRIVILEGES","COLUMN_STATISTICS","ENGINES","TABLES"],"macro":["setup_memory_table"],"mod":["columns","memory_table","table_names","tables"],"struct":["InformationSchemaProvider","InformationTableDataSource","MEMORY_TABLES"],"trait":["InformationTable"],"type":["InformationTableRef"]};

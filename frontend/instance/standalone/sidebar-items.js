@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["create_table_route"],"struct":["RegionInvoker","StandaloneDatanodeManager","StandaloneTableMetadataAllocator"]};
