@@ -9,7 +9,6 @@ permissions:
 
 jobs:
   triage:
-    if: ${{ github.repository == 'GreptimeTeam/greptimedb' }}
     runs-on: ubuntu-latest
     steps:
     - uses: github/issue-labeler@v3.3
