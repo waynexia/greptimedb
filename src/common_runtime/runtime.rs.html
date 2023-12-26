@@ -288,6 +288,25 @@
 <a href="#287" id="287">287</a>
 <a href="#288" id="288">288</a>
 <a href="#289" id="289">289</a>
+<a href="#290" id="290">290</a>
+<a href="#291" id="291">291</a>
+<a href="#292" id="292">292</a>
+<a href="#293" id="293">293</a>
+<a href="#294" id="294">294</a>
+<a href="#295" id="295">295</a>
+<a href="#296" id="296">296</a>
+<a href="#297" id="297">297</a>
+<a href="#298" id="298">298</a>
+<a href="#299" id="299">299</a>
+<a href="#300" id="300">300</a>
+<a href="#301" id="301">301</a>
+<a href="#302" id="302">302</a>
+<a href="#303" id="303">303</a>
+<a href="#304" id="304">304</a>
+<a href="#305" id="305">305</a>
+<a href="#306" id="306">306</a>
+<a href="#307" id="307">307</a>
+<a href="#308" id="308">308</a>
 </pre></div><pre class="rust"><code><span class="comment">// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -442,6 +461,7 @@
             .build()
             .context(BuildRuntimeSnafu)<span class="question-mark">?</span>;
 
+        <span class="kw">let </span>name = <span class="self">self</span>.runtime_name.clone();
         <span class="kw">let </span>handle = runtime.handle().clone();
         <span class="kw">let </span>(send_stop, recv_stop) = oneshot::channel();
         <span class="comment">// Block the runtime to shutdown.
@@ -449,14 +469,25 @@
             .name(<span class="macro">format!</span>(<span class="string">"{}-blocker"</span>, <span class="self">self</span>.thread_name))
             .spawn(<span class="kw">move </span>|| runtime.block_on(recv_stop));
 
+        <span class="attr">#[cfg(tokio_unstable)]
+        </span>register_collector(name.clone(), <span class="kw-2">&amp;</span>handle);
+
         <span class="prelude-val">Ok</span>(Runtime {
-            name: <span class="self">self</span>.runtime_name.clone(),
+            name,
             handle,
             _dropper: Arc::new(Dropper {
                 close: <span class="prelude-val">Some</span>(send_stop),
             }),
         })
     }
+}
+
+<span class="attr">#[cfg(tokio_unstable)]
+</span><span class="kw">pub fn </span>register_collector(name: String, handle: <span class="kw-2">&amp;</span>Handle) {
+    <span class="kw">let </span>name = name.replace(<span class="string">"-"</span>, <span class="string">"_"</span>);
+    <span class="kw">let </span>monitor = tokio_metrics::RuntimeMonitor::new(handle);
+    <span class="kw">let </span>collector = tokio_metrics_collector::RuntimeCollector::new(monitor, name);
+    <span class="kw">let _ </span>= prometheus::register(Box::new(collector));
 }
 
 <span class="kw">fn </span>on_thread_start(thread_name: String) -&gt; <span class="kw">impl </span>Fn() + <span class="lifetime">'static </span>{
@@ -531,6 +562,13 @@
 
         <span class="macro">assert!</span>(metric_text.contains(<span class="string">"runtime_threads_idle{thread_name=\"test_runtime_metric\"}"</span>));
         <span class="macro">assert!</span>(metric_text.contains(<span class="string">"runtime_threads_alive{thread_name=\"test_runtime_metric\"}"</span>));
+
+        <span class="attr">#[cfg(tokio_unstable)]
+        </span>{
+            <span class="macro">assert!</span>(metric_text.contains(<span class="string">"runtime_0_tokio_budget_forced_yield_count 0"</span>));
+            <span class="macro">assert!</span>(metric_text.contains(<span class="string">"runtime_0_tokio_injection_queue_depth 0"</span>));
+            <span class="macro">assert!</span>(metric_text.contains(<span class="string">"runtime_0_tokio_workers_count 5"</span>));
+        }
     }
 
     <span class="attr">#[test]

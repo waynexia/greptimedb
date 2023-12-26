@@ -128,6 +128,14 @@
 <a href="#127" id="127">127</a>
 <a href="#128" id="128">128</a>
 <a href="#129" id="129">129</a>
+<a href="#130" id="130">130</a>
+<a href="#131" id="131">131</a>
+<a href="#132" id="132">132</a>
+<a href="#133" id="133">133</a>
+<a href="#134" id="134">134</a>
+<a href="#135" id="135">135</a>
+<a href="#136" id="136">136</a>
+<a href="#137" id="137">137</a>
 </pre></div><pre class="rust"><code><span class="comment">// Copyright 2023 Greptime Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -225,6 +233,14 @@
 
 <span class="attr">#[tokio::main]
 </span><span class="kw">async fn </span>main() -&gt; <span class="prelude-ty">Result</span>&lt;()&gt; {
+    <span class="kw">let </span>metadata = human_panic::Metadata {
+        version: <span class="macro">env!</span>(<span class="string">"CARGO_PKG_VERSION"</span>).into(),
+        name: <span class="string">"GreptimeDB"</span>.into(),
+        authors: Default::default(),
+        homepage: <span class="string">"https://github.com/GreptimeTeam/greptimedb/discussions"</span>.into(),
+    };
+    <span class="macro">human_panic::setup_panic!</span>(metadata);
+
     common_telemetry::set_panic_hook();
 
     <span class="kw">let </span>cli = greptimedb_cli();
