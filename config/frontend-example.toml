@@ -26,12 +26,14 @@ cert_path = ""
 key_path = ""
 
 # PostgresSQL server options, see `standalone.example.toml`.
+
 [postgres]
 enable = true
 addr = "127.0.0.1:4003"
 runtime_size = 2
 
 # PostgresSQL server TLS options, see `standalone.example.toml`.
+
 [postgres.tls]
 mode = "disable"
 cert_path = ""
