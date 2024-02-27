@@ -19,7 +19,7 @@ enable = true
 addr = "127.0.0.1:4002"
 runtime_size = 2
 
-# MySQL server TLS options, see `standalone.example.toml`.
+# MySQL server TLS options, see `standalone.example.toml`
 [mysql.tls]
 mode = "disable"
 cert_path = ""
@@ -39,13 +39,13 @@ mode = "disable"
 cert_path = ""
 key_path = ""
 
-# OpenTSDB protocol options, see `standalone.example.toml`.
+# OpenTSDB protocol options, see `standalone.example.toml`
 [opentsdb]
 enable = true
 addr = "127.0.0.1:4242"
 runtime_size = 2
 
-# InfluxDB protocol options, see `standalone.example.toml`.
+# InfluxDB protocol options, see `standalone.example.toml`. 
 [influxdb]
 enable = true
 
