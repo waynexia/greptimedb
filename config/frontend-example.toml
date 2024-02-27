@@ -4,7 +4,6 @@ interval = "5s"
 # Interval for retry sending heartbeat task, 5 seconds by default.
 retry_interval = "5s"
 
-# HTTP server options, see `standalone.example.toml`.
 [http]
 addr = "127.0.0.1:4000"
 timeout = "30s"
@@ -15,7 +14,6 @@ body_limit = "64MB"
 addr = "127.0.0.1:4001"
 runtime_size = 8
 
-# MySQL server options, see `standalone.example.toml`.
 [mysql]
 enable = true
 addr = "127.0.0.1:4002"
