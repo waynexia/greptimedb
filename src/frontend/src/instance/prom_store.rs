@@ -23,7 +23,8 @@ use common_error::ext::BoxedError;
 use common_query::prelude::GREPTIME_PHYSICAL_TABLE;
 use common_query::Output;
 use common_recordbatch::RecordBatches;
-use common_telemetry::logging;
+use common_telemetry::{error, logging};
+use greptimedb_client::Database;
 use operator::insert::InserterRef;
 use operator::statement::StatementExecutor;
 use prost::Message;
@@ -168,23 +169,28 @@ impl PromStoreProtocolHandler for Instance {
             .context(AuthSnafu)?;
 
         let (requests, samples) = prom_store::to_grpc_row_insert_requests(request)?;
-        if with_metric_engine {
-            let physical_table = ctx
-                .extension(PHYSICAL_TABLE_PARAM)
-                .unwrap_or(GREPTIME_PHYSICAL_TABLE)
-                .to_string();
-            let _ = self
-                .handle_metric_row_inserts(requests, ctx.clone(), physical_table.to_string())
-                .await
-                .map_err(BoxedError::new)
-                .context(error::ExecuteGrpcQuerySnafu)?;
-        } else {
-            let _ = self
-                .handle_row_inserts(requests, ctx.clone())
-                .await
-                .map_err(BoxedError::new)
-                .context(error::ExecuteGrpcQuerySnafu)?;
-        }
+
+        let db_name = ctx.get_db_string();
+        let database = Database::new_with_dbname(db_name, self.client.clone());
+        let result = database.row_insert(requests).await.unwrap();
+
+        // if with_metric_engine {
+        //     let physical_table = ctx
+        //         .extension(PHYSICAL_TABLE_PARAM)
+        //         .unwrap_or(GREPTIME_PHYSICAL_TABLE)
+        //         .to_string();
+        //     let _ = self
+        //         .handle_metric_row_inserts(requests, ctx.clone(), physical_table.to_string())
+        //         .await
+        //         .map_err(BoxedError::new)
+        //         .context(error::ExecuteGrpcQuerySnafu)?;
+        // } else {
+        //     let _ = self
+        //         .handle_row_inserts(requests, ctx.clone())
+        //         .await
+        //         .map_err(BoxedError::new)
+        //         .context(error::ExecuteGrpcQuerySnafu)?;
+        // }
 
         PROM_STORE_REMOTE_WRITE_SAMPLES.inc_by(samples as u64);
         Ok(())

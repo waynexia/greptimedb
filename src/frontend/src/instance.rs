@@ -41,6 +41,7 @@ use common_procedure::ProcedureManagerRef;
 use common_query::Output;
 use common_telemetry::error;
 use common_telemetry::logging::info;
+use greptimedb_client::Client;
 use log_store::raft_engine::RaftEngineBackend;
 use meta_client::client::{MetaClient, MetaClientBuilder};
 use meta_client::MetaClientOptions;
@@ -121,6 +122,8 @@ pub struct Instance {
     deleter: DeleterRef,
     export_metrics_task: Option<ExportMetricsTask>,
     table_metadata_manager: TableMetadataManagerRef,
+
+    client: Client,
 }
 
 impl Instance {

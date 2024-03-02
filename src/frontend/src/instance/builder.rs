@@ -21,6 +21,7 @@ use common_meta::datanode_manager::DatanodeManagerRef;
 use common_meta::ddl::ProcedureExecutorRef;
 use common_meta::key::TableMetadataManager;
 use common_meta::kv_backend::KvBackendRef;
+use greptimedb_client::Client;
 use operator::delete::Deleter;
 use operator::insert::Inserter;
 use operator::procedure::ProcedureServiceOperator;
@@ -149,6 +150,10 @@ impl FrontendBuilder {
 
         plugins.insert::<StatementExecutorRef>(statement_executor.clone());
 
+        let greptimedb_endpoint =
+            std::env::var("GREPTIMEDB_ENDPOINT").unwrap_or_else(|_| "localhost:4001".to_owned());
+        let client = Client::with_urls(vec![&greptimedb_endpoint]);
+
         Ok(Instance {
             catalog_manager,
             script_executor,
@@ -161,6 +166,8 @@ impl FrontendBuilder {
             deleter,
             export_metrics_task: None,
             table_metadata_manager: Arc::new(TableMetadataManager::new(kv_backend)),
+
+            client,
         })
     }
 }
