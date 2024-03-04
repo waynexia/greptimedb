@@ -14,10 +14,11 @@
 
 //! Implementation of the merge tree.
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use ahash::HashSet;
 use api::v1::OpType;
 use common_recordbatch::filter::SimpleFilterEvaluator;
 use common_time::Timestamp;

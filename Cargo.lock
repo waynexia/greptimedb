@@ -5321,6 +5321,7 @@ dependencies = [
 name = "mito2"
 version = "0.6.0"
 dependencies = [
+ "ahash 0.8.6",
  "anymap",
  "api",
  "aquamarine",

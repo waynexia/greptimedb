@@ -14,9 +14,10 @@
 
 //! Builder of a shard.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use ahash::HashMap;
 use store_api::metadata::RegionMetadataRef;
 
 use crate::error::Result;

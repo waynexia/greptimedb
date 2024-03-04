@@ -16,10 +16,10 @@
 //!
 //! We only support partitioning the tree by pre-defined internal columns.
 
-use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use ahash::{HashMap, HashSet};
 use api::v1::SemanticType;
 use common_recordbatch::filter::SimpleFilterEvaluator;
 use store_api::metadata::RegionMetadataRef;
@@ -585,7 +585,7 @@ impl Inner {
         let shard_builder = ShardBuilder::new(metadata.clone(), config, current_shard_id);
         Self {
             metadata,
-            pk_to_pk_id: HashMap::new(),
+            pk_to_pk_id: HashMap::default(),
             shard_builder,
             shards,
             num_rows: 0,

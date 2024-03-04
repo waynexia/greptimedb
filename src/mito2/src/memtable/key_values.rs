@@ -37,6 +37,9 @@ impl KeyValues {
     /// Returns `None` if `rows` of the `mutation` is `None`.
     pub fn new(metadata: &RegionMetadata, mutation: Mutation) -> Option<KeyValues> {
         let rows = mutation.rows.as_ref()?;
+        //         mutation.rows.map(|rows| {
+        // rows.rows.sort_unstable_by_key(f)
+        //         });
         let helper = SparseReadRowHelper::new(metadata, rows);
 
         Some(KeyValues { mutation, helper })
