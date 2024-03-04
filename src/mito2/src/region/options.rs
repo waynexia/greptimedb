@@ -133,8 +133,8 @@ impl TwcsOptions {
 impl Default for TwcsOptions {
     fn default() -> Self {
         Self {
-            max_active_window_files: 4,
-            max_inactive_window_files: 1,
+            max_active_window_files: 10000,
+            max_inactive_window_files: 10000,
             time_window: None,
         }
     }
