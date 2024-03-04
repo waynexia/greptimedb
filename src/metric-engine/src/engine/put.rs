@@ -175,10 +175,10 @@ impl MetricEngineInner {
     ) {
         let mut hasher = mur3::Hasher128::with_seed(TSID_HASH_SEED);
         for (idx, name) in tag_col_indices {
-            let tag = row.values[*idx].clone();
+            let tag = &row.values[*idx];
             name.hash(&mut hasher);
             // The type is checked before. So only null is ignored.
-            if let Some(ValueData::StringValue(string)) = tag.value_data {
+            if let Some(ValueData::StringValue(string)) = &tag.value_data {
                 string.hash(&mut hasher);
             }
         }
@@ -186,6 +186,7 @@ impl MetricEngineInner {
         let (hash, _) = hasher.finish128();
 
         // fill table id and tsid
+        row.values.reserve(2);
         row.values.push(ValueData::U32Value(table_id).into());
         row.values.push(ValueData::U64Value(hash).into());
     }
