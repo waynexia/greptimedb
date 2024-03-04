@@ -244,6 +244,11 @@ impl WriteRequest {
 
     /// Fills default value for specific `column`.
     fn fill_column(&mut self, column: &ColumnMetadata) -> Result<()> {
+        // fast path
+        if column.column_schema.default_constraint().is_none() {
+            return Ok(());
+        }
+
         // Need to add a default value for this column.
         let proto_value = self.column_default_value(column)?;
 
