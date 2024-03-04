@@ -366,13 +366,24 @@ impl SparseEncoder {
         I: Iterator<Item = ValueRef<'a>>,
     {
         let mut serializer = Serializer::new(buffer);
-        for (value, field) in row.zip(self.fields.iter()) {
+        // for (value, field) in row.zip(self.fields.iter()) {
+        //     if !value.is_null() {
+        //         field
+        //             .column_id
+        //             .serialize(&mut serializer)
+        //             .context(SerializeFieldSnafu)?;
+        //         field.field.serialize(&mut serializer, &value)?;
+        //     }
+        // }
+        for (index, value) in row.enumerate() {
             if !value.is_null() {
-                field
+                self.fields[index]
                     .column_id
                     .serialize(&mut serializer)
                     .context(SerializeFieldSnafu)?;
-                field.field.serialize(&mut serializer, &value)?;
+                self.fields[index]
+                    .field
+                    .serialize(&mut serializer, &value)?;
             }
         }
         Ok(())
