@@ -5541,8 +5541,11 @@ dependencies = [
 name = "index"
 version = "0.12.0"
 dependencies = [
+ "ahash 0.8.11",
+ "arrow-array",
  "async-trait",
  "asynchronous-codec",
+ "bincode",
  "bytemuck",
  "bytes",
  "common-base",
@@ -5573,6 +5576,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "uuid",
+ "xorf",
 ]
 
 [[package]]
@@ -13800,6 +13804,16 @@ dependencies = [
  "libc",
  "linux-raw-sys",
  "rustix",
+]
+
+[[package]]
+name = "xorf"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf24c008fe464f5d8f58b8d16a1ab7e930bd73b2a6933ff8704c414b2bed7f92"
+dependencies = [
+ "libm",
+ "rand",
 ]
 
 [[package]]

@@ -20,6 +20,8 @@ pub mod error;
 pub mod external_provider;
 pub mod fulltext_index;
 pub mod inverted_index;
+pub mod value_hasher;
+pub mod xor_filter;
 
 pub type Bytes = Vec<u8>;
 pub type BytesRef<'a> = &'a [u8];

@@ -8,8 +8,11 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+ahash = "0.8"
+arrow-array.workspace = true
 async-trait.workspace = true
 asynchronous-codec = "0.7.0"
+bincode = "1.3"
 bytemuck.workspace = true
 bytes.workspace = true
 common-base.workspace = true
@@ -37,6 +40,7 @@ tantivy-jieba = "0.11.0"
 tokio.workspace = true
 tokio-util.workspace = true
 uuid.workspace = true
+xorf = "0.11"
 
 [dev-dependencies]
 common-test-util.workspace = true
