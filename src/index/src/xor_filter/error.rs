@@ -25,8 +25,7 @@ use snafu::{Location, Snafu};
 pub enum Error {
     #[snafu(display("Failed to create XOR filter"))]
     CreateXorFilter {
-        #[snafu(source)]
-        source: BoxedError,
+        reason: String,
         #[snafu(implicit)]
         location: Location,
     },
@@ -34,7 +33,7 @@ pub enum Error {
     #[snafu(display("Failed to serialize XOR filter"))]
     SerializeXorFilter {
         #[snafu(source)]
-        source: BoxedError,
+        error: bincode::Error,
         #[snafu(implicit)]
         location: Location,
     },
@@ -42,7 +41,7 @@ pub enum Error {
     #[snafu(display("Failed to deserialize XOR filter"))]
     DeserializeXorFilter {
         #[snafu(source)]
-        source: BoxedError,
+        error: bincode::Error,
         #[snafu(implicit)]
         location: Location,
     },
@@ -75,7 +74,7 @@ pub enum Error {
     #[snafu(display("Failed to decode proto message"))]
     DecodeProto {
         #[snafu(source)]
-        source: prost::DecodeError,
+        error: prost::DecodeError,
         #[snafu(implicit)]
         location: Location,
     },
@@ -89,8 +88,7 @@ pub enum Error {
 
     #[snafu(display("Intermediate file operation failed"))]
     Intermediate {
-        #[snafu(source)]
-        source: BoxedError,
+        source: crate::error::Error,
         #[snafu(implicit)]
         location: Location,
     },

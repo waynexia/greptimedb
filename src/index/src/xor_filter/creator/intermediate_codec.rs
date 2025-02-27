@@ -17,7 +17,10 @@ use bytes::{Buf, BufMut};
 use snafu::{ensure, ResultExt};
 
 use crate::xor_filter::creator::finalize_segment::FinalizedXorFilterSegment;
-use crate::xor_filter::error::{Error, InvalidIntermediateMagicSnafu, IoSnafu, Result};
+use crate::xor_filter::error::{
+    DeserializeXorFilterSnafu, Error, InvalidIntermediateMagicSnafu, IoSnafu, Result,
+    SerializeXorFilterSnafu,
+};
 
 /// The magic number for the codec version 1 of the intermediate XOR filter.
 const CODEC_V1_MAGIC: &[u8; 4] = b"xi01";
@@ -43,7 +46,7 @@ impl Encoder for IntermediateXorFilterCodecV1 {
             self.handled_header_magic = true;
         }
 
-        let keys_bytes = bincode::serialize(&item.keys).context(IoSnafu)?;
+        let keys_bytes = bincode::serialize(&item.keys).context(SerializeXorFilterSnafu)?;
         let keys_count = item.keys.len();
 
         dst.reserve(2 * std::mem::size_of::<u64>() + keys_bytes.len());
@@ -90,8 +93,8 @@ impl Decoder for IntermediateXorFilterCodecV1 {
             return Ok(None);
         }
 
-        let keys: Vec<u64> =
-            bincode::deserialize(&s[n_size..n_size + keys_size]).context(IoSnafu)?;
+        let keys: Vec<u64> = bincode::deserialize(&s[n_size..n_size + keys_size])
+            .context(DeserializeXorFilterSnafu)?;
         src.advance(n_size + keys_size);
         Ok(Some(FinalizedXorFilterSegment { keys }))
     }

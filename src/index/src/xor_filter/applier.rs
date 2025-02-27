@@ -95,7 +95,7 @@ mod tests {
 
     use super::*;
     use crate::external_provider::MockExternalTempFileProvider;
-    use crate::value_hasher::IntegerValueHasher;
+    use crate::value_hasher::ArrayValueHasher;
     use crate::xor_filter::creator::{XorFilterCreator, XorFilterSegmentBuilder};
     use crate::xor_filter::reader::XorFilterReaderImpl;
 
@@ -110,28 +110,28 @@ mod tests {
             None,
         );
 
-        let hasher = IntegerValueHasher::new();
+        let hasher = ArrayValueHasher::default();
 
         // Segment 0: values 1-4
         let mut segment_builder = XorFilterSegmentBuilder::new();
         segment_builder.add_keys(vec![1, 2, 3, 4]).unwrap();
-        creator.add_segment(segment_builder).unwrap();
+        creator.add_segment(segment_builder).await.unwrap();
 
         // Segment 1: values 5-8
         let mut segment_builder = XorFilterSegmentBuilder::new();
         segment_builder.add_keys(vec![5, 6, 7, 8]).unwrap();
-        creator.add_segment(segment_builder).unwrap();
+        creator.add_segment(segment_builder).await.unwrap();
 
         // Segment 2: values 9-12
         let mut segment_builder = XorFilterSegmentBuilder::new();
         segment_builder.add_keys(vec![9, 10, 11, 12]).unwrap();
-        creator.add_segment(segment_builder).unwrap();
+        creator.add_segment(segment_builder).await.unwrap();
 
         // Duplicate segments with value 42
         for _ in 0..4 {
             let mut segment_builder = XorFilterSegmentBuilder::new();
             segment_builder.add_key(42).unwrap();
-            creator.add_segment(segment_builder).unwrap();
+            creator.add_segment(segment_builder).await.unwrap();
         }
 
         creator.finish(&mut writer).await.unwrap();

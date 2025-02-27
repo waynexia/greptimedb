@@ -64,7 +64,7 @@ pub trait XorFilterReader: Sync {
         let bss = self.read_vec(&ranges).await?;
 
         let mut result = Vec::with_capacity(bss.len());
-        for (bs, _) in bss.into_iter().zip(locs.iter()) {
+        for bs in bss {
             let filter = XorFilter::deserialize(&bs)?;
             result.push(filter);
         }
@@ -200,7 +200,7 @@ mod tests {
 
     use super::*;
     use crate::external_provider::MockExternalTempFileProvider;
-    use crate::value_hasher::IntegerValueHasher;
+    use crate::value_hasher::ArrayValueHasher;
     use crate::xor_filter::creator::{XorFilterCreator, XorFilterSegmentBuilder};
 
     async fn mock_xor_filter_bytes() -> Vec<u8> {
@@ -215,17 +215,17 @@ mod tests {
         // Segment 1
         let mut segment_builder = XorFilterSegmentBuilder::new();
         segment_builder.add_keys(vec![1, 2]).unwrap();
-        creator.add_segment(segment_builder).unwrap();
+        creator.add_segment(segment_builder).await.unwrap();
 
         // Segment 2
         let mut segment_builder = XorFilterSegmentBuilder::new();
         segment_builder.add_keys(vec![3, 4]).unwrap();
-        creator.add_segment(segment_builder).unwrap();
+        creator.add_segment(segment_builder).await.unwrap();
 
         // Segment 3
         let mut segment_builder = XorFilterSegmentBuilder::new();
         segment_builder.add_keys(vec![5, 6]).unwrap();
-        creator.add_segment(segment_builder).unwrap();
+        creator.add_segment(segment_builder).await.unwrap();
 
         creator.finish(&mut writer).await.unwrap();
 

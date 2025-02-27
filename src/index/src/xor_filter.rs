@@ -29,7 +29,7 @@ use std::any::Any;
 use std::fmt::{Debug, Display, Formatter};
 
 use common_base::bytes::Bytes;
-use snafu::{OptionExt, ResultExt};
+use snafu::ResultExt;
 use xorf::{BinaryFuse8, Filter};
 
 use crate::xor_filter::error::{
@@ -46,7 +46,8 @@ impl XorFilter {
     /// Create a new XOR filter by building from keys.
     pub fn create_from_keys(keys: &[u64]) -> Result<Self> {
         Ok(Self {
-            filter: BinaryFuse8::try_from(keys).context(CreateXorFilterSnafu)?,
+            filter: BinaryFuse8::try_from(keys)
+                .map_err(|reason| CreateXorFilterSnafu { reason }.build())?,
         })
     }
 

@@ -25,13 +25,10 @@ use greptime_proto::v1::index::{XorFilterLoc, XorFilterMeta};
 use prost::Message;
 use snafu::ResultExt;
 
-use crate::error::Result;
 use crate::external_provider::ExternalTempFileProvider;
-use crate::value_hasher::ValueHasher;
 use crate::xor_filter::creator::finalize_segment::FinalizedXorFilterSegment;
 use crate::xor_filter::creator::intermediate_codec::IntermediateXorFilterCodecV1;
-use crate::xor_filter::error::{IntermediateSnafu, IoSnafu};
-use crate::xor_filter::XorFilter;
+use crate::xor_filter::error::{IntermediateSnafu, IoSnafu, Result};
 
 /// The minimum memory usage threshold for flushing in-memory XOR filters to disk.
 const MIN_MEMORY_USAGE_THRESHOLD: usize = 1024 * 1024; // 1MB
@@ -439,7 +436,8 @@ mod tests {
 
     use super::*;
     use crate::external_provider::MockExternalTempFileProvider;
-    use crate::value_hasher::IntegerValueHasher;
+    use crate::value_hasher::ArrayValueHasher;
+    use crate::xor_filter::XorFilter;
 
     #[tokio::test]
     async fn test_xor_filter_creator() {
@@ -451,8 +449,9 @@ mod tests {
             None,
         );
 
-        let hasher = IntegerValueHasher::new();
-        let array1 = UInt32Array::from(vec![1, 2]);
+        let hasher = ArrayValueHasher::default();
+        let array1: arrow_array::PrimitiveArray<arrow_array::types::UInt32Type> =
+            UInt32Array::from(vec![1, 2]);
         let array2 = UInt32Array::from(vec![3, 4]);
         let array3 = UInt32Array::from(vec![5, 6]);
 
