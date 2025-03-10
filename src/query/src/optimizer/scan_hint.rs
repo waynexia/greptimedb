@@ -135,10 +135,8 @@ impl ScanHintRule {
         while let (Some(sort_expr), Some(pk_col)) = (curr_sort_expr, curr_pk_col) {
             if sort_expr.name == pk_col.column_schema.name {
                 curr_sort_expr = sort_expr_cursor.next();
-                curr_pk_col = pk_column_iter.next();
-            } else {
-                return;
             }
+            curr_pk_col = pk_column_iter.next();
         }
 
         let next_remaining = sort_expr_cursor.next();

@@ -73,11 +73,19 @@ impl RegionScanExec {
         }
 
         let metadata = scanner.metadata();
-        let mut pk_columns: Vec<PhysicalSortExpr> = metadata
+        let mut ordered_pk_columns = metadata
             .primary_key_columns()
+            .map(|col| col.column_schema.name.clone())
+            .collect::<Vec<_>>();
+        ordered_pk_columns.sort();
+        let mut pk_columns: Vec<PhysicalSortExpr> = 
+        // metadata
+        //     .primary_key_columns()
+        ordered_pk_columns.into_iter()
             .filter_map(|col| {
                 Some(PhysicalSortExpr::new(
-                    Arc::new(Column::new_with_schema(&col.column_schema.name, &arrow_schema).ok()?)
+                    // Arc::new(Column::new_with_schema(&col.column_schema.name, &arrow_schema).ok()?)
+                    Arc::new(Column::new_with_schema(&col, &arrow_schema).ok()?)
                         as _,
                     SortOptions {
                         descending: false,
