@@ -56,7 +56,9 @@ pub enum CommonFilterError {
         location: Location,
     },
 
-    #[snafu(display("Unexpected filter meta size: max {max_meta_size}, actual {actual_meta_size}"))]
+    #[snafu(display(
+        "Unexpected filter meta size: max {max_meta_size}, actual {actual_meta_size}"
+    ))]
     UnexpectedMetaSize {
         max_meta_size: u64,
         actual_meta_size: u64,

@@ -14,8 +14,10 @@
 
 pub mod applier;
 pub mod creator;
+pub mod creator_v2;
 pub mod error;
 pub mod reader;
+pub mod segment;
 
 use std::any::Any;
 use std::fmt::{Debug, Display, Formatter};

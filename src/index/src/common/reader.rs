@@ -24,7 +24,9 @@ use greptime_proto::v1::index::{BloomFilterLoc as FilterLoc, BloomFilterMeta as 
 use prost::Message;
 use snafu::{ensure, ResultExt};
 
-use crate::common::error::{CommonResult, DecodeProtoSnafu, FileSizeTooSmallSnafu, IoSnafu, UnexpectedMetaSizeSnafu};
+use crate::common::error::{
+    CommonResult, DecodeProtoSnafu, FileSizeTooSmallSnafu, IoSnafu, UnexpectedMetaSizeSnafu,
+};
 use crate::common::filter::ProbabilisticFilter;
 
 /// Minimum size of the filter metadata (4 bytes for length)
@@ -152,7 +154,8 @@ impl<R: RangeReader, F: ProbabilisticFilter> FilterReader<F> for FilterReaderImp
         let metadata = self.reader.metadata().await.context(IoSnafu)?;
         let file_size = metadata.content_length;
 
-        let mut meta_reader = FilterMetaReader::new(&self.reader, file_size, Some(DEFAULT_PREFETCH_SIZE));
+        let mut meta_reader =
+            FilterMetaReader::new(&self.reader, file_size, Some(DEFAULT_PREFETCH_SIZE));
         meta_reader.metadata().await
     }
 }

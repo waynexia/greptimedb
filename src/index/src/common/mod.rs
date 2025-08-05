@@ -14,6 +14,8 @@
 
 //! Common abstractions for probabilistic filters (Bloom, XOR, etc.)
 
+pub mod applier;
+pub mod creator;
 pub mod error;
 pub mod filter;
 pub mod reader;

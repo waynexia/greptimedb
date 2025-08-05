@@ -22,8 +22,10 @@
 
 pub mod applier;
 pub mod creator;
+pub mod creator_v2;
 pub mod error;
 pub mod reader;
+pub mod segment;
 
 use std::any::Any;
 use std::fmt::{Debug, Display, Formatter};
@@ -49,6 +51,16 @@ impl XorFilter {
         Ok(Self {
             filter: BinaryFuse8::try_from(keys)
                 .map_err(|reason| CreateXorFilterSnafu { reason }.build())?,
+        })
+    }
+    
+    /// Create a new XOR filter from keys (convenience method for common result).
+    pub fn from(keys: &[u64]) -> CommonResult<Self> {
+        Self::create_from_keys(keys).map_err(|e| {
+            crate::common::CommonFilterError::External {
+                source: common_error::ext::BoxedError::new(e),
+                location: snafu::Location::new(file!(), line!(), 0),
+            }
         })
     }
 
