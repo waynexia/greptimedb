@@ -14,10 +14,8 @@
 
 pub mod applier;
 pub mod creator;
-pub mod creator_v2;
 pub mod error;
 pub mod reader;
-pub mod segment;
 
 use std::any::Any;
 use std::fmt::{Debug, Display, Formatter};
@@ -26,14 +24,14 @@ use common_base::bytes::Bytes;
 use fastbloom::BloomFilter as FastBloomFilter;
 use snafu::ResultExt;
 
-use crate::bloom_filter::error::{Result, SerializeBloomFilterSnafu, DeserializeBloomFilterSnafu};
+use crate::bloom_filter::error::{DeserializeBloomFilterSnafu, Result, SerializeBloomFilterSnafu};
 use crate::common::{CommonResult, ProbabilisticFilter};
 
 /// The seed used for the Bloom filter.
 pub const SEED: u128 = 42;
 
 /// Skipping index based on Bloom filter.
-/// 
+///
 /// This wrapper provides a unified interface for bloom filters while maintaining
 /// compatibility with the existing fastbloom implementation.
 #[derive(Debug)]
@@ -115,8 +113,8 @@ impl Display for BloomFilter {
 
 impl PartialEq for BloomFilter {
     fn eq(&self, other: &Self) -> bool {
-        self.element_count == other.element_count &&
-        self.filter.as_slice() == other.filter.as_slice()
+        self.element_count == other.element_count
+            && self.filter.as_slice() == other.filter.as_slice()
     }
 }
 
@@ -134,17 +132,16 @@ impl ProbabilisticFilter for BloomFilter {
     fn serialize(&self) -> CommonResult<Bytes> {
         let bits_slice = self.filter.as_slice();
         let bits: Vec<u64> = bits_slice.to_vec();
-        let bytes = bincode::serialize(&bits).map_err(|e| {
-            crate::common::CommonFilterError::External {
+        let bytes =
+            bincode::serialize(&bits).map_err(|e| crate::common::CommonFilterError::External {
                 source: common_error::ext::BoxedError::new(
                     crate::bloom_filter::error::Error::SerializeBloomFilter {
                         error: e,
                         location: snafu::Location::new(file!(), line!(), 0),
-                    }
+                    },
                 ),
                 location: snafu::Location::new(file!(), line!(), 0),
-            }
-        })?;
+            })?;
         Ok(Bytes::from(bytes))
     }
 
@@ -157,7 +154,7 @@ impl ProbabilisticFilter for BloomFilter {
                     crate::bloom_filter::error::Error::DeserializeBloomFilter {
                         error: e,
                         location: snafu::Location::new(file!(), line!(), 0),
-                    }
+                    },
                 ),
                 location: snafu::Location::new(file!(), line!(), 0),
             }
@@ -165,7 +162,7 @@ impl ProbabilisticFilter for BloomFilter {
         let filter = FastBloomFilter::from_vec(bits)
             .seed(&SEED)
             .expected_items(1); // Default value, caller should reinitialize properly
-        Ok(Self::new(filter, 0))  // element_count will need to be set by caller
+        Ok(Self::new(filter, 0)) // element_count will need to be set by caller
     }
 
     fn memory_usage(&self) -> usize {

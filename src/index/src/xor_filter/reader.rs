@@ -27,7 +27,7 @@ use crate::xor_filter::XorFilter;
 pub const DEFAULT_PREFETCH_SIZE: u64 = 8192; // 8KiB
 
 /// `XorFilterReader` reads the XOR filter from the file.
-/// 
+///
 /// This trait provides backward compatibility with the existing XOR filter API
 /// while delegating to the common FilterReader implementation.
 #[async_trait]
@@ -49,7 +49,7 @@ pub trait XorFilterReader: Sync {
 }
 
 /// `XorFilterReaderImpl` reads the XOR filter from the file.
-/// 
+///
 /// This implementation delegates to the common FilterReaderImpl for shared functionality.
 pub struct XorFilterReaderImpl<R: RangeReader> {
     /// The underlying generic reader.
@@ -82,17 +82,11 @@ impl<R: RangeReader> XorFilterReader for XorFilterReaderImpl<R> {
     }
 
     async fn metadata(&self) -> Result<XorFilterMeta> {
-        self.inner
-            .metadata()
-            .await
-            .map_err(convert_common_error)
+        self.inner.metadata().await.map_err(convert_common_error)
     }
 
     async fn xor_filter(&self, loc: &XorFilterLoc) -> Result<XorFilter> {
-        self.inner
-            .filter(loc)
-            .await
-            .map_err(convert_common_error)
+        self.inner.filter(loc).await.map_err(convert_common_error)
     }
 
     async fn xor_filter_vec(&self, locs: &[XorFilterLoc]) -> Result<Vec<XorFilter>> {
@@ -110,9 +104,15 @@ fn convert_common_error(e: crate::common::CommonFilterError) -> Error {
         crate::common::CommonFilterError::FileSizeTooSmall { size, location } => {
             Error::FileSizeTooSmall { size, location }
         }
-        crate::common::CommonFilterError::UnexpectedMetaSize { max_meta_size, actual_meta_size, location } => {
-            Error::UnexpectedMetaSize { max_meta_size, actual_meta_size, location }
-        }
+        crate::common::CommonFilterError::UnexpectedMetaSize {
+            max_meta_size,
+            actual_meta_size,
+            location,
+        } => Error::UnexpectedMetaSize {
+            max_meta_size,
+            actual_meta_size,
+            location,
+        },
         crate::common::CommonFilterError::DecodeProto { error, location } => {
             Error::DecodeProto { error, location }
         }

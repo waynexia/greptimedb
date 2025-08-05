@@ -76,7 +76,7 @@ pub trait BloomFilterReader: Sync {
 }
 
 /// `BloomFilterReaderImpl` reads the bloom filter from the file.
-/// 
+///
 /// This implementation delegates to the common FilterReaderImpl for shared functionality
 /// while maintaining backward compatibility with the existing BloomFilter API.
 pub struct BloomFilterReaderImpl<R: RangeReader> {
@@ -110,32 +110,25 @@ impl<R: RangeReader> BloomFilterReader for BloomFilterReaderImpl<R> {
     }
 
     async fn metadata(&self) -> Result<BloomFilterMeta> {
-        self.inner
-            .metadata()
-            .await
-            .map_err(convert_common_error)
+        self.inner.metadata().await.map_err(convert_common_error)
     }
 
     async fn bloom_filter(&self, loc: &BloomFilterLoc) -> Result<BloomFilter> {
         // Use custom deserialization with element_count parameter
         self.inner
-            .filter_with_params(
-                loc,
-                loc.element_count as usize,
-                |bytes, element_count| {
-                    let vec = bytes
-                        .chunks_exact(std::mem::size_of::<u64>())
-                        .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
-                        .collect();
-                    Ok(BloomFilter::from_vec(vec, element_count))
-                },
-            )
+            .filter_with_params(loc, loc.element_count as usize, |bytes, element_count| {
+                let vec = bytes
+                    .chunks_exact(std::mem::size_of::<u64>())
+                    .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+                    .collect();
+                Ok(BloomFilter::from_vec(vec, element_count))
+            })
             .await
             .map_err(convert_common_error)
     }
 
     async fn bloom_filter_vec(&self, locs: &[BloomFilterLoc]) -> Result<Vec<BloomFilter>> {
-        // Use custom vector deserialization with element_count parameter  
+        // Use custom vector deserialization with element_count parameter
         self.inner
             .filter_vec_with_params(
                 locs,
@@ -160,9 +153,15 @@ fn convert_common_error(e: crate::common::CommonFilterError) -> Error {
         crate::common::CommonFilterError::FileSizeTooSmall { size, location } => {
             Error::FileSizeTooSmall { size, location }
         }
-        crate::common::CommonFilterError::UnexpectedMetaSize { max_meta_size, actual_meta_size, location } => {
-            Error::UnexpectedMetaSize { max_meta_size, actual_meta_size, location }
-        }
+        crate::common::CommonFilterError::UnexpectedMetaSize {
+            max_meta_size,
+            actual_meta_size,
+            location,
+        } => Error::UnexpectedMetaSize {
+            max_meta_size,
+            actual_meta_size,
+            location,
+        },
         crate::common::CommonFilterError::DecodeProto { error, location } => {
             Error::DecodeProto { error, location }
         }
@@ -177,7 +176,6 @@ fn convert_common_error(e: crate::common::CommonFilterError) -> Error {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {

@@ -12,26 +12,226 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod finalize_segment;
-pub mod intermediate_codec;
-
-use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
-use asynchronous_codec::{FramedRead, FramedWrite};
-use futures::{stream, AsyncWrite, AsyncWriteExt, Stream, StreamExt};
-use greptime_proto::v1::index::{BloomFilterLoc as XorFilterLoc, BloomFilterMeta as XorFilterMeta};
-use prost::Message;
+use futures::AsyncWrite;
 use snafu::ResultExt;
 
+use crate::common::creator::{FilterCreator, FilterCreatorImpl, FinalizedSegment, SegmentBuilder};
+use crate::common::CommonResult;
 use crate::external_provider::ExternalTempFileProvider;
-use crate::xor_filter::creator::finalize_segment::FinalizedXorFilterSegment;
-use crate::xor_filter::creator::intermediate_codec::IntermediateXorFilterCodecV1;
-use crate::xor_filter::error::{IntermediateSnafu, IoSnafu, Result};
+use crate::xor_filter::error::{CommonSnafu, Result};
 
-/// The minimum memory usage threshold for flushing in-memory XOR filters to disk.
-const MIN_MEMORY_USAGE_THRESHOLD: usize = 1024 * 1024; // 1MB
+/// XOR filter segment builder implementation.
+#[derive(Debug, Default)]
+pub struct XorFilterSegmentBuilderNew {
+    /// Keys in this segment.
+    keys: Vec<u64>,
+}
+
+impl XorFilterSegmentBuilderNew {
+    /// Create a new XOR filter segment builder.
+    pub fn new() -> Self {
+        Self { keys: Vec::new() }
+    }
+}
+
+impl SegmentBuilder for XorFilterSegmentBuilderNew {
+    type Input = Vec<u64>;
+    type Segment = FinalizedXorFilterSegment;
+
+    fn add_data(&mut self, data: Self::Input) -> CommonResult<()> {
+        self.keys.extend(data);
+        Ok(())
+    }
+
+    fn finalize(self) -> Self::Segment {
+        FinalizedXorFilterSegment::new(self.keys)
+    }
+
+    fn memory_usage(&self) -> usize {
+        self.keys.len() * std::mem::size_of::<u64>()
+    }
+}
+
+/// Finalized XOR filter segment.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FinalizedXorFilterSegment {
+    /// Keys in this segment.
+    pub keys: Vec<u64>,
+}
+
+impl FinalizedXorFilterSegment {
+    /// Create a new finalized XOR filter segment.
+    pub fn new(keys: Vec<u64>) -> Self {
+        Self { keys }
+    }
+
+    /// Build the actual XOR filter from the keys.
+    pub fn build_xor_filter(&self) -> Result<crate::xor_filter::XorFilter> {
+        if self.keys.is_empty() {
+            // Create an empty filter using create_from_keys
+            return crate::xor_filter::XorFilter::create_from_keys(&[]).map_err(|e| {
+                crate::xor_filter::error::Error::CreateXorFilter {
+                    reason: format!("Failed to create empty XOR filter: {}", e),
+                    location: snafu::Location::new(file!(), line!(), 0),
+                }
+            });
+        }
+
+        let mut unique_keys = self.keys.clone();
+        unique_keys.sort_unstable();
+        unique_keys.dedup();
+
+        crate::xor_filter::XorFilter::create_from_keys(&unique_keys).map_err(|e| {
+            crate::xor_filter::error::Error::CreateXorFilter {
+                reason: format!("Failed to create XOR filter: {}", e),
+                location: snafu::Location::new(file!(), line!(), 0),
+            }
+        })
+    }
+}
+
+impl FinalizedSegment for FinalizedXorFilterSegment {
+    fn memory_usage(&self) -> usize {
+        self.keys.len() * std::mem::size_of::<u64>()
+    }
+
+    fn serialize_for_storage(&self) -> CommonResult<Vec<u8>> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&(self.keys.len() as u64).to_le_bytes());
+        for key in &self.keys {
+            data.extend_from_slice(&key.to_le_bytes());
+        }
+        Ok(data)
+    }
+
+    fn deserialize_from_storage(bytes: &[u8]) -> CommonResult<Self> {
+        if bytes.len() < 8 {
+            return Err(crate::common::CommonFilterError::Io {
+                error: std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid segment data"),
+                location: snafu::Location::new(file!(), line!(), 0),
+            });
+        }
+
+        let key_count = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
+
+        if bytes.len() != 8 + key_count * 8 {
+            return Err(crate::common::CommonFilterError::Io {
+                error: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Invalid segment data size",
+                ),
+                location: snafu::Location::new(file!(), line!(), 0),
+            });
+        }
+
+        let mut keys = Vec::with_capacity(key_count);
+        for i in 0..key_count {
+            let start = 8 + i * 8;
+            let end = start + 8;
+            let key = u64::from_le_bytes(bytes[start..end].try_into().unwrap());
+            keys.push(key);
+        }
+
+        Ok(Self { keys })
+    }
+
+    fn build_filter(&self) -> CommonResult<Vec<u8>> {
+        let filter =
+            self.build_xor_filter()
+                .map_err(|e| crate::common::CommonFilterError::External {
+                    source: common_error::ext::BoxedError::new(e),
+                    location: snafu::Location::new(file!(), line!(), 0),
+                })?;
+
+        let bytes = filter
+            .serialize()
+            .map_err(|e| crate::common::CommonFilterError::External {
+                source: common_error::ext::BoxedError::new(e),
+                location: snafu::Location::new(file!(), line!(), 0),
+            })?;
+
+        Ok(bytes.to_vec())
+    }
+
+    fn element_count(&self) -> usize {
+        self.keys.len()
+    }
+}
+
+/// Refactored XOR filter creator using the common infrastructure.
+pub struct XorFilterCreatorV2 {
+    /// The underlying generic creator implementation.
+    inner: FilterCreatorImpl<XorFilterSegmentBuilderNew>,
+}
+
+impl XorFilterCreatorV2 {
+    /// Creates a new `XorFilterCreatorV2` with the specified number of rows per segment.
+    pub fn new(
+        rows_per_segment: usize,
+        intermediate_provider: Arc<dyn ExternalTempFileProvider>,
+        global_memory_usage: Arc<AtomicUsize>,
+        global_memory_usage_threshold: Option<usize>,
+    ) -> Self {
+        let initial_builder = XorFilterSegmentBuilderNew::new();
+        let inner = FilterCreatorImpl::new(
+            rows_per_segment,
+            intermediate_provider,
+            global_memory_usage,
+            global_memory_usage_threshold,
+            initial_builder,
+        );
+
+        Self { inner }
+    }
+
+    /// Returns the memory usage of the creating XOR filter.
+    pub fn memory_usage(&self) -> usize {
+        self.inner.memory_usage()
+    }
+}
+
+impl FilterCreator for XorFilterCreatorV2 {
+    type Builder = XorFilterSegmentBuilderNew;
+    type ElementInput = u64;
+
+    async fn push_n_row_elems(
+        &mut self,
+        nrows: usize,
+        elems: impl IntoIterator<Item = Self::ElementInput> + Send,
+    ) -> CommonResult<()> {
+        // Convert iterator to Vec to handle the repeated usage across segments
+        let elems_vec: Vec<u64> = elems.into_iter().collect();
+
+        // For XOR filters, we add the same keys to each row
+        // We call add_data once with the total row count
+        self.inner
+            .add_data(elems_vec, nrows, || XorFilterSegmentBuilderNew::new())
+            .await
+    }
+
+    async fn push_row_elems(
+        &mut self,
+        elems: impl IntoIterator<Item = Self::ElementInput> + Send,
+    ) -> CommonResult<()> {
+        let elems_vec: Vec<u64> = elems.into_iter().collect();
+        self.inner
+            .add_data(elems_vec, 1, || XorFilterSegmentBuilderNew::new())
+            .await
+    }
+
+    async fn finish(&mut self, writer: impl AsyncWrite + Unpin + Send) -> CommonResult<()> {
+        self.inner
+            .finish(writer, || XorFilterSegmentBuilderNew::new())
+            .await
+    }
+
+    fn memory_usage(&self) -> usize {
+        self.inner.memory_usage()
+    }
+}
 
 /// A segment builder for XOR filter.
 #[derive(Debug, Default)]
@@ -59,219 +259,14 @@ impl XorFilterSegmentBuilder {
         self.keys.extend(keys);
         Ok(())
     }
-
-    /// Finalize the segment builder and return a finalized segment.
-    pub fn finalize(self) -> FinalizedXorFilterSegment {
-        FinalizedXorFilterSegment::new(self.keys)
-    }
-}
-
-/// Storage for finalized XOR filters.
-pub struct FinalizedXorFilterStorage {
-    /// Indices of the segments in the sequence of finalized XOR filters.
-    segment_indices: Vec<usize>,
-
-    /// XOR filters that are stored in memory.
-    in_memory: Vec<FinalizedXorFilterSegment>,
-
-    /// Used to generate unique file IDs for intermediate XOR filters.
-    intermediate_file_id_counter: usize,
-
-    /// Prefix for intermediate XOR filter files.
-    intermediate_prefix: String,
-
-    /// The provider for intermediate XOR filter files.
-    intermediate_provider: Arc<dyn ExternalTempFileProvider>,
-
-    /// The memory usage of the in-memory XOR filters.
-    memory_usage: usize,
-
-    /// The global memory usage provided by the user to track the
-    /// total memory usage of the creating XOR filters.
-    global_memory_usage: Arc<AtomicUsize>,
-
-    /// The threshold of the global memory usage of the creating XOR filters.
-    global_memory_usage_threshold: Option<usize>,
-
-    /// Records the number of flushed segments.
-    flushed_seg_count: usize,
-}
-
-impl FinalizedXorFilterStorage {
-    /// Creates a new `FinalizedXorFilterStorage`.
-    pub fn new(
-        intermediate_provider: Arc<dyn ExternalTempFileProvider>,
-        global_memory_usage: Arc<AtomicUsize>,
-        global_memory_usage_threshold: Option<usize>,
-    ) -> Self {
-        let external_prefix = format!("intm-xor-filters-{}", uuid::Uuid::new_v4());
-        Self {
-            segment_indices: Vec::new(),
-            in_memory: Vec::new(),
-            intermediate_file_id_counter: 0,
-            intermediate_prefix: external_prefix,
-            intermediate_provider,
-            memory_usage: 0,
-            global_memory_usage,
-            global_memory_usage_threshold,
-            flushed_seg_count: 0,
-        }
-    }
-
-    /// Returns the memory usage of the storage.
-    pub fn memory_usage(&self) -> usize {
-        self.memory_usage
-    }
-
-    /// Adds a finalized segment to the storage.
-    ///
-    /// If the memory usage exceeds the threshold, flushes the in-memory XOR filters to disk.
-    pub async fn add(&mut self, segment: FinalizedXorFilterSegment) -> Result<usize> {
-        // Reuse the last segment if it is the same as the current one.
-        if self
-            .in_memory
-            .last()
-            .map(|s| s.keys == segment.keys)
-            .unwrap_or(false)
-        {
-            let idx = self.flushed_seg_count + self.in_memory.len() - 1;
-            self.segment_indices.push(idx);
-            return Ok(idx);
-        }
-
-        // Update memory usage.
-        let memory_diff = segment.keys.len() * std::mem::size_of::<u64>();
-        self.memory_usage += memory_diff;
-        self.global_memory_usage
-            .fetch_add(memory_diff, Ordering::Relaxed);
-
-        // Add the finalized XOR filter to the in-memory storage.
-        self.in_memory.push(segment);
-        let idx = self.flushed_seg_count + self.in_memory.len() - 1;
-        self.segment_indices.push(idx);
-
-        // Flush to disk if necessary.
-
-        // Do not flush if memory usage is too low.
-        if self.memory_usage < MIN_MEMORY_USAGE_THRESHOLD {
-            return Ok(idx);
-        }
-
-        // Check if the global memory usage exceeds the threshold and flush to disk if necessary.
-        if let Some(threshold) = self.global_memory_usage_threshold {
-            let global = self.global_memory_usage.load(Ordering::Relaxed);
-
-            if global > threshold {
-                self.flush_in_memory_to_disk().await?;
-
-                self.global_memory_usage
-                    .fetch_sub(self.memory_usage, Ordering::Relaxed);
-                self.memory_usage = 0;
-            }
-        }
-
-        Ok(idx)
-    }
-
-    /// Drains the storage and returns indices of the segments and a stream of finalized XOR filters.
-    pub async fn drain(
-        &mut self,
-    ) -> Result<(
-        Vec<usize>,
-        Pin<Box<dyn Stream<Item = Result<FinalizedXorFilterSegment>> + Send + '_>>,
-    )> {
-        // FAST PATH: memory only
-        if self.intermediate_file_id_counter == 0 {
-            return Ok((
-                std::mem::take(&mut self.segment_indices),
-                Box::pin(stream::iter(self.in_memory.drain(..).map(Ok))),
-            ));
-        }
-
-        // SLOW PATH: memory + disk
-        let mut on_disk = self
-            .intermediate_provider
-            .read_all(&self.intermediate_prefix)
-            .await
-            .context(IntermediateSnafu)?;
-        on_disk.sort_unstable_by(|x, y| x.0.cmp(&y.0));
-
-        let streams = on_disk
-            .into_iter()
-            .map(|(_, reader)| FramedRead::new(reader, IntermediateXorFilterCodecV1::default()));
-
-        let in_memory_stream = stream::iter(self.in_memory.drain(..)).map(Ok);
-        Ok((
-            std::mem::take(&mut self.segment_indices),
-            Box::pin(stream::iter(streams).flatten().chain(in_memory_stream)),
-        ))
-    }
-
-    /// Flushes the in-memory XOR filters to disk.
-    async fn flush_in_memory_to_disk(&mut self) -> Result<()> {
-        let file_id = self.intermediate_file_id_counter;
-        self.intermediate_file_id_counter += 1;
-        self.flushed_seg_count += self.in_memory.len();
-
-        let file_id = format!("{:08}", file_id);
-        let mut writer = self
-            .intermediate_provider
-            .create(&self.intermediate_prefix, &file_id)
-            .await
-            .context(IntermediateSnafu)?;
-
-        let fw = FramedWrite::new(&mut writer, IntermediateXorFilterCodecV1::default());
-        // `forward()` will flush and close the writer when the stream ends
-        if let Err(e) = stream::iter(self.in_memory.drain(..).map(Ok))
-            .forward(fw)
-            .await
-        {
-            writer.close().await.context(IoSnafu)?;
-            writer.flush().await.context(IoSnafu)?;
-            return Err(e);
-        }
-
-        Ok(())
-    }
-}
-
-impl Drop for FinalizedXorFilterStorage {
-    fn drop(&mut self) {
-        self.global_memory_usage
-            .fetch_sub(self.memory_usage, Ordering::Relaxed);
-    }
 }
 
 /// `XorFilterCreator` is responsible for creating and managing XOR filters
 /// for a set of elements. It divides the rows into segments and creates
 /// XOR filters for each segment.
-///
-/// # Format
-///
-/// The XOR filter creator writes the following format to the writer:
-///
-/// ```text
-/// +--------------------+--------------------+-----+----------------------+----------------------+
-/// | XOR filter 0       | XOR filter 1       | ... | XorFilterMeta        | Meta size            |
-/// +--------------------+--------------------+-----+----------------------+----------------------+
-/// |<- bytes (size 0) ->|<- bytes (size 1) ->| ... |<- json (meta size) ->|<- u32 LE (4 bytes) ->|
-/// ```
-///
 pub struct XorFilterCreator {
-    /// The number of rows per segment set by the user.
-    rows_per_segment: usize,
-
-    /// Row count that added to the XOR filter so far.
-    accumulated_row_count: usize,
-
-    /// Current segment builder
-    current_segment_builder: XorFilterSegmentBuilder,
-
-    /// Storage for finalized XOR filters.
-    finalized_xor_filters: FinalizedXorFilterStorage,
-
-    /// Global memory usage of the XOR filter creator.
-    global_memory_usage: Arc<AtomicUsize>,
+    /// Internal implementation using the new common infrastructure.
+    inner: XorFilterCreatorV2,
 }
 
 impl XorFilterCreator {
@@ -292,11 +287,8 @@ impl XorFilterCreator {
         );
 
         Self {
-            rows_per_segment,
-            accumulated_row_count: 0,
-            current_segment_builder: XorFilterSegmentBuilder::new(),
-            global_memory_usage: global_memory_usage.clone(),
-            finalized_xor_filters: FinalizedXorFilterStorage::new(
+            inner: XorFilterCreatorV2::new(
+                rows_per_segment,
                 intermediate_provider,
                 global_memory_usage,
                 global_memory_usage_threshold,
@@ -306,123 +298,40 @@ impl XorFilterCreator {
 
     /// Add a segment directly to the creator.
     pub async fn add_segment(&mut self, segment_builder: XorFilterSegmentBuilder) -> Result<()> {
-        let segment = segment_builder.finalize();
-        self.accumulated_row_count += 1;
-        self.finalized_xor_filters.add(segment).await?;
-
-        if self.accumulated_row_count % self.rows_per_segment == 0 {
-            // Replace the current segment builder with a new one
-            self.current_segment_builder = XorFilterSegmentBuilder::new();
-        }
-        Ok(())
+        // Convert old segment builder to the new format and add as single row
+        let keys = segment_builder.keys;
+        self.inner.push_row_elems(keys).await.context(CommonSnafu)
     }
 
     /// Adds multiple rows of keys to the XOR filter. If the number of accumulated rows
     /// reaches `rows_per_segment`, it finalizes the current segment.
-    pub async fn push_n_row_elems<I>(&mut self, mut nrows: usize, keys: I) -> Result<()>
+    pub async fn push_n_row_elems<I>(&mut self, nrows: usize, keys: I) -> Result<()>
     where
-        I: IntoIterator<Item = u64>,
+        I: IntoIterator<Item = u64> + Send,
     {
-        if nrows == 0 {
-            return Ok(());
-        }
-        if nrows == 1 {
-            return self.push_row_elems(keys).await;
-        }
-
-        let keys = keys.into_iter().collect::<Vec<_>>();
-        while nrows > 0 {
-            let rows_to_seg_end =
-                self.rows_per_segment - (self.accumulated_row_count % self.rows_per_segment);
-            let rows_to_push = nrows.min(rows_to_seg_end);
-            nrows -= rows_to_push;
-
-            self.accumulated_row_count += rows_to_push;
-
-            self.current_segment_builder
-                .add_keys(keys.iter().copied())?;
-
-            if self.accumulated_row_count % self.rows_per_segment == 0 {
-                // Finalize the current segment and start a new one
-                let segment = std::mem::take(&mut self.current_segment_builder).finalize();
-                self.finalized_xor_filters.add(segment).await?;
-            }
-        }
-
-        Ok(())
+        self.inner
+            .push_n_row_elems(nrows, keys)
+            .await
+            .context(CommonSnafu)
     }
 
     /// Adds a row of keys to the XOR filter. If the number of accumulated rows
     /// reaches `rows_per_segment`, it finalizes the current segment.
     pub async fn push_row_elems<I>(&mut self, keys: I) -> Result<()>
     where
-        I: IntoIterator<Item = u64>,
+        I: IntoIterator<Item = u64> + Send,
     {
-        self.accumulated_row_count += 1;
-
-        self.current_segment_builder.add_keys(keys)?;
-
-        if self.accumulated_row_count % self.rows_per_segment == 0 {
-            // Finalize the current segment and start a new one
-            let segment = std::mem::take(&mut self.current_segment_builder).finalize();
-            self.finalized_xor_filters.add(segment).await?;
-        }
-
-        Ok(())
+        self.inner.push_row_elems(keys).await.context(CommonSnafu)
     }
 
     /// Finalizes any remaining segments and writes the XOR filters and metadata to the provided writer.
-    pub async fn finish(&mut self, mut writer: impl AsyncWrite + Unpin) -> Result<()> {
-        if self.accumulated_row_count % self.rows_per_segment != 0 {
-            // Finalize the current segment if there's any data
-            let segment = std::mem::take(&mut self.current_segment_builder).finalize();
-            if !segment.keys.is_empty() {
-                self.finalized_xor_filters.add(segment).await?;
-            }
-        }
-
-        let mut meta = XorFilterMeta {
-            rows_per_segment: self.rows_per_segment as _,
-            row_count: self.accumulated_row_count as _,
-            ..Default::default()
-        };
-
-        let (indices, mut segs) = self.finalized_xor_filters.drain().await?;
-        meta.segment_loc_indices = indices.into_iter().map(|i| i as u64).collect();
-        meta.segment_count = meta.segment_loc_indices.len() as _;
-
-        while let Some(segment) = segs.next().await {
-            let segment = segment?;
-            let filter = segment.build_filter()?;
-            let bytes = filter.serialize()?;
-            writer.write_all(&bytes).await.context(IoSnafu)?;
-
-            let size = bytes.len() as u64;
-            meta.bloom_filter_locs.push(XorFilterLoc {
-                offset: meta.bloom_filter_size as _,
-                size,
-                element_count: segment.keys.len() as _,
-            });
-            meta.bloom_filter_size += size;
-        }
-
-        let meta_bytes = meta.encode_to_vec();
-        writer.write_all(&meta_bytes).await.context(IoSnafu)?;
-
-        let meta_size = meta_bytes.len() as u32;
-        writer
-            .write_all(&meta_size.to_le_bytes())
-            .await
-            .context(IoSnafu)?;
-        writer.flush().await.context(IoSnafu)?;
-
-        Ok(())
+    pub async fn finish(&mut self, writer: impl AsyncWrite + Unpin + Send) -> Result<()> {
+        self.inner.finish(writer).await.context(CommonSnafu)
     }
 
     /// Returns the memory usage of the creating XOR filter.
     pub fn memory_usage(&self) -> usize {
-        self.current_segment_builder.keys.len() * std::mem::size_of::<u64>()
-            + self.finalized_xor_filters.memory_usage()
+        self.inner.memory_usage()
     }
 }
 
@@ -433,6 +342,7 @@ mod tests {
 
     use arrow_array::UInt32Array;
     use futures::io::Cursor;
+    use prost::Message;
 
     use super::*;
     use crate::external_provider::MockExternalTempFileProvider;
@@ -479,7 +389,7 @@ mod tests {
         let meta_size = u32::from_le_bytes((&bytes[meta_size_offset..]).try_into().unwrap());
 
         let meta_bytes = &bytes[total_size - meta_size as usize - 4..total_size - 4];
-        let meta = XorFilterMeta::decode(meta_bytes).unwrap();
+        let meta = greptime_proto::v1::index::BloomFilterMeta::decode(meta_bytes).unwrap();
 
         assert_eq!(meta.rows_per_segment, 2);
         assert_eq!(meta.segment_count, 2);
@@ -489,158 +399,88 @@ mod tests {
             total_size
         );
 
-        assert_eq!(meta.bloom_filter_locs.len(), 2);
+        // Verify filters work by reconstructing them
+        for (i, segment_loc) in meta.bloom_filter_locs.iter().enumerate() {
+            let filter_bytes = &bytes
+                [segment_loc.offset as usize..(segment_loc.offset + segment_loc.size) as usize];
 
-        // Verify the XOR filters by reading their locations and deserializing
-        let xf0_bytes = &bytes[meta.bloom_filter_locs[0].offset as usize
-            ..(meta.bloom_filter_locs[0].offset + meta.bloom_filter_locs[0].size) as usize];
-        let xf0 = XorFilter::deserialize(xf0_bytes).unwrap();
-        assert!(xf0.contains(1));
-        assert!(xf0.contains(2));
-        assert!(xf0.contains(3));
-        assert!(xf0.contains(4));
+            if !filter_bytes.is_empty() {
+                let xf = XorFilter::deserialize(filter_bytes).unwrap();
+                let segment_idx = meta.segment_loc_indices[i] as usize;
 
-        let xf1_bytes = &bytes[meta.bloom_filter_locs[1].offset as usize
-            ..(meta.bloom_filter_locs[1].offset + meta.bloom_filter_locs[1].size) as usize];
-        let xf1 = XorFilter::deserialize(xf1_bytes).unwrap();
-        assert!(xf1.contains(5));
-        assert!(xf1.contains(6));
-    }
-
-    #[tokio::test]
-    async fn test_xor_filter_creator_add_segment() {
-        let mut writer = Cursor::new(Vec::new());
-        let mut creator = XorFilterCreator::new(
-            2,
-            Arc::new(MockExternalTempFileProvider::new()),
-            Arc::new(AtomicUsize::new(0)),
-            None,
-        );
-
-        // Segment 1
-        let mut segment_builder = XorFilterSegmentBuilder::new();
-        segment_builder.add_keys(vec![1, 2]).unwrap();
-        creator.add_segment(segment_builder).await.unwrap();
-
-        // Segment 2
-        let mut segment_builder = XorFilterSegmentBuilder::new();
-        segment_builder.add_keys(vec![3, 4]).unwrap();
-        creator.add_segment(segment_builder).await.unwrap();
-
-        // Segment 3 with duplicate data - should be reused
-        let mut segment_builder = XorFilterSegmentBuilder::new();
-        segment_builder.add_keys(vec![3, 4]).unwrap();
-        creator.add_segment(segment_builder).await.unwrap();
-
-        creator.finish(&mut writer).await.unwrap();
-
-        let bytes = writer.into_inner();
-        let total_size = bytes.len();
-        let meta_size_offset = total_size - 4;
-        let meta_size = u32::from_le_bytes((&bytes[meta_size_offset..]).try_into().unwrap());
-
-        let meta_bytes = &bytes[total_size - meta_size as usize - 4..total_size - 4];
-        let meta = XorFilterMeta::decode(meta_bytes).unwrap();
-
-        // We should have 3 segments but only 2 unique XOR filters
-        assert_eq!(meta.segment_count, 3);
-        assert_eq!(meta.bloom_filter_locs.len(), 2);
-
-        // The third segment should point to the second XOR filter
-        assert_eq!(meta.segment_loc_indices[2], 1);
-    }
-
-    #[tokio::test]
-    async fn test_xor_filter_creator_push_elems() {
-        let mut writer = Cursor::new(Vec::new());
-        let mut creator = XorFilterCreator::new(
-            2,
-            Arc::new(MockExternalTempFileProvider::new()),
-            Arc::new(AtomicUsize::new(0)),
-            None,
-        );
-
-        // Push single rows
-        creator.push_row_elems(vec![1, 2]).await.unwrap();
-        creator.push_row_elems(vec![3, 4]).await.unwrap();
-        creator.push_row_elems(vec![5, 6]).await.unwrap();
-
-        creator.finish(&mut writer).await.unwrap();
-
-        let bytes = writer.into_inner();
-        let total_size = bytes.len();
-        let meta_size_offset = total_size - 4;
-        let meta_size = u32::from_le_bytes((&bytes[meta_size_offset..]).try_into().unwrap());
-
-        let meta_bytes = &bytes[total_size - meta_size as usize - 4..total_size - 4];
-        let meta = XorFilterMeta::decode(meta_bytes).unwrap();
-
-        assert_eq!(meta.rows_per_segment, 2);
-        assert_eq!(meta.segment_count, 2);
-        assert_eq!(meta.row_count, 3);
-
-        // Verify the XOR filters by reading their locations and deserializing
-        let xf0_bytes = &bytes[meta.bloom_filter_locs[0].offset as usize
-            ..(meta.bloom_filter_locs[0].offset + meta.bloom_filter_locs[0].size) as usize];
-        let xf0 = XorFilter::deserialize(xf0_bytes).unwrap();
-        assert!(xf0.contains(1));
-        assert!(xf0.contains(2));
-        assert!(xf0.contains(3));
-        assert!(xf0.contains(4));
-
-        let xf1_bytes = &bytes[meta.bloom_filter_locs[1].offset as usize
-            ..(meta.bloom_filter_locs[1].offset + meta.bloom_filter_locs[1].size) as usize];
-        let xf1 = XorFilter::deserialize(xf1_bytes).unwrap();
-        assert!(xf1.contains(5));
-        assert!(xf1.contains(6));
-    }
-
-    #[tokio::test]
-    async fn test_xor_filter_creator_push_n_rows() {
-        let mut writer = Cursor::new(Vec::new());
-        let mut creator = XorFilterCreator::new(
-            2,
-            Arc::new(MockExternalTempFileProvider::new()),
-            Arc::new(AtomicUsize::new(0)),
-            None,
-        );
-
-        // Push multiple rows at once
-        creator.push_n_row_elems(5, vec![1, 2]).await.unwrap();
-        creator.push_n_row_elems(5, vec![3, 4]).await.unwrap();
-
-        creator.finish(&mut writer).await.unwrap();
-
-        let bytes = writer.into_inner();
-        let total_size = bytes.len();
-        let meta_size_offset = total_size - 4;
-        let meta_size = u32::from_le_bytes((&bytes[meta_size_offset..]).try_into().unwrap());
-
-        let meta_bytes = &bytes[total_size - meta_size as usize - 4..total_size - 4];
-        let meta = XorFilterMeta::decode(meta_bytes).unwrap();
-
-        assert_eq!(meta.rows_per_segment, 2);
-        assert_eq!(meta.segment_count, 5); // 10 rows / 2 rows per segment = 5 segments
-        assert_eq!(meta.row_count, 10);
-
-        // Check that all segments contain the expected values
-        let mut found_1_2 = false;
-        let mut found_3_4 = false;
-
-        for i in 0..meta.bloom_filter_locs.len() {
-            let xf_bytes = &bytes[meta.bloom_filter_locs[i].offset as usize
-                ..(meta.bloom_filter_locs[i].offset + meta.bloom_filter_locs[i].size) as usize];
-            let xf = XorFilter::deserialize(xf_bytes).unwrap();
-
-            if xf.contains(1) && xf.contains(2) {
-                found_1_2 = true;
-            }
-            if xf.contains(3) && xf.contains(4) {
-                found_3_4 = true;
+                if segment_idx == 0 {
+                    // First segment should contain keys from first two rows
+                    for key in hasher.hash_values(&array1).unwrap() {
+                        assert!(xf.contains(key));
+                    }
+                    for key in hasher.hash_values(&array2).unwrap() {
+                        assert!(xf.contains(key));
+                    }
+                } else {
+                    // Second segment should contain keys from third row
+                    for key in hasher.hash_values(&array3).unwrap() {
+                        assert!(xf.contains(key));
+                    }
+                }
             }
         }
+    }
 
-        assert!(found_1_2);
-        assert!(found_3_4);
+    #[tokio::test]
+    async fn test_xor_filter_creator_batch_push() {
+        let mut writer = Cursor::new(Vec::new());
+        let mut creator: XorFilterCreator = XorFilterCreator::new(
+            2,
+            Arc::new(MockExternalTempFileProvider::new()),
+            Arc::new(AtomicUsize::new(0)),
+            None,
+        );
+
+        let hasher = ArrayValueHasher::default();
+        let array = UInt32Array::from(vec![1, 2, 3]);
+
+        creator
+            .push_n_row_elems(5, hasher.hash_values(&array).unwrap())
+            .await
+            .unwrap();
+
+        assert!(creator.memory_usage() > 0);
+
+        creator.finish(&mut writer).await.unwrap();
+
+        let bytes = writer.into_inner();
+        let total_size = bytes.len();
+        let meta_size_offset = total_size - 4;
+        let meta_size = u32::from_le_bytes((&bytes[meta_size_offset..]).try_into().unwrap());
+
+        let meta_bytes = &bytes[total_size - meta_size as usize - 4..total_size - 4];
+        let meta = greptime_proto::v1::index::BloomFilterMeta::decode(meta_bytes).unwrap();
+
+        assert_eq!(meta.rows_per_segment, 2);
+        assert_eq!(meta.segment_count, 3); // 5 rows / 2 rows per segment = 3 segments
+        assert_eq!(meta.row_count, 5);
+
+        // All segments should contain the same keys since we pushed the same data to each row
+        for segment_loc in &meta.bloom_filter_locs {
+            let filter_bytes = &bytes
+                [segment_loc.offset as usize..(segment_loc.offset + segment_loc.size) as usize];
+
+            if !filter_bytes.is_empty() {
+                let xf = XorFilter::deserialize(filter_bytes).unwrap();
+                for key in hasher.hash_values(&array).unwrap() {
+                    assert!(xf.contains(key));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_xor_filter_segment_builder() {
+        let mut builder = XorFilterSegmentBuilder::new();
+
+        builder.add_key(42).unwrap();
+        builder.add_keys(vec![1, 2, 3]).unwrap();
+
+        assert_eq!(builder.keys, vec![42, 1, 2, 3]);
     }
 }

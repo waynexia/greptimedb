@@ -12,23 +12,239 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod finalize_segment;
-mod intermediate_codec;
-
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
-use finalize_segment::FinalizedBloomFilterStorage;
-use futures::{AsyncWrite, AsyncWriteExt, StreamExt};
-use greptime_proto::v1::index::{BloomFilterLoc, BloomFilterMeta};
-use prost::Message;
+use fastbloom::BloomFilter as FastBloomFilter;
+use futures::AsyncWrite;
 use snafu::ResultExt;
 
-use crate::bloom_filter::error::{IoSnafu, Result};
-use crate::bloom_filter::SEED;
+use crate::bloom_filter::error::{CommonSnafu, Result};
+use crate::common::creator::{FilterCreator, FilterCreatorImpl, FinalizedSegment, SegmentBuilder};
+use crate::common::CommonResult;
 use crate::external_provider::ExternalTempFileProvider;
 use crate::Bytes;
+
+/// Bloom filter segment builder implementation.
+#[derive(Debug)]
+pub struct BloomFilterSegmentBuilder {
+    /// Distinct elements in this segment.
+    distinct_elems: HashSet<Bytes>,
+    /// False positive rate for creating the bloom filter.
+    false_positive_rate: f64,
+}
+
+impl BloomFilterSegmentBuilder {
+    /// Create a new bloom filter segment builder.
+    pub fn new(false_positive_rate: f64) -> Self {
+        Self {
+            distinct_elems: HashSet::default(),
+            false_positive_rate,
+        }
+    }
+}
+
+impl SegmentBuilder for BloomFilterSegmentBuilder {
+    type Input = Vec<Bytes>;
+    type Segment = FinalizedBloomFilterSegment;
+
+    fn add_data(&mut self, data: Self::Input) -> CommonResult<()> {
+        for elem in data {
+            self.distinct_elems.insert(elem);
+        }
+        Ok(())
+    }
+
+    fn finalize(self) -> Self::Segment {
+        FinalizedBloomFilterSegment::new(self.distinct_elems, self.false_positive_rate)
+    }
+
+    fn memory_usage(&self) -> usize {
+        self.distinct_elems.iter().map(|elem| elem.len()).sum()
+    }
+}
+
+/// Finalized bloom filter segment.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FinalizedBloomFilterSegment {
+    /// Bloom filter bytes.
+    pub bloom_filter_bytes: Vec<u8>,
+    /// Number of elements in this segment.
+    pub element_count: usize,
+}
+
+impl FinalizedBloomFilterSegment {
+    /// Create a new finalized bloom filter segment.
+    pub fn new(distinct_elems: HashSet<Bytes>, false_positive_rate: f64) -> Self {
+        let element_count = distinct_elems.len();
+
+        if element_count == 0 {
+            return Self {
+                bloom_filter_bytes: Vec::new(),
+                element_count: 0,
+            };
+        }
+
+        let mut filter = FastBloomFilter::with_false_pos(false_positive_rate)
+            .seed(&crate::bloom_filter::SEED)
+            .expected_items(element_count);
+
+        for elem in distinct_elems {
+            filter.insert(&elem);
+        }
+
+        let bloom_filter_bytes: Vec<u8> = filter
+            .as_slice()
+            .iter()
+            .flat_map(|&x| x.to_le_bytes())
+            .collect();
+
+        Self {
+            bloom_filter_bytes,
+            element_count,
+        }
+    }
+}
+
+impl FinalizedSegment for FinalizedBloomFilterSegment {
+    fn memory_usage(&self) -> usize {
+        self.bloom_filter_bytes.len() + std::mem::size_of::<usize>()
+    }
+
+    fn serialize_for_storage(&self) -> CommonResult<Vec<u8>> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&(self.element_count as u64).to_le_bytes());
+        data.extend_from_slice(&(self.bloom_filter_bytes.len() as u64).to_le_bytes());
+        data.extend_from_slice(&self.bloom_filter_bytes);
+        Ok(data)
+    }
+
+    fn deserialize_from_storage(bytes: &[u8]) -> CommonResult<Self> {
+        if bytes.len() < 16 {
+            return Err(crate::common::CommonFilterError::Io {
+                error: std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid segment data"),
+                location: snafu::Location::new(file!(), line!(), 0),
+            });
+        }
+
+        let element_count = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
+        let filter_size = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+
+        if bytes.len() != 16 + filter_size {
+            return Err(crate::common::CommonFilterError::Io {
+                error: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Invalid segment data size",
+                ),
+                location: snafu::Location::new(file!(), line!(), 0),
+            });
+        }
+
+        let bloom_filter_bytes = bytes[16..].to_vec();
+
+        Ok(Self {
+            bloom_filter_bytes,
+            element_count,
+        })
+    }
+
+    fn build_filter(&self) -> CommonResult<Vec<u8>> {
+        Ok(self.bloom_filter_bytes.clone())
+    }
+
+    fn element_count(&self) -> usize {
+        self.element_count
+    }
+}
+
+/// Refactored bloom filter creator using the common infrastructure.
+pub struct BloomFilterCreatorV2 {
+    /// The underlying generic creator implementation.
+    inner: FilterCreatorImpl<BloomFilterSegmentBuilder>,
+
+    /// False positive rate for creating new builders.
+    false_positive_rate: f64,
+}
+
+impl BloomFilterCreatorV2 {
+    /// Creates a new `BloomFilterCreatorV2` with the specified number of rows per segment.
+    pub fn new(
+        rows_per_segment: usize,
+        false_positive_rate: f64,
+        intermediate_provider: Arc<dyn ExternalTempFileProvider>,
+        global_memory_usage: Arc<AtomicUsize>,
+        global_memory_usage_threshold: Option<usize>,
+    ) -> Self {
+        let initial_builder = BloomFilterSegmentBuilder::new(false_positive_rate);
+        let inner = FilterCreatorImpl::new(
+            rows_per_segment,
+            intermediate_provider,
+            global_memory_usage,
+            global_memory_usage_threshold,
+            initial_builder,
+        );
+
+        Self {
+            inner,
+            false_positive_rate,
+        }
+    }
+
+    /// Returns the memory usage of the creating bloom filter.
+    pub fn memory_usage(&self) -> usize {
+        self.inner.memory_usage()
+    }
+}
+
+impl FilterCreator for BloomFilterCreatorV2 {
+    type Builder = BloomFilterSegmentBuilder;
+    type ElementInput = Bytes;
+
+    async fn push_n_row_elems(
+        &mut self,
+        nrows: usize,
+        elems: impl IntoIterator<Item = Self::ElementInput> + Send,
+    ) -> CommonResult<()> {
+        // Convert iterator to Vec to handle the repeated usage across segments
+        let elems_vec: Vec<Bytes> = elems.into_iter().collect();
+
+        // For bloom filters, we add the same elements to each row
+        // We call add_data once with the total row count
+        let false_positive_rate = self.false_positive_rate;
+        self.inner
+            .add_data(elems_vec, nrows, move || {
+                BloomFilterSegmentBuilder::new(false_positive_rate)
+            })
+            .await
+    }
+
+    async fn push_row_elems(
+        &mut self,
+        elems: impl IntoIterator<Item = Self::ElementInput> + Send,
+    ) -> CommonResult<()> {
+        let elems_vec: Vec<Bytes> = elems.into_iter().collect();
+        let false_positive_rate = self.false_positive_rate;
+        self.inner
+            .add_data(elems_vec, 1, move || {
+                BloomFilterSegmentBuilder::new(false_positive_rate)
+            })
+            .await
+    }
+
+    async fn finish(&mut self, writer: impl AsyncWrite + Unpin + Send) -> CommonResult<()> {
+        let false_positive_rate = self.false_positive_rate;
+        self.inner
+            .finish(writer, move || {
+                BloomFilterSegmentBuilder::new(false_positive_rate)
+            })
+            .await
+    }
+
+    fn memory_usage(&self) -> usize {
+        self.inner.memory_usage()
+    }
+}
 
 /// `BloomFilterCreator` is responsible for creating and managing bloom filters
 /// for a set of elements. It divides the rows into segments and creates
@@ -46,26 +262,8 @@ use crate::Bytes;
 /// ```
 ///
 pub struct BloomFilterCreator {
-    /// The number of rows per segment set by the user.
-    rows_per_segment: usize,
-
-    /// Row count that added to the bloom filter so far.
-    accumulated_row_count: usize,
-
-    /// A set of distinct elements in the current segment.
-    cur_seg_distinct_elems: HashSet<Bytes>,
-
-    /// The memory usage of the current segment's distinct elements.
-    cur_seg_distinct_elems_mem_usage: usize,
-
-    /// Storage for finalized Bloom filters.
-    finalized_bloom_filters: FinalizedBloomFilterStorage,
-
-    /// Row count that finalized so far.
-    finalized_row_count: usize,
-
-    /// Global memory usage of the bloom filter creator.
-    global_memory_usage: Arc<AtomicUsize>,
+    /// Internal implementation using the new common infrastructure.
+    inner: BloomFilterCreatorV2,
 }
 
 impl BloomFilterCreator {
@@ -87,18 +285,13 @@ impl BloomFilterCreator {
         );
 
         Self {
-            rows_per_segment,
-            accumulated_row_count: 0,
-            cur_seg_distinct_elems: HashSet::default(),
-            cur_seg_distinct_elems_mem_usage: 0,
-            global_memory_usage: global_memory_usage.clone(),
-            finalized_bloom_filters: FinalizedBloomFilterStorage::new(
+            inner: BloomFilterCreatorV2::new(
+                rows_per_segment,
                 false_positive_rate,
                 intermediate_provider,
                 global_memory_usage,
                 global_memory_usage_threshold,
             ),
-            finalized_row_count: 0,
         }
     }
 
@@ -106,138 +299,32 @@ impl BloomFilterCreator {
     /// reaches `rows_per_segment`, it finalizes the current segment.
     pub async fn push_n_row_elems(
         &mut self,
-        mut nrows: usize,
-        elems: impl IntoIterator<Item = Bytes>,
+        nrows: usize,
+        elems: impl IntoIterator<Item = Bytes> + Send,
     ) -> Result<()> {
-        if nrows == 0 {
-            return Ok(());
-        }
-        if nrows == 1 {
-            return self.push_row_elems(elems).await;
-        }
-
-        let elems = elems.into_iter().collect::<Vec<_>>();
-        while nrows > 0 {
-            let rows_to_seg_end =
-                self.rows_per_segment - (self.accumulated_row_count % self.rows_per_segment);
-            let rows_to_push = nrows.min(rows_to_seg_end);
-            nrows -= rows_to_push;
-
-            self.accumulated_row_count += rows_to_push;
-
-            let mut mem_diff = 0;
-            for elem in &elems {
-                let len = elem.len();
-                let is_new = self.cur_seg_distinct_elems.insert(elem.clone());
-                if is_new {
-                    mem_diff += len;
-                }
-            }
-            self.cur_seg_distinct_elems_mem_usage += mem_diff;
-            self.global_memory_usage
-                .fetch_add(mem_diff, Ordering::Relaxed);
-
-            if self.accumulated_row_count % self.rows_per_segment == 0 {
-                self.finalize_segment().await?;
-                self.finalized_row_count = self.accumulated_row_count;
-            }
-        }
-
-        Ok(())
+        self.inner
+            .push_n_row_elems(nrows, elems)
+            .await
+            .context(CommonSnafu)
     }
 
     /// Adds a row of elements to the bloom filter. If the number of accumulated rows
     /// reaches `rows_per_segment`, it finalizes the current segment.
-    pub async fn push_row_elems(&mut self, elems: impl IntoIterator<Item = Bytes>) -> Result<()> {
-        self.accumulated_row_count += 1;
-
-        let mut mem_diff = 0;
-        for elem in elems.into_iter() {
-            let len = elem.len();
-            let is_new = self.cur_seg_distinct_elems.insert(elem);
-            if is_new {
-                mem_diff += len;
-            }
-        }
-        self.cur_seg_distinct_elems_mem_usage += mem_diff;
-        self.global_memory_usage
-            .fetch_add(mem_diff, Ordering::Relaxed);
-
-        if self.accumulated_row_count % self.rows_per_segment == 0 {
-            self.finalize_segment().await?;
-            self.finalized_row_count = self.accumulated_row_count;
-        }
-
-        Ok(())
+    pub async fn push_row_elems(
+        &mut self,
+        elems: impl IntoIterator<Item = Bytes> + Send,
+    ) -> Result<()> {
+        self.inner.push_row_elems(elems).await.context(CommonSnafu)
     }
 
     /// Finalizes any remaining segments and writes the bloom filters and metadata to the provided writer.
-    pub async fn finish(&mut self, mut writer: impl AsyncWrite + Unpin) -> Result<()> {
-        if self.accumulated_row_count > self.finalized_row_count {
-            self.finalize_segment().await?;
-        }
-
-        let mut meta = BloomFilterMeta {
-            rows_per_segment: self.rows_per_segment as _,
-            row_count: self.accumulated_row_count as _,
-            ..Default::default()
-        };
-
-        let (indices, mut segs) = self.finalized_bloom_filters.drain().await?;
-        meta.segment_loc_indices = indices.into_iter().map(|i| i as u64).collect();
-        meta.segment_count = meta.segment_loc_indices.len() as _;
-
-        while let Some(segment) = segs.next().await {
-            let segment = segment?;
-            writer
-                .write_all(&segment.bloom_filter_bytes)
-                .await
-                .context(IoSnafu)?;
-
-            let size = segment.bloom_filter_bytes.len() as u64;
-            meta.bloom_filter_locs.push(BloomFilterLoc {
-                offset: meta.bloom_filter_size as _,
-                size,
-                element_count: segment.element_count as _,
-            });
-            meta.bloom_filter_size += size;
-        }
-
-        let meta_bytes = meta.encode_to_vec();
-        writer.write_all(&meta_bytes).await.context(IoSnafu)?;
-
-        let meta_size = meta_bytes.len() as u32;
-        writer
-            .write_all(&meta_size.to_le_bytes())
-            .await
-            .context(IoSnafu)?;
-        writer.flush().await.unwrap();
-
-        Ok(())
+    pub async fn finish(&mut self, writer: impl AsyncWrite + Unpin + Send) -> Result<()> {
+        self.inner.finish(writer).await.context(CommonSnafu)
     }
 
     /// Returns the memory usage of the creating bloom filter.
     pub fn memory_usage(&self) -> usize {
-        self.cur_seg_distinct_elems_mem_usage + self.finalized_bloom_filters.memory_usage()
-    }
-
-    async fn finalize_segment(&mut self) -> Result<()> {
-        let elem_count = self.cur_seg_distinct_elems.len();
-        self.finalized_bloom_filters
-            .add(self.cur_seg_distinct_elems.drain(), elem_count)
-            .await?;
-
-        self.global_memory_usage
-            .fetch_sub(self.cur_seg_distinct_elems_mem_usage, Ordering::Relaxed);
-        self.cur_seg_distinct_elems_mem_usage = 0;
-        Ok(())
-    }
-}
-
-impl Drop for BloomFilterCreator {
-    fn drop(&mut self) {
-        self.global_memory_usage
-            .fetch_sub(self.cur_seg_distinct_elems_mem_usage, Ordering::Relaxed);
+        self.inner.memory_usage()
     }
 }
 
@@ -245,6 +332,7 @@ impl Drop for BloomFilterCreator {
 mod tests {
     use fastbloom::BloomFilter;
     use futures::io::Cursor;
+    use prost::Message;
 
     use super::*;
     use crate::external_provider::MockExternalTempFileProvider;
@@ -272,7 +360,6 @@ mod tests {
             .push_row_elems(vec![b"a".to_vec(), b"b".to_vec()])
             .await
             .unwrap();
-        assert!(creator.cur_seg_distinct_elems_mem_usage > 0);
         assert!(creator.memory_usage() > 0);
 
         creator
@@ -280,14 +367,12 @@ mod tests {
             .await
             .unwrap();
         // Finalize the first segment
-        assert_eq!(creator.cur_seg_distinct_elems_mem_usage, 0);
         assert!(creator.memory_usage() > 0);
 
         creator
             .push_row_elems(vec![b"e".to_vec(), b"f".to_vec()])
             .await
             .unwrap();
-        assert!(creator.cur_seg_distinct_elems_mem_usage > 0);
         assert!(creator.memory_usage() > 0);
 
         creator.finish(&mut writer).await.unwrap();
@@ -298,7 +383,7 @@ mod tests {
         let meta_size = u32::from_le_bytes((&bytes[meta_size_offset..]).try_into().unwrap());
 
         let meta_bytes = &bytes[total_size - meta_size as usize - 4..total_size - 4];
-        let meta = BloomFilterMeta::decode(meta_bytes).unwrap();
+        let meta = greptime_proto::v1::index::BloomFilterMeta::decode(meta_bytes).unwrap();
 
         assert_eq!(meta.rows_per_segment, 2);
         assert_eq!(meta.segment_count, 2);
@@ -314,7 +399,7 @@ mod tests {
                 &bytes[segment.offset as usize..(segment.offset + segment.size) as usize];
             let v = u64_vec_from_bytes(bloom_filter_bytes);
             let bloom_filter = BloomFilter::from_vec(v)
-                .seed(&SEED)
+                .seed(&crate::bloom_filter::SEED)
                 .expected_items(segment.element_count as usize);
             bfs.push(bloom_filter);
         }
@@ -347,21 +432,18 @@ mod tests {
             .push_n_row_elems(5, vec![b"a".to_vec(), b"b".to_vec()])
             .await
             .unwrap();
-        assert!(creator.cur_seg_distinct_elems_mem_usage > 0);
         assert!(creator.memory_usage() > 0);
 
         creator
             .push_n_row_elems(5, vec![b"c".to_vec(), b"d".to_vec()])
             .await
             .unwrap();
-        assert_eq!(creator.cur_seg_distinct_elems_mem_usage, 0);
         assert!(creator.memory_usage() > 0);
 
         creator
             .push_n_row_elems(10, vec![b"e".to_vec(), b"f".to_vec()])
             .await
             .unwrap();
-        assert_eq!(creator.cur_seg_distinct_elems_mem_usage, 0);
         assert!(creator.memory_usage() > 0);
 
         creator.finish(&mut writer).await.unwrap();
@@ -372,7 +454,7 @@ mod tests {
         let meta_size = u32::from_le_bytes((&bytes[meta_size_offset..]).try_into().unwrap());
 
         let meta_bytes = &bytes[total_size - meta_size as usize - 4..total_size - 4];
-        let meta = BloomFilterMeta::decode(meta_bytes).unwrap();
+        let meta = greptime_proto::v1::index::BloomFilterMeta::decode(meta_bytes).unwrap();
 
         assert_eq!(meta.rows_per_segment, 2);
         assert_eq!(meta.segment_count, 10);
@@ -388,7 +470,7 @@ mod tests {
                 &bytes[segment.offset as usize..(segment.offset + segment.size) as usize];
             let v = u64_vec_from_bytes(bloom_filter_bytes);
             let bloom_filter = BloomFilter::from_vec(v)
-                .seed(&SEED)
+                .seed(&crate::bloom_filter::SEED)
                 .expected_items(segment.element_count as _);
             bfs.push(bloom_filter);
         }
@@ -439,7 +521,7 @@ mod tests {
         let meta_size = u32::from_le_bytes((&bytes[meta_size_offset..]).try_into().unwrap());
 
         let meta_bytes = &bytes[total_size - meta_size as usize - 4..total_size - 4];
-        let meta = BloomFilterMeta::decode(meta_bytes).unwrap();
+        let meta = greptime_proto::v1::index::BloomFilterMeta::decode(meta_bytes).unwrap();
 
         assert_eq!(meta.rows_per_segment, 2);
         assert_eq!(meta.segment_count, 3);

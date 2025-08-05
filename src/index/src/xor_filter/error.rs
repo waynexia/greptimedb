@@ -99,6 +99,13 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+
+    #[snafu(display("Common infrastructure error"))]
+    Common {
+        source: crate::common::CommonFilterError,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 impl ErrorExt for Error {
@@ -114,7 +121,8 @@ impl ErrorExt for Error {
             | UnexpectedMetaSize { .. }
             | DecodeProto { .. }
             | InvalidIntermediateMagic { .. }
-            | Intermediate { .. } => StatusCode::Unexpected,
+            | Intermediate { .. }
+            | Common { .. } => StatusCode::Unexpected,
             External { source, .. } => source.status_code(),
         }
     }
