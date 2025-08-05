@@ -53,7 +53,11 @@ mod prune_test;
 #[cfg(test)]
 mod row_selector_test;
 #[cfg(test)]
+mod scan_test;
+#[cfg(test)]
 mod set_role_state_test;
+#[cfg(test)]
+mod sync_test;
 #[cfg(test)]
 mod truncate_test;
 
@@ -68,7 +72,7 @@ use common_base::Plugins;
 use common_error::ext::BoxedError;
 use common_meta::key::SchemaMetadataManagerRef;
 use common_recordbatch::SendableRecordBatchStream;
-use common_telemetry::tracing;
+use common_telemetry::{info, tracing};
 use common_wal::options::{WalOptions, WAL_OPTIONS_KEY};
 use futures::future::{join_all, try_join_all};
 use object_store::manager::ObjectStoreManagerRef;
@@ -76,24 +80,35 @@ use snafu::{ensure, OptionExt, ResultExt};
 use store_api::codec::PrimaryKeyEncoding;
 use store_api::logstore::provider::Provider;
 use store_api::logstore::LogStore;
-use store_api::metadata::RegionMetadataRef;
+use store_api::metadata::{ColumnMetadata, RegionMetadataRef};
+use store_api::metric_engine_consts::{
+    MANIFEST_INFO_EXTENSION_KEY, TABLE_COLUMN_METADATA_EXTENSION_KEY,
+};
 use store_api::region_engine::{
-    BatchResponses, RegionEngine, RegionRole, RegionScannerRef, RegionStatistic,
-    SetRegionRoleStateResponse, SettableRegionRoleState,
+    BatchResponses, RegionEngine, RegionManifestInfo, RegionRole, RegionScannerRef,
+    RegionStatistic, SetRegionRoleStateResponse, SettableRegionRoleState, SyncManifestResponse,
 };
 use store_api::region_request::{AffectedRows, RegionOpenRequest, RegionRequest};
 use store_api::storage::{RegionId, ScanRequest, SequenceNumber};
+use store_api::ManifestVersion;
 use tokio::sync::{oneshot, Semaphore};
 
 use crate::cache::CacheStrategy;
 use crate::config::MitoConfig;
 use crate::error::{
-    InvalidRequestSnafu, JoinSnafu, RecvSnafu, RegionNotFoundSnafu, Result, SerdeJsonSnafu,
+    InvalidRequestSnafu, JoinSnafu, MitoManifestInfoSnafu, RecvSnafu, RegionNotFoundSnafu, Result,
+    SerdeJsonSnafu, SerializeColumnMetadataSnafu,
 };
+#[cfg(feature = "enterprise")]
+use crate::extension::BoxedExtensionRangeProviderFactory;
 use crate::manifest::action::RegionEdit;
+use crate::memtable::MemtableStats;
 use crate::metrics::HANDLE_REQUEST_ELAPSED;
 use crate::read::scan_region::{ScanRegion, Scanner};
+use crate::read::stream::ScanBatchStream;
+use crate::region::MitoRegionRef;
 use crate::request::{RegionEditRequest, WorkerRequest};
+use crate::sst::file::FileMeta;
 use crate::wal::entry_distributor::{
     build_wal_entry_distributor_and_receivers, DEFAULT_ENTRY_RECEIVER_BUFFER_SIZE,
 };
@@ -101,6 +116,81 @@ use crate::wal::raw_entry_reader::{LogStoreRawEntryReader, RawEntryReader};
 use crate::worker::WorkerGroup;
 
 pub const MITO_ENGINE_NAME: &str = "mito";
+
+pub struct MitoEngineBuilder<'a, S: LogStore> {
+    data_home: &'a str,
+    config: MitoConfig,
+    log_store: Arc<S>,
+    object_store_manager: ObjectStoreManagerRef,
+    schema_metadata_manager: SchemaMetadataManagerRef,
+    plugins: Plugins,
+    #[cfg(feature = "enterprise")]
+    extension_range_provider_factory: Option<BoxedExtensionRangeProviderFactory>,
+}
+
+impl<'a, S: LogStore> MitoEngineBuilder<'a, S> {
+    pub fn new(
+        data_home: &'a str,
+        config: MitoConfig,
+        log_store: Arc<S>,
+        object_store_manager: ObjectStoreManagerRef,
+        schema_metadata_manager: SchemaMetadataManagerRef,
+        plugins: Plugins,
+    ) -> Self {
+        Self {
+            data_home,
+            config,
+            log_store,
+            object_store_manager,
+            schema_metadata_manager,
+            plugins,
+            #[cfg(feature = "enterprise")]
+            extension_range_provider_factory: None,
+        }
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[must_use]
+    pub fn with_extension_range_provider_factory(
+        self,
+        extension_range_provider_factory: Option<BoxedExtensionRangeProviderFactory>,
+    ) -> Self {
+        Self {
+            extension_range_provider_factory,
+            ..self
+        }
+    }
+
+    pub async fn try_build(mut self) -> Result<MitoEngine> {
+        self.config.sanitize(self.data_home)?;
+
+        let config = Arc::new(self.config);
+        let workers = WorkerGroup::start(
+            config.clone(),
+            self.log_store.clone(),
+            self.object_store_manager,
+            self.schema_metadata_manager,
+            self.plugins,
+        )
+        .await?;
+        let wal_raw_entry_reader = Arc::new(LogStoreRawEntryReader::new(self.log_store));
+        let inner = EngineInner {
+            workers,
+            config,
+            wal_raw_entry_reader,
+            #[cfg(feature = "enterprise")]
+            extension_range_provider_factory: None,
+        };
+
+        #[cfg(feature = "enterprise")]
+        let inner =
+            inner.with_extension_range_provider_factory(self.extension_range_provider_factory);
+
+        Ok(MitoEngine {
+            inner: Arc::new(inner),
+        })
+    }
+}
 
 /// Region engine implementation for timeseries data.
 #[derive(Clone)]
@@ -112,26 +202,21 @@ impl MitoEngine {
     /// Returns a new [MitoEngine] with specific `config`, `log_store` and `object_store`.
     pub async fn new<S: LogStore>(
         data_home: &str,
-        mut config: MitoConfig,
+        config: MitoConfig,
         log_store: Arc<S>,
         object_store_manager: ObjectStoreManagerRef,
         schema_metadata_manager: SchemaMetadataManagerRef,
         plugins: Plugins,
     ) -> Result<MitoEngine> {
-        config.sanitize(data_home)?;
-
-        Ok(MitoEngine {
-            inner: Arc::new(
-                EngineInner::new(
-                    config,
-                    log_store,
-                    object_store_manager,
-                    schema_metadata_manager,
-                    plugins,
-                )
-                .await?,
-            ),
-        })
+        let builder = MitoEngineBuilder::new(
+            data_home,
+            config,
+            log_store,
+            object_store_manager,
+            schema_metadata_manager,
+            plugins,
+        );
+        builder.try_build().await
     }
 
     /// Returns true if the specific region exists.
@@ -146,17 +231,13 @@ impl MitoEngine {
 
     /// Returns the region disk/memory statistic.
     pub fn get_region_statistic(&self, region_id: RegionId) -> Option<RegionStatistic> {
-        self.inner
-            .workers
-            .get_region(region_id)
+        self.find_region(region_id)
             .map(|region| region.region_statistic())
     }
 
     /// Returns primary key encoding of the region.
     pub fn get_primary_key_encoding(&self, region_id: RegionId) -> Option<PrimaryKeyEncoding> {
-        self.inner
-            .workers
-            .get_region(region_id)
+        self.find_region(region_id)
             .map(|r| r.primary_key_encoding())
     }
 
@@ -171,14 +252,27 @@ impl MitoEngine {
         request: ScanRequest,
     ) -> Result<SendableRecordBatchStream, BoxedError> {
         self.scanner(region_id, request)
+            .await
             .map_err(BoxedError::new)?
             .scan()
             .await
     }
 
+    /// Scan [`Batch`]es by [`ScanRequest`].
+    pub async fn scan_batch(
+        &self,
+        region_id: RegionId,
+        request: ScanRequest,
+        filter_deleted: bool,
+    ) -> Result<ScanBatchStream> {
+        let mut scan_region = self.scan_region(region_id, request)?;
+        scan_region.set_filter_deleted(filter_deleted);
+        scan_region.scanner().await?.scan_batch()
+    }
+
     /// Returns a scanner to scan for `request`.
-    fn scanner(&self, region_id: RegionId, request: ScanRequest) -> Result<Scanner> {
-        self.scan_region(region_id, request)?.scanner()
+    async fn scanner(&self, region_id: RegionId, request: ScanRequest) -> Result<Scanner> {
+        self.scan_region(region_id, request)?.scanner().await
     }
 
     /// Scans a region.
@@ -218,7 +312,73 @@ impl MitoEngine {
 
     #[cfg(test)]
     pub(crate) fn get_region(&self, id: RegionId) -> Option<crate::region::MitoRegionRef> {
-        self.inner.workers.get_region(id)
+        self.find_region(id)
+    }
+
+    fn find_region(&self, region_id: RegionId) -> Option<MitoRegionRef> {
+        self.inner.workers.get_region(region_id)
+    }
+
+    fn encode_manifest_info_to_extensions(
+        region_id: &RegionId,
+        manifest_info: RegionManifestInfo,
+        extensions: &mut HashMap<String, Vec<u8>>,
+    ) -> Result<()> {
+        let region_manifest_info = vec![(*region_id, manifest_info)];
+
+        extensions.insert(
+            MANIFEST_INFO_EXTENSION_KEY.to_string(),
+            RegionManifestInfo::encode_list(&region_manifest_info).context(SerdeJsonSnafu)?,
+        );
+        info!(
+            "Added manifest info: {:?} to extensions, region_id: {:?}",
+            region_manifest_info, region_id
+        );
+        Ok(())
+    }
+
+    fn encode_column_metadatas_to_extensions(
+        region_id: &RegionId,
+        column_metadatas: Vec<ColumnMetadata>,
+        extensions: &mut HashMap<String, Vec<u8>>,
+    ) -> Result<()> {
+        extensions.insert(
+            TABLE_COLUMN_METADATA_EXTENSION_KEY.to_string(),
+            ColumnMetadata::encode_list(&column_metadatas).context(SerializeColumnMetadataSnafu)?,
+        );
+        info!(
+            "Added column metadatas: {:?} to extensions, region_id: {:?}",
+            column_metadatas, region_id
+        );
+        Ok(())
+    }
+
+    /// Find the current version's memtables and SSTs stats by region_id.
+    /// The stats must be collected in one place one time to ensure data consistency.
+    pub fn find_memtable_and_sst_stats(
+        &self,
+        region_id: RegionId,
+    ) -> Result<(Vec<MemtableStats>, Vec<FileMeta>)> {
+        let region = self
+            .find_region(region_id)
+            .context(RegionNotFoundSnafu { region_id })?;
+
+        let version = region.version();
+        let memtable_stats = version
+            .memtables
+            .list_memtables()
+            .iter()
+            .map(|x| x.stats())
+            .collect::<Vec<_>>();
+
+        let sst_stats = version
+            .ssts
+            .levels()
+            .iter()
+            .flat_map(|level| level.files().map(|x| x.meta_ref()))
+            .cloned()
+            .collect::<Vec<_>>();
+        Ok((memtable_stats, sst_stats))
     }
 }
 
@@ -246,6 +406,8 @@ struct EngineInner {
     config: Arc<MitoConfig>,
     /// The Wal raw entry reader.
     wal_raw_entry_reader: Arc<dyn RawEntryReader>,
+    #[cfg(feature = "enterprise")]
+    extension_range_provider_factory: Option<BoxedExtensionRangeProviderFactory>,
 }
 
 type TopicGroupedRegionOpenRequests = HashMap<String, Vec<(RegionId, RegionOpenRequest)>>;
@@ -272,7 +434,7 @@ fn prepare_batch_open_requests(
                     .or_default()
                     .push((region_id, request));
             }
-            WalOptions::RaftEngine => {
+            WalOptions::RaftEngine | WalOptions::Noop => {
                 remaining_regions.push((region_id, request));
             }
         }
@@ -282,28 +444,16 @@ fn prepare_batch_open_requests(
 }
 
 impl EngineInner {
-    /// Returns a new [EngineInner] with specific `config`, `log_store` and `object_store`.
-    async fn new<S: LogStore>(
-        config: MitoConfig,
-        log_store: Arc<S>,
-        object_store_manager: ObjectStoreManagerRef,
-        schema_metadata_manager: SchemaMetadataManagerRef,
-        plugins: Plugins,
-    ) -> Result<EngineInner> {
-        let config = Arc::new(config);
-        let wal_raw_entry_reader = Arc::new(LogStoreRawEntryReader::new(log_store.clone()));
-        Ok(EngineInner {
-            workers: WorkerGroup::start(
-                config.clone(),
-                log_store,
-                object_store_manager,
-                schema_metadata_manager,
-                plugins,
-            )
-            .await?,
-            config,
-            wal_raw_entry_reader,
-        })
+    #[cfg(feature = "enterprise")]
+    #[must_use]
+    fn with_extension_range_provider_factory(
+        self,
+        extension_range_provider_factory: Option<BoxedExtensionRangeProviderFactory>,
+    ) -> Self {
+        Self {
+            extension_range_provider_factory,
+            ..self
+        }
     }
 
     /// Stop the inner engine.
@@ -311,15 +461,18 @@ impl EngineInner {
         self.workers.stop().await
     }
 
+    fn find_region(&self, region_id: RegionId) -> Result<MitoRegionRef> {
+        self.workers
+            .get_region(region_id)
+            .context(RegionNotFoundSnafu { region_id })
+    }
+
     /// Get metadata of a region.
     ///
     /// Returns error if the region doesn't exist.
     fn get_metadata(&self, region_id: RegionId) -> Result<RegionMetadataRef> {
         // Reading a region doesn't need to go through the region worker thread.
-        let region = self
-            .workers
-            .get_region(region_id)
-            .context(RegionNotFoundSnafu { region_id })?;
+        let region = self.find_region(region_id)?;
         Ok(region.metadata())
     }
 
@@ -426,23 +579,15 @@ impl EngineInner {
 
     fn get_last_seq_num(&self, region_id: RegionId) -> Result<Option<SequenceNumber>> {
         // Reading a region doesn't need to go through the region worker thread.
-        let region = self
-            .workers
-            .get_region(region_id)
-            .context(RegionNotFoundSnafu { region_id })?;
-        let version_ctrl = &region.version_control;
-        let seq = Some(version_ctrl.committed_sequence());
-        Ok(seq)
+        let region = self.find_region(region_id)?;
+        Ok(Some(region.find_committed_sequence()))
     }
 
     /// Handles the scan `request` and returns a [ScanRegion].
     fn scan_region(&self, region_id: RegionId, request: ScanRequest) -> Result<ScanRegion> {
         let query_start = Instant::now();
         // Reading a region doesn't need to go through the region worker thread.
-        let region = self
-            .workers
-            .get_region(region_id)
-            .context(RegionNotFoundSnafu { region_id })?;
+        let region = self.find_region(region_id)?;
         let version = region.version();
         // Get cache.
         let cache_manager = self.workers.cache_manager();
@@ -454,21 +599,36 @@ impl EngineInner {
             CacheStrategy::EnableAll(cache_manager),
         )
         .with_parallel_scan_channel_size(self.config.parallel_scan_channel_size)
+        .with_max_concurrent_scan_files(self.config.max_concurrent_scan_files)
         .with_ignore_inverted_index(self.config.inverted_index.apply_on_query.disabled())
         .with_ignore_fulltext_index(self.config.fulltext_index.apply_on_query.disabled())
         .with_ignore_bloom_filter(self.config.bloom_filter_index.apply_on_query.disabled())
         .with_start_time(query_start);
 
+        #[cfg(feature = "enterprise")]
+        let scan_region = self.maybe_fill_extension_range_provider(scan_region, region);
+
         Ok(scan_region)
+    }
+
+    #[cfg(feature = "enterprise")]
+    fn maybe_fill_extension_range_provider(
+        &self,
+        mut scan_region: ScanRegion,
+        region: MitoRegionRef,
+    ) -> ScanRegion {
+        if region.is_follower()
+            && let Some(factory) = self.extension_range_provider_factory.as_ref()
+        {
+            scan_region
+                .set_extension_range_provider(factory.create_extension_range_provider(region));
+        }
+        scan_region
     }
 
     /// Converts the [`RegionRole`].
     fn set_region_role(&self, region_id: RegionId, role: RegionRole) -> Result<()> {
-        let region = self
-            .workers
-            .get_region(region_id)
-            .context(RegionNotFoundSnafu { region_id })?;
-
+        let region = self.find_region(region_id)?;
         region.set_role(role);
         Ok(())
     }
@@ -486,6 +646,20 @@ impl EngineInner {
         self.workers.submit_to_worker(region_id, request).await?;
 
         receiver.await.context(RecvSnafu)
+    }
+
+    async fn sync_region(
+        &self,
+        region_id: RegionId,
+        manifest_info: RegionManifestInfo,
+    ) -> Result<(ManifestVersion, bool)> {
+        ensure!(manifest_info.is_mito(), MitoManifestInfoSnafu);
+        let manifest_version = manifest_info.data_manifest_version();
+        let (request, receiver) =
+            WorkerRequest::new_sync_region_request(region_id, manifest_version);
+        self.workers.submit_to_worker(region_id, request).await?;
+
+        receiver.await.context(RecvSnafu)?
     }
 
     fn role(&self, region_id: RegionId) -> Option<RegionRole> {
@@ -539,11 +713,24 @@ impl RegionEngine for MitoEngine {
             .with_label_values(&[request.request_type()])
             .start_timer();
 
-        self.inner
+        let is_alter = matches!(request, RegionRequest::Alter(_));
+        let is_create = matches!(request, RegionRequest::Create(_));
+        let mut response = self
+            .inner
             .handle_request(region_id, request)
             .await
             .map(RegionResponse::new)
-            .map_err(BoxedError::new)
+            .map_err(BoxedError::new)?;
+
+        if is_alter {
+            self.handle_alter_response(region_id, &mut response)
+                .map_err(BoxedError::new)?;
+        } else if is_create {
+            self.handle_create_response(region_id, &mut response)
+                .map_err(BoxedError::new)?;
+        }
+
+        Ok(response)
     }
 
     #[tracing::instrument(skip_all)]
@@ -555,6 +742,7 @@ impl RegionEngine for MitoEngine {
         self.scan_region(region_id, request)
             .map_err(BoxedError::new)?
             .region_scanner()
+            .await
             .map_err(BoxedError::new)
     }
 
@@ -609,12 +797,75 @@ impl RegionEngine for MitoEngine {
             .map_err(BoxedError::new)
     }
 
+    async fn sync_region(
+        &self,
+        region_id: RegionId,
+        manifest_info: RegionManifestInfo,
+    ) -> Result<SyncManifestResponse, BoxedError> {
+        let (_, synced) = self
+            .inner
+            .sync_region(region_id, manifest_info)
+            .await
+            .map_err(BoxedError::new)?;
+
+        Ok(SyncManifestResponse::Mito { synced })
+    }
+
     fn role(&self, region_id: RegionId) -> Option<RegionRole> {
         self.inner.role(region_id)
     }
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+impl MitoEngine {
+    fn handle_alter_response(
+        &self,
+        region_id: RegionId,
+        response: &mut RegionResponse,
+    ) -> Result<()> {
+        if let Some(statistic) = self.region_statistic(region_id) {
+            Self::encode_manifest_info_to_extensions(
+                &region_id,
+                statistic.manifest,
+                &mut response.extensions,
+            )?;
+        }
+        let column_metadatas = self
+            .inner
+            .find_region(region_id)
+            .ok()
+            .map(|r| r.metadata().column_metadatas.clone());
+        if let Some(column_metadatas) = column_metadatas {
+            Self::encode_column_metadatas_to_extensions(
+                &region_id,
+                column_metadatas,
+                &mut response.extensions,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn handle_create_response(
+        &self,
+        region_id: RegionId,
+        response: &mut RegionResponse,
+    ) -> Result<()> {
+        let column_metadatas = self
+            .inner
+            .find_region(region_id)
+            .ok()
+            .map(|r| r.metadata().column_metadatas.clone());
+        if let Some(column_metadatas) = column_metadatas {
+            Self::encode_column_metadatas_to_extensions(
+                &region_id,
+                column_metadatas,
+                &mut response.extensions,
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -651,6 +902,8 @@ impl MitoEngine {
                 .await?,
                 config,
                 wal_raw_entry_reader,
+                #[cfg(feature = "enterprise")]
+                extension_range_provider_factory: None,
             }),
         })
     }

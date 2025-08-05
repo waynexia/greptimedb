@@ -57,7 +57,10 @@
 //!     - This key is mainly used in constructing the view in Datanode and Frontend.
 //!
 //! 12. Kafka topic key: `__topic_name/kafka/{topic_name}`
-//!     - The key is used to mark existing topics in kafka for WAL.
+//!     - The key is used to track existing topics in Kafka.
+//!     - The value is a [TopicNameValue](crate::key::topic_name::TopicNameValue) struct; it contains the `pruned_entry_id` which represents
+//!       the highest entry id that has been pruned from the remote WAL.
+//!     - When a region uses this topic, it should start replaying entries from `pruned_entry_id + 1` (minimum available entry id).
 //!
 //! 13. Topic name to region map key `__topic_region/{topic_name}/{region_id}`
 //!     - Mapping {topic_name} to {region_id}
@@ -97,8 +100,8 @@
 pub mod catalog_name;
 pub mod datanode_table;
 pub mod flow;
-pub mod maintenance;
 pub mod node_address;
+pub mod runtime_switch;
 mod schema_metadata_manager;
 pub mod schema_name;
 pub mod table_info;
@@ -106,10 +109,10 @@ pub mod table_name;
 pub mod table_route;
 #[cfg(any(test, feature = "testing"))]
 pub mod test_utils;
-mod tombstone;
+pub mod tombstone;
 pub mod topic_name;
 pub mod topic_region;
-pub(crate) mod txn_helper;
+pub mod txn_helper;
 pub mod view_info;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -137,6 +140,7 @@ use table::metadata::{RawTableInfo, TableId};
 use table::table_name::TableName;
 use table_info::{TableInfoKey, TableInfoManager, TableInfoValue};
 use table_name::{TableNameKey, TableNameManager, TableNameValue};
+use topic_name::TopicNameManager;
 use topic_region::{TopicRegionKey, TopicRegionManager};
 use view_info::{ViewInfoKey, ViewInfoManager, ViewInfoValue};
 
@@ -156,10 +160,14 @@ use crate::kv_backend::txn::{Txn, TxnOp};
 use crate::kv_backend::KvBackendRef;
 use crate::rpc::router::{region_distribution, LeaderState, RegionRoute};
 use crate::rpc::store::BatchDeleteRequest;
+use crate::state_store::PoisonValue;
 use crate::DatanodeId;
 
 pub const NAME_PATTERN: &str = r"[a-zA-Z_:-][a-zA-Z0-9_:\-\.@#]*";
-pub const MAINTENANCE_KEY: &str = "__maintenance";
+pub const LEGACY_MAINTENANCE_KEY: &str = "__maintenance";
+pub const MAINTENANCE_KEY: &str = "__switches/maintenance";
+pub const PAUSE_PROCEDURE_KEY: &str = "__switches/pause_procedure";
+pub const RECOVERY_MODE_KEY: &str = "__switches/recovery";
 
 pub const DATANODE_TABLE_KEY_PREFIX: &str = "__dn_table";
 pub const TABLE_INFO_KEY_PREFIX: &str = "__table_info";
@@ -174,6 +182,11 @@ pub const KAFKA_TOPIC_KEY_PREFIX: &str = "__topic_name/kafka";
 pub const LEGACY_TOPIC_KEY_PREFIX: &str = "__created_wal_topics/kafka";
 pub const TOPIC_REGION_PREFIX: &str = "__topic_region";
 
+/// The election key.
+pub const ELECTION_KEY: &str = "__metasrv_election";
+/// The root key of metasrv election candidates.
+pub const CANDIDATES_ROOT: &str = "__metasrv_election_candidates/";
+
 /// The keys with these prefixes will be loaded into the cache when the leader starts.
 pub const CACHE_KEY_PREFIXES: [&str; 5] = [
     TABLE_NAME_KEY_PREFIX,
@@ -183,7 +196,71 @@ pub const CACHE_KEY_PREFIXES: [&str; 5] = [
     NODE_ADDRESS_PREFIX,
 ];
 
-pub type RegionDistribution = BTreeMap<DatanodeId, Vec<RegionNumber>>;
+/// A set of regions with the same role.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct RegionRoleSet {
+    /// Leader regions.
+    pub leader_regions: Vec<RegionNumber>,
+    /// Follower regions.
+    pub follower_regions: Vec<RegionNumber>,
+}
+
+impl<'de> Deserialize<'de> for RegionRoleSet {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum RegionRoleSetOrLeaderOnly {
+            Full {
+                leader_regions: Vec<RegionNumber>,
+                follower_regions: Vec<RegionNumber>,
+            },
+            LeaderOnly(Vec<RegionNumber>),
+        }
+        match RegionRoleSetOrLeaderOnly::deserialize(deserializer)? {
+            RegionRoleSetOrLeaderOnly::Full {
+                leader_regions,
+                follower_regions,
+            } => Ok(RegionRoleSet::new(leader_regions, follower_regions)),
+            RegionRoleSetOrLeaderOnly::LeaderOnly(leader_regions) => {
+                Ok(RegionRoleSet::new(leader_regions, vec![]))
+            }
+        }
+    }
+}
+
+impl RegionRoleSet {
+    /// Create a new region role set.
+    pub fn new(leader_regions: Vec<RegionNumber>, follower_regions: Vec<RegionNumber>) -> Self {
+        Self {
+            leader_regions,
+            follower_regions,
+        }
+    }
+
+    /// Add a leader region to the set.
+    pub fn add_leader_region(&mut self, region_number: RegionNumber) {
+        self.leader_regions.push(region_number);
+    }
+
+    /// Add a follower region to the set.
+    pub fn add_follower_region(&mut self, region_number: RegionNumber) {
+        self.follower_regions.push(region_number);
+    }
+
+    /// Sort the regions.
+    pub fn sort(&mut self) {
+        self.follower_regions.sort();
+        self.leader_regions.sort();
+    }
+}
+
+/// The distribution of regions.
+///
+/// The key is the datanode id, the value is the region role set.
+pub type RegionDistribution = BTreeMap<DatanodeId, RegionRoleSet>;
 
 /// The id of flow.
 pub type FlowId = u32;
@@ -308,6 +385,7 @@ pub struct TableMetadataManager {
     schema_manager: SchemaManager,
     table_route_manager: TableRouteManager,
     tombstone_manager: TombstoneManager,
+    topic_name_manager: TopicNameManager,
     topic_region_manager: TopicRegionManager,
     kv_backend: KvBackendRef,
 }
@@ -459,6 +537,30 @@ impl TableMetadataManager {
             schema_manager: SchemaManager::new(kv_backend.clone()),
             table_route_manager: TableRouteManager::new(kv_backend.clone()),
             tombstone_manager: TombstoneManager::new(kv_backend.clone()),
+            topic_name_manager: TopicNameManager::new(kv_backend.clone()),
+            topic_region_manager: TopicRegionManager::new(kv_backend.clone()),
+            kv_backend,
+        }
+    }
+
+    /// Creates a new `TableMetadataManager` with a custom tombstone prefix.
+    pub fn new_with_custom_tombstone_prefix(
+        kv_backend: KvBackendRef,
+        tombstone_prefix: &str,
+    ) -> Self {
+        Self {
+            table_name_manager: TableNameManager::new(kv_backend.clone()),
+            table_info_manager: TableInfoManager::new(kv_backend.clone()),
+            view_info_manager: ViewInfoManager::new(kv_backend.clone()),
+            datanode_table_manager: DatanodeTableManager::new(kv_backend.clone()),
+            catalog_manager: CatalogManager::new(kv_backend.clone()),
+            schema_manager: SchemaManager::new(kv_backend.clone()),
+            table_route_manager: TableRouteManager::new(kv_backend.clone()),
+            tombstone_manager: TombstoneManager::new_with_prefix(
+                kv_backend.clone(),
+                tombstone_prefix,
+            ),
+            topic_name_manager: TopicNameManager::new(kv_backend.clone()),
             topic_region_manager: TopicRegionManager::new(kv_backend.clone()),
             kv_backend,
         }
@@ -510,6 +612,14 @@ impl TableMetadataManager {
 
     pub fn table_route_manager(&self) -> &TableRouteManager {
         &self.table_route_manager
+    }
+
+    pub fn topic_name_manager(&self) -> &TopicNameManager {
+        &self.topic_name_manager
+    }
+
+    pub fn topic_region_manager(&self) -> &TopicRegionManager {
+        &self.topic_region_manager
     }
 
     #[cfg(feature = "testing")]
@@ -846,7 +956,7 @@ impl TableMetadataManager {
     ) -> Result<()> {
         let keys =
             self.table_metadata_keys(table_id, table_name, table_route_value, region_wal_options)?;
-        self.tombstone_manager.create(keys).await
+        self.tombstone_manager.create(keys).await.map(|_| ())
     }
 
     /// Deletes metadata tombstone for table **permanently**.
@@ -860,7 +970,10 @@ impl TableMetadataManager {
     ) -> Result<()> {
         let table_metadata_keys =
             self.table_metadata_keys(table_id, table_name, table_route_value, region_wal_options)?;
-        self.tombstone_manager.delete(table_metadata_keys).await
+        self.tombstone_manager
+            .delete(table_metadata_keys)
+            .await
+            .map(|_| ())
     }
 
     /// Restores metadata for table.
@@ -874,7 +987,7 @@ impl TableMetadataManager {
     ) -> Result<()> {
         let keys =
             self.table_metadata_keys(table_id, table_name, table_route_value, region_wal_options)?;
-        self.tombstone_manager.restore(keys).await
+        self.tombstone_manager.restore(keys).await.map(|_| ())
     }
 
     /// Deletes metadata for table **permanently**.
@@ -1320,7 +1433,8 @@ impl_metadata_value! {
     TableFlowValue,
     NodeAddressValue,
     SchemaNameValue,
-    FlowStateValue
+    FlowStateValue,
+    PoisonValue
 }
 
 impl_optional_metadata_value! {
@@ -1352,7 +1466,8 @@ mod tests {
     use crate::key::table_name::TableNameKey;
     use crate::key::table_route::TableRouteValue;
     use crate::key::{
-        DeserializedValueWithBytes, TableMetadataManager, ViewInfoValue, TOPIC_REGION_PREFIX,
+        DeserializedValueWithBytes, RegionDistribution, RegionRoleSet, TableMetadataManager,
+        ViewInfoValue, TOPIC_REGION_PREFIX,
     };
     use crate::kv_backend::memory::MemoryKvBackend;
     use crate::kv_backend::KvBackend;
@@ -1400,6 +1515,7 @@ mod tests {
                 name: "r1".to_string(),
                 partition: None,
                 attrs: BTreeMap::new(),
+                partition_expr: Default::default(),
             },
             leader_peer: Some(Peer::new(datanode, "a2")),
             follower_peers: vec![],
@@ -1471,7 +1587,8 @@ mod tests {
             new_test_table_info(region_routes.iter().map(|r| r.region.id.region_number())).into();
         let wal_allocator = WalOptionsAllocator::RaftEngine;
         let regions = (0..16).collect();
-        let region_wal_options = allocate_region_wal_options(regions, &wal_allocator).unwrap();
+        let region_wal_options =
+            allocate_region_wal_options(regions, &wal_allocator, false).unwrap();
         create_physical_table_metadata(
             &table_metadata_manager,
             table_info.clone(),
@@ -1891,6 +2008,7 @@ mod tests {
                     name: "r1".to_string(),
                     partition: None,
                     attrs: BTreeMap::new(),
+                    partition_expr: Default::default(),
                 },
                 leader_peer: Some(Peer::new(datanode, "a2")),
                 leader_state: Some(LeaderState::Downgrading),
@@ -1903,6 +2021,7 @@ mod tests {
                     name: "r2".to_string(),
                     partition: None,
                     attrs: BTreeMap::new(),
+                    partition_expr: Default::default(),
                 },
                 leader_peer: Some(Peer::new(datanode, "a1")),
                 leader_state: None,
@@ -1978,7 +2097,8 @@ mod tests {
                 .unwrap()
                 .unwrap();
 
-            assert_eq!(got.regions, regions)
+            assert_eq!(got.regions, regions.leader_regions);
+            assert_eq!(got.follower_regions, regions.follower_regions);
         }
     }
 
@@ -2394,5 +2514,29 @@ mod tests {
         assert_eq!(current_view_info.definition, new_definition);
         assert_eq!(current_view_info.columns, new_columns);
         assert_eq!(current_view_info.plan_columns, new_plan_columns);
+    }
+
+    #[test]
+    fn test_region_role_set_deserialize() {
+        let s = r#"{"leader_regions": [1, 2, 3], "follower_regions": [4, 5, 6]}"#;
+        let region_role_set: RegionRoleSet = serde_json::from_str(s).unwrap();
+        assert_eq!(region_role_set.leader_regions, vec![1, 2, 3]);
+        assert_eq!(region_role_set.follower_regions, vec![4, 5, 6]);
+
+        let s = r#"[1, 2, 3]"#;
+        let region_role_set: RegionRoleSet = serde_json::from_str(s).unwrap();
+        assert_eq!(region_role_set.leader_regions, vec![1, 2, 3]);
+        assert!(region_role_set.follower_regions.is_empty());
+    }
+
+    #[test]
+    fn test_region_distribution_deserialize() {
+        let s = r#"{"1": [1,2,3], "2": {"leader_regions": [7, 8, 9], "follower_regions": [10, 11, 12]}}"#;
+        let region_distribution: RegionDistribution = serde_json::from_str(s).unwrap();
+        assert_eq!(region_distribution.len(), 2);
+        assert_eq!(region_distribution[&1].leader_regions, vec![1, 2, 3]);
+        assert!(region_distribution[&1].follower_regions.is_empty());
+        assert_eq!(region_distribution[&2].leader_regions, vec![7, 8, 9]);
+        assert_eq!(region_distribution[&2].follower_regions, vec![10, 11, 12]);
     }
 }

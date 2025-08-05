@@ -26,10 +26,11 @@ use store_api::storage::RegionId;
 
 mod close_region;
 mod downgrade_region;
+mod flush_region;
 mod open_region;
 mod upgrade_region;
 
-use super::task_tracker::TaskTracker;
+use crate::heartbeat::task_tracker::TaskTracker;
 use crate::region_server::RegionServer;
 
 /// Handler for [Instruction::OpenRegion] and [Instruction::CloseRegion].
@@ -38,17 +39,19 @@ pub struct RegionHeartbeatResponseHandler {
     region_server: RegionServer,
     catchup_tasks: TaskTracker<()>,
     downgrade_tasks: TaskTracker<()>,
+    flush_tasks: TaskTracker<()>,
 }
 
 /// Handler of the instruction.
 pub type InstructionHandler =
-    Box<dyn FnOnce(HandlerContext) -> BoxFuture<'static, InstructionReply> + Send>;
+    Box<dyn FnOnce(HandlerContext) -> BoxFuture<'static, Option<InstructionReply>> + Send>;
 
 #[derive(Clone)]
 pub struct HandlerContext {
     region_server: RegionServer,
     catchup_tasks: TaskTracker<()>,
     downgrade_tasks: TaskTracker<()>,
+    flush_tasks: TaskTracker<()>,
 }
 
 impl HandlerContext {
@@ -62,6 +65,7 @@ impl HandlerContext {
             region_server,
             catchup_tasks: TaskTracker::new(),
             downgrade_tasks: TaskTracker::new(),
+            flush_tasks: TaskTracker::new(),
         }
     }
 }
@@ -73,6 +77,7 @@ impl RegionHeartbeatResponseHandler {
             region_server,
             catchup_tasks: TaskTracker::new(),
             downgrade_tasks: TaskTracker::new(),
+            flush_tasks: TaskTracker::new(),
         }
     }
 
@@ -94,6 +99,12 @@ impl RegionHeartbeatResponseHandler {
                 handler_context.handle_upgrade_region_instruction(upgrade_region)
             })),
             Instruction::InvalidateCaches(_) => InvalidHeartbeatResponseSnafu.fail(),
+            Instruction::FlushRegions(flush_regions) => Ok(Box::new(move |handler_context| {
+                handler_context.handle_flush_regions_instruction(flush_regions)
+            })),
+            Instruction::FlushRegion(flush_region) => Ok(Box::new(move |handler_context| {
+                handler_context.handle_flush_region_instruction(flush_region)
+            })),
         }
     }
 }
@@ -107,6 +118,7 @@ impl HeartbeatResponseHandler for RegionHeartbeatResponseHandler {
                 | Some((_, Instruction::CloseRegion { .. }))
                 | Some((_, Instruction::DowngradeRegion { .. }))
                 | Some((_, Instruction::UpgradeRegion { .. }))
+                | Some((_, Instruction::FlushRegion { .. }))
         )
     }
 
@@ -120,17 +132,21 @@ impl HeartbeatResponseHandler for RegionHeartbeatResponseHandler {
         let region_server = self.region_server.clone();
         let catchup_tasks = self.catchup_tasks.clone();
         let downgrade_tasks = self.downgrade_tasks.clone();
+        let flush_tasks = self.flush_tasks.clone();
         let handler = Self::build_handler(instruction)?;
         let _handle = common_runtime::spawn_global(async move {
             let reply = handler(HandlerContext {
                 region_server,
                 catchup_tasks,
                 downgrade_tasks,
+                flush_tasks,
             })
             .await;
 
-            if let Err(e) = mailbox.send((meta, reply)).await {
-                error!(e; "Failed to send reply to mailbox");
+            if let Some(reply) = reply {
+                if let Err(e) = mailbox.send((meta, reply)).await {
+                    error!(e; "Failed to send reply to mailbox");
+                }
             }
         });
 
@@ -152,7 +168,7 @@ mod tests {
     use mito2::config::MitoConfig;
     use mito2::engine::MITO_ENGINE_NAME;
     use mito2::test_util::{CreateRequestBuilder, TestEnv};
-    use store_api::path_utils::region_dir;
+    use store_api::path_utils::table_dir;
     use store_api::region_engine::RegionRole;
     use store_api::region_request::{RegionCloseRequest, RegionRequest};
     use store_api::storage::RegionId;
@@ -214,7 +230,6 @@ mod tests {
         let instruction = Instruction::DowngradeRegion(DowngradeRegion {
             region_id: RegionId::new(2048, 1),
             flush_timeout: Some(Duration::from_secs(1)),
-            reject_write: false,
         });
         assert!(heartbeat_handler
             .is_acceptable(&heartbeat_env.create_handler_ctx((meta.clone(), instruction))));
@@ -223,6 +238,7 @@ mod tests {
         let instruction = Instruction::UpgradeRegion(UpgradeRegion {
             region_id,
             last_entry_id: None,
+            metadata_last_entry_id: None,
             replay_timeout: None,
             location_id: None,
         });
@@ -235,7 +251,6 @@ mod tests {
         Instruction::CloseRegion(RegionIdent {
             table_id: region_id.table_id(),
             region_number: region_id.region_number(),
-            cluster_id: 1,
             datanode_id: 2,
             engine: MITO_ENGINE_NAME.to_string(),
         })
@@ -246,7 +261,6 @@ mod tests {
             RegionIdent {
                 table_id: region_id.table_id(),
                 region_number: region_id.region_number(),
-                cluster_id: 1,
                 datanode_id: 2,
                 engine: MITO_ENGINE_NAME.to_string(),
             },
@@ -264,7 +278,7 @@ mod tests {
         let mut region_server = mock_region_server();
         let heartbeat_handler = RegionHeartbeatResponseHandler::new(region_server.clone());
 
-        let mut engine_env = TestEnv::with_prefix("close-region");
+        let mut engine_env = TestEnv::with_prefix("close-region").await;
         let engine = engine_env.create_engine(MitoConfig::default()).await;
         region_server.register_engine(Arc::new(engine));
         let region_id = RegionId::new(1024, 1);
@@ -312,7 +326,7 @@ mod tests {
         let mut region_server = mock_region_server();
         let heartbeat_handler = RegionHeartbeatResponseHandler::new(region_server.clone());
 
-        let mut engine_env = TestEnv::with_prefix("open-region");
+        let mut engine_env = TestEnv::with_prefix("open-region").await;
         let engine = engine_env.create_engine(MitoConfig::default()).await;
         region_server.register_engine(Arc::new(engine));
         let region_id = RegionId::new(1024, 1);
@@ -320,7 +334,7 @@ mod tests {
         let builder = CreateRequestBuilder::new();
         let mut create_req = builder.build();
         let storage_path = "test";
-        create_req.region_dir = region_dir(storage_path, region_id);
+        create_req.table_dir = table_dir(storage_path, region_id.table_id());
 
         region_server
             .handle_request(region_id, RegionRequest::Create(create_req))
@@ -360,7 +374,7 @@ mod tests {
         let mut region_server = mock_region_server();
         let heartbeat_handler = RegionHeartbeatResponseHandler::new(region_server.clone());
 
-        let mut engine_env = TestEnv::with_prefix("open-not-exists-region");
+        let mut engine_env = TestEnv::with_prefix("open-not-exists-region").await;
         let engine = engine_env.create_engine(MitoConfig::default()).await;
         region_server.register_engine(Arc::new(engine));
         let region_id = RegionId::new(1024, 1);
@@ -392,7 +406,7 @@ mod tests {
         let mut region_server = mock_region_server();
         let heartbeat_handler = RegionHeartbeatResponseHandler::new(region_server.clone());
 
-        let mut engine_env = TestEnv::with_prefix("downgrade-region");
+        let mut engine_env = TestEnv::with_prefix("downgrade-region").await;
         let engine = engine_env.create_engine(MitoConfig::default()).await;
         region_server.register_engine(Arc::new(engine));
         let region_id = RegionId::new(1024, 1);
@@ -400,7 +414,7 @@ mod tests {
         let builder = CreateRequestBuilder::new();
         let mut create_req = builder.build();
         let storage_path = "test";
-        create_req.region_dir = region_dir(storage_path, region_id);
+        create_req.table_dir = table_dir(storage_path, region_id.table_id());
 
         region_server
             .handle_request(region_id, RegionRequest::Create(create_req))
@@ -415,7 +429,6 @@ mod tests {
             let instruction = Instruction::DowngradeRegion(DowngradeRegion {
                 region_id,
                 flush_timeout: Some(Duration::from_secs(1)),
-                reject_write: false,
             });
 
             let mut ctx = heartbeat_env.create_handler_ctx((meta, instruction));
@@ -438,7 +451,6 @@ mod tests {
         let instruction = Instruction::DowngradeRegion(DowngradeRegion {
             region_id: RegionId::new(2048, 1),
             flush_timeout: Some(Duration::from_secs(1)),
-            reject_write: false,
         });
         let mut ctx = heartbeat_env.create_handler_ctx((meta, instruction));
         let control = heartbeat_handler.handle(&mut ctx).await.unwrap();

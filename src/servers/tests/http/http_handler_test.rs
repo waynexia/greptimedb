@@ -142,7 +142,7 @@ async fn test_sql_output_rows() {
                     axum::body::to_bytes(resp.into_body(), usize::MAX)
                         .await
                         .unwrap(),
-                    Bytes::from_static(b"4950\n"),
+                    Bytes::from_static(b"4950\r\n"),
                 );
             }
             HttpResponse::Table(resp) => {
@@ -218,7 +218,7 @@ async fn test_sql_form() {
     ctx.set_current_user(auth::userinfo_by_name(None));
     let api_state = ApiState { sql_handler };
 
-    for format in ["greptimedb_v1", "influxdb_v1", "csv", "table"] {
+    for format in ["greptimedb_v1", "influxdb_v1", "csv", "table", "null"] {
         let form = create_form(format);
         let json = http_handler::sql(
             State(api_state.clone()),
@@ -289,7 +289,7 @@ async fn test_sql_form() {
                     axum::body::to_bytes(resp.into_body(), usize::MAX)
                         .await
                         .unwrap(),
-                    Bytes::from_static(b"4950\n"),
+                    Bytes::from_static(b"4950\r\n"),
                 );
             }
             HttpResponse::Table(resp) => {
@@ -308,6 +308,23 @@ async fn test_sql_form() {
 └──────────────────────┘
 "#
                     ),
+                );
+            }
+            HttpResponse::Null(resp) => {
+                assert_eq!(resp.rows(), 1);
+                let resp = resp.into_response();
+                assert_eq!(
+                    resp.headers().get(header::CONTENT_TYPE),
+                    Some(HeaderValue::from_static(mime::TEXT_PLAIN_UTF_8.as_ref())).as_ref(),
+                );
+                let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let body_str = std::str::from_utf8(&body).unwrap();
+                assert!(
+                    body_str.starts_with("1 rows in set.\n"),
+                    "Body did not start with expected prefix: {}",
+                    body_str
                 );
             }
             _ => unreachable!(),
@@ -382,16 +399,14 @@ async fn test_status() {
 #[tokio::test]
 async fn test_config() {
     let toml_str = r#"
-            mode = "distributed"
-
             [http]
             addr = "127.0.0.1:4000"
-            timeout = "30s"
+            timeout = "0s"
             body_limit = "2GB"
 
             [logging]
             level = "debug"
-            dir = "/tmp/greptimedb/test/logs"
+            dir = "./greptimedb_data/test/logs"
         "#;
     let rs = http_handler::config(State(GreptimeOptionsConfigState {
         greptime_config_options: toml_str.to_string(),

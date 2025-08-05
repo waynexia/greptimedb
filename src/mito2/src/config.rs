@@ -30,6 +30,8 @@ use crate::sst::DEFAULT_WRITE_BUFFER_SIZE;
 const MULTIPART_UPLOAD_MINIMUM_SIZE: ReadableSize = ReadableSize::mb(5);
 /// Default channel size for parallel scan task.
 pub(crate) const DEFAULT_SCAN_CHANNEL_SIZE: usize = 32;
+/// Default maximum number of SST files to scan concurrently.
+pub(crate) const DEFAULT_MAX_CONCURRENT_SCAN_FILES: usize = 128;
 
 // Use `1/GLOBAL_WRITE_BUFFER_SIZE_FACTOR` of OS memory as global write buffer size in default mode
 const GLOBAL_WRITE_BUFFER_SIZE_FACTOR: u64 = 8;
@@ -46,6 +48,7 @@ const INDEX_CREATE_MEM_THRESHOLD_FACTOR: u64 = 16;
 pub(crate) const FETCH_OPTION_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Configuration for [MitoEngine](crate::engine::MitoEngine).
+/// Before using the config, make sure to call `MitoConfig::validate()` to check if the config is valid.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(default)]
 pub struct MitoConfig {
@@ -106,6 +109,8 @@ pub struct MitoConfig {
     pub sst_write_buffer_size: ReadableSize,
     /// Capacity of the channel to send data from parallel scan tasks to the main task (default 32).
     pub parallel_scan_channel_size: usize,
+    /// Maximum number of SST files to scan concurrently (default 128).
+    pub max_concurrent_scan_files: usize,
     /// Whether to allow stale entries read during replay.
     pub allow_stale_entries: bool,
 
@@ -151,6 +156,7 @@ impl Default for MitoConfig {
             write_cache_ttl: None,
             sst_write_buffer_size: DEFAULT_WRITE_BUFFER_SIZE,
             parallel_scan_channel_size: DEFAULT_SCAN_CHANNEL_SIZE,
+            max_concurrent_scan_files: DEFAULT_MAX_CONCURRENT_SCAN_FILES,
             allow_stale_entries: false,
             index: IndexConfig::default(),
             inverted_index: InvertedIndexConfig::default(),
@@ -264,6 +270,8 @@ impl MitoConfig {
         self.vector_cache_size = mem_cache_size;
         self.page_cache_size = page_cache_size;
         self.selector_result_cache_size = mem_cache_size;
+
+        self.index.adjust_buffer_and_cache_size(sys_memory);
     }
 
     /// Enable write cache.
@@ -314,6 +322,8 @@ pub struct IndexConfig {
     pub content_cache_size: ReadableSize,
     /// Page size for inverted index content.
     pub content_cache_page_size: ReadableSize,
+    /// Cache size for index result. Setting it to 0 to disable the cache.
+    pub result_cache_size: ReadableSize,
 }
 
 impl Default for IndexConfig {
@@ -326,6 +336,7 @@ impl Default for IndexConfig {
             metadata_cache_size: ReadableSize::mb(64),
             content_cache_size: ReadableSize::mb(128),
             content_cache_page_size: ReadableSize::kb(64),
+            result_cache_size: ReadableSize::mb(128),
         }
     }
 }
@@ -363,6 +374,18 @@ impl IndexConfig {
         }
 
         Ok(())
+    }
+
+    pub fn adjust_buffer_and_cache_size(&mut self, sys_memory: ReadableSize) {
+        let cache_size = cmp::min(sys_memory / MEM_CACHE_SIZE_FACTOR, ReadableSize::mb(128));
+        self.result_cache_size = cmp::min(self.result_cache_size, cache_size);
+        self.content_cache_size = cmp::min(self.content_cache_size, cache_size);
+
+        let metadata_cache_size = cmp::min(
+            sys_memory / SST_META_CACHE_SIZE_FACTOR,
+            ReadableSize::mb(64),
+        );
+        self.metadata_cache_size = cmp::min(self.metadata_cache_size, metadata_cache_size);
     }
 }
 

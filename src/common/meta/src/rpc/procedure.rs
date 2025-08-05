@@ -20,6 +20,7 @@ use api::v1::meta::{
     ProcedureMeta as PbProcedureMeta, ProcedureStateResponse as PbProcedureStateResponse,
     ProcedureStatus as PbProcedureStatus,
 };
+use common_error::ext::ErrorExt;
 use common_procedure::{ProcedureId, ProcedureInfo, ProcedureState};
 use snafu::ResultExt;
 
@@ -32,6 +33,24 @@ pub struct MigrateRegionRequest {
     pub from_peer: u64,
     pub to_peer: u64,
     pub timeout: Duration,
+}
+
+/// A request to add region follower.
+#[derive(Debug, Clone)]
+pub struct AddRegionFollowerRequest {
+    /// The region id to add follower.
+    pub region_id: u64,
+    /// The peer id to add follower.
+    pub peer_id: u64,
+}
+
+/// A request to remove region follower.
+#[derive(Debug, Clone)]
+pub struct RemoveRegionFollowerRequest {
+    /// The region id to remove follower.
+    pub region_id: u64,
+    /// The peer id to remove follower.
+    pub peer_id: u64,
 }
 
 /// Cast the protobuf [`ProcedureId`] to common [`ProcedureId`].
@@ -55,14 +74,15 @@ pub fn procedure_state_to_pb_state(state: &ProcedureState) -> (PbProcedureStatus
     match state {
         ProcedureState::Running => (PbProcedureStatus::Running, String::default()),
         ProcedureState::Done { .. } => (PbProcedureStatus::Done, String::default()),
-        ProcedureState::Retrying { error } => (PbProcedureStatus::Retrying, error.to_string()),
-        ProcedureState::Failed { error } => (PbProcedureStatus::Failed, error.to_string()),
+        ProcedureState::Retrying { error } => (PbProcedureStatus::Retrying, error.output_msg()),
+        ProcedureState::Failed { error } => (PbProcedureStatus::Failed, error.output_msg()),
         ProcedureState::PrepareRollback { error } => {
-            (PbProcedureStatus::PrepareRollback, error.to_string())
+            (PbProcedureStatus::PrepareRollback, error.output_msg())
         }
         ProcedureState::RollingBack { error } => {
-            (PbProcedureStatus::RollingBack, error.to_string())
+            (PbProcedureStatus::RollingBack, error.output_msg())
         }
+        ProcedureState::Poisoned { error, .. } => (PbProcedureStatus::Poisoned, error.output_msg()),
     }
 }
 

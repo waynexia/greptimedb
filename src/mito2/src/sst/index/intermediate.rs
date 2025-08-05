@@ -49,6 +49,11 @@ impl IntermediateManager {
     /// Create a new `IntermediateManager` with the given root path.
     /// It will clean up all garbage intermediate files from previous runs.
     pub async fn init_fs(aux_path: impl AsRef<str>) -> Result<Self> {
+        common_telemetry::info!(
+            "Initializing intermediate manager, aux_path: {}",
+            aux_path.as_ref()
+        );
+
         let store = new_fs_cache_store(&normalize_dir(aux_path.as_ref())).await?;
         let store = InstrumentedStore::new(store);
 
@@ -322,7 +327,8 @@ mod tests {
         let temp_dir = temp_dir::create_temp_dir("intermediate");
         let path = temp_dir.path().display().to_string();
 
-        let location = IntermediateLocation::new(&RegionId::new(0, 0), &FileId::random());
+        let region_id = RegionId::new(0, 0);
+        let location = IntermediateLocation::new(&region_id, &FileId::random());
         let store = IntermediateManager::init_fs(path).await.unwrap();
         let provider = TempFileProvider::new(location.clone(), store);
 

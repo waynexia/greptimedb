@@ -20,7 +20,7 @@ use store_api::region_engine::RegionEngine;
 use store_api::region_request::{AffectedRows, RegionCloseRequest, RegionRequest};
 use store_api::storage::RegionId;
 
-use super::MetricEngineInner;
+use crate::engine::MetricEngineInner;
 use crate::error::{CloseMitoRegionSnafu, Result};
 use crate::metrics::PHYSICAL_REGION_COUNT;
 use crate::utils;
@@ -59,7 +59,7 @@ impl MetricEngineInner {
         }
     }
 
-    async fn close_physical_region(&self, region_id: RegionId) -> Result<AffectedRows> {
+    pub(crate) async fn close_physical_region(&self, region_id: RegionId) -> Result<AffectedRows> {
         let data_region_id = utils::to_data_region_id(region_id);
         let metadata_region_id = utils::to_metadata_region_id(region_id);
 

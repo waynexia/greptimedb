@@ -17,8 +17,8 @@ pub mod builder;
 mod cancellation;
 mod database;
 pub mod flight;
+pub mod frontend_grpc_handler;
 pub mod greptime_handler;
-mod otlp;
 pub mod prom_query_gateway;
 pub mod region_server;
 
@@ -33,11 +33,13 @@ use common_grpc::channel_manager::{
 };
 use common_telemetry::{error, info, warn};
 use futures::FutureExt;
+use otel_arrow_rust::opentelemetry::ArrowMetricsServiceServer;
 use serde::{Deserialize, Serialize};
 use snafu::{ensure, OptionExt, ResultExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot::{self, Receiver, Sender};
 use tokio::sync::Mutex;
+use tonic::service::interceptor::InterceptedService;
 use tonic::service::Routes;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::ServerTlsConfig;
@@ -48,6 +50,8 @@ use crate::error::{
     AlreadyStartedSnafu, InternalSnafu, Result, StartGrpcSnafu, TcpBindSnafu, TcpIncomingSnafu,
 };
 use crate::metrics::MetricsMiddlewareLayer;
+use crate::otel_arrow::{HeaderInterceptor, OtelArrowServiceHandler};
+use crate::query_handler::OpenTelemetryProtocolHandlerRef;
 use crate::server::Server;
 use crate::tls::TlsOption;
 
@@ -63,6 +67,8 @@ pub struct GrpcOptions {
     pub max_recv_message_size: ReadableSize,
     /// Max gRPC sending(encoding) message size
     pub max_send_message_size: ReadableSize,
+    /// Compression mode in Arrow Flight service.
+    pub flight_compression: FlightCompression,
     pub runtime_size: usize,
     #[serde(default = "Default::default")]
     pub tls: TlsOption,
@@ -99,6 +105,15 @@ impl GrpcOptions {
             common_telemetry::debug!("detect local IP is not supported on Android");
         }
     }
+
+    /// Create a [GrpcServerConfig] from self's options.
+    pub fn as_config(&self) -> GrpcServerConfig {
+        GrpcServerConfig {
+            max_recv_message_size: self.max_recv_message_size.as_bytes() as usize,
+            max_send_message_size: self.max_send_message_size.as_bytes() as usize,
+            tls: self.tls.clone(),
+        }
+    }
 }
 
 const DEFAULT_GRPC_ADDR_PORT: &str = "4001";
@@ -111,6 +126,7 @@ impl Default for GrpcOptions {
             server_addr: String::new(),
             max_recv_message_size: DEFAULT_MAX_GRPC_RECV_MESSAGE_SIZE,
             max_send_message_size: DEFAULT_MAX_GRPC_SEND_MESSAGE_SIZE,
+            flight_compression: FlightCompression::ArrowIpc,
             runtime_size: 8,
             tls: TlsOption::default(),
         }
@@ -129,6 +145,30 @@ impl GrpcOptions {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FlightCompression {
+    /// Disable all compression in Arrow Flight service.
+    #[default]
+    None,
+    /// Enable only transport layer compression (zstd).
+    Transport,
+    /// Enable only payload compression (lz4)
+    ArrowIpc,
+    /// Enable all compression.
+    All,
+}
+
+impl FlightCompression {
+    pub fn transport_compression(&self) -> bool {
+        self == &FlightCompression::Transport || self == &FlightCompression::All
+    }
+
+    pub fn arrow_compression(&self) -> bool {
+        self == &FlightCompression::ArrowIpc || self == &FlightCompression::All
+    }
+}
+
 pub struct GrpcServer {
     // states
     shutdown_tx: Mutex<Option<Sender<()>>>,
@@ -139,6 +179,16 @@ pub struct GrpcServer {
     routes: Mutex<Option<Routes>>,
     // tls config
     tls_config: Option<ServerTlsConfig>,
+    // Otel arrow service
+    otel_arrow_service: Mutex<
+        Option<
+            InterceptedService<
+                ArrowMetricsServiceServer<OtelArrowServiceHandler<OpenTelemetryProtocolHandlerRef>>,
+                HeaderInterceptor,
+            >,
+        >,
+    >,
+    bind_addr: Option<SocketAddr>,
 }
 
 /// Grpc Server configuration
@@ -216,7 +266,7 @@ impl Server for GrpcServer {
         let mut shutdown_tx = self.shutdown_tx.lock().await;
         if let Some(tx) = shutdown_tx.take() {
             if tx.send(()).is_err() {
-                info!("Receiver dropped, the grpc server has already existed");
+                info!("Receiver dropped, the grpc server has already exited");
             }
         }
         info!("Shutdown grpc server");
@@ -224,7 +274,7 @@ impl Server for GrpcServer {
         Ok(())
     }
 
-    async fn start(&self, addr: SocketAddr) -> Result<SocketAddr> {
+    async fn start(&mut self, addr: SocketAddr) -> Result<()> {
         let routes = {
             let mut routes = self.routes.lock().await;
             let Some(routes) = routes.take() else {
@@ -265,10 +315,15 @@ impl Server for GrpcServer {
         if let Some(tls_config) = self.tls_config.clone() {
             builder = builder.tls_config(tls_config).context(StartGrpcSnafu)?;
         }
-        let builder = builder
+
+        let mut builder = builder
             .add_routes(routes)
             .add_service(self.create_healthcheck_service())
             .add_service(self.create_reflection_service());
+
+        if let Some(otel_arrow_service) = self.otel_arrow_service.lock().await.take() {
+            builder = builder.add_service(otel_arrow_service);
+        }
 
         let (serve_state_tx, serve_state_rx) = oneshot::channel();
         let mut serve_state = self.serve_state.lock().await;
@@ -281,10 +336,16 @@ impl Server for GrpcServer {
                 .context(StartGrpcSnafu);
             serve_state_tx.send(result)
         });
-        Ok(addr)
+
+        self.bind_addr = Some(addr);
+        Ok(())
     }
 
     fn name(&self) -> &str {
         GRPC_SERVER
+    }
+
+    fn bind_addr(&self) -> Option<SocketAddr> {
+        self.bind_addr
     }
 }

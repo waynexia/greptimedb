@@ -18,8 +18,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use catalog::information_schema::{
-    columns, flows, key_column_usage, schemata, tables, CHARACTER_SETS, COLLATIONS, COLUMNS, FLOWS,
-    KEY_COLUMN_USAGE, SCHEMATA, TABLES, VIEWS,
+    columns, flows, key_column_usage, process_list, region_peers, schemata, tables, CHARACTER_SETS,
+    COLLATIONS, COLUMNS, FLOWS, KEY_COLUMN_USAGE, REGION_PEERS, SCHEMATA, TABLES, VIEWS,
 };
 use catalog::CatalogManagerRef;
 use common_catalog::consts::{
@@ -40,7 +40,7 @@ use common_recordbatch::RecordBatches;
 use common_time::timezone::get_timezone;
 use common_time::Timestamp;
 use datafusion::common::ScalarValue;
-use datafusion::prelude::{concat_ws, SessionContext};
+use datafusion::prelude::SessionContext;
 use datafusion_expr::expr::WildcardOptions;
 use datafusion_expr::{case, col, lit, Expr, SortExpr};
 use datatypes::prelude::*;
@@ -55,10 +55,10 @@ pub use show_create_table::create_table_stmt;
 use snafu::{ensure, OptionExt, ResultExt};
 use sql::ast::Ident;
 use sql::parser::ParserContext;
-use sql::statements::create::{CreateDatabase, CreateFlow, CreateView, Partitions};
+use sql::statements::create::{CreateDatabase, CreateFlow, CreateView, Partitions, SqlOrTql};
 use sql::statements::show::{
-    ShowColumns, ShowDatabases, ShowFlows, ShowIndex, ShowKind, ShowTableStatus, ShowTables,
-    ShowVariables, ShowViews,
+    ShowColumns, ShowDatabases, ShowFlows, ShowIndex, ShowKind, ShowProcessList, ShowRegion,
+    ShowTableStatus, ShowTables, ShowVariables, ShowViews,
 };
 use sql::statements::statement::Statement;
 use sql::statements::OptionMap;
@@ -301,8 +301,7 @@ async fn query_from_information_schema_table(
                     .state()
                     .clone(),
             )
-            .read_table(view)
-            .context(error::DataFusionSnafu)?;
+            .read_table(view)?;
 
             let planner = query_engine.planner();
             let planner = planner
@@ -319,10 +318,7 @@ async fn query_from_information_schema_table(
         }
     };
 
-    let stream = dataframe
-        .execute_stream()
-        .await
-        .context(error::DataFusionSnafu)?;
+    let stream = dataframe.execute_stream().await?;
 
     Ok(Output::new_with_stream(Box::pin(
         RecordBatchStreamAdapter::try_new(stream).context(error::CreateRecordBatchSnafu)?,
@@ -403,23 +399,6 @@ pub async fn show_index(
         query_ctx.current_schema()
     };
 
-    let primary_key_expr = case(col("constraint_name").like(lit("%PRIMARY%")))
-        .when(lit(true), lit("greptime-primary-key-v1"))
-        .otherwise(null())
-        .context(error::PlanSqlSnafu)?;
-    let inverted_index_expr = case(col("constraint_name").like(lit("%INVERTED INDEX%")))
-        .when(lit(true), lit("greptime-inverted-index-v1"))
-        .otherwise(null())
-        .context(error::PlanSqlSnafu)?;
-    let fulltext_index_expr = case(col("constraint_name").like(lit("%FULLTEXT INDEX%")))
-        .when(lit(true), lit("greptime-fulltext-index-v1"))
-        .otherwise(null())
-        .context(error::PlanSqlSnafu)?;
-    let skipping_index_expr = case(col("constraint_name").like(lit("%SKIPPING INDEX%")))
-        .when(lit(true), lit("greptime-bloom-filter-v1"))
-        .otherwise(null())
-        .context(error::PlanSqlSnafu)?;
-
     let select = vec![
         // 1 as `Non_unique`: contain duplicates
         lit(1).alias(INDEX_NONT_UNIQUE_COLUMN),
@@ -437,23 +416,13 @@ pub async fn show_index(
             .otherwise(lit(YES_STR))
             .context(error::PlanSqlSnafu)?
             .alias(COLUMN_NULLABLE_COLUMN),
-        concat_ws(
-            lit(", "),
-            vec![
-                primary_key_expr,
-                inverted_index_expr,
-                fulltext_index_expr,
-                skipping_index_expr,
-            ],
-        )
-        .alias(INDEX_INDEX_TYPE_COLUMN),
         lit("").alias(COLUMN_COMMENT_COLUMN),
         lit("").alias(INDEX_COMMENT_COLUMN),
         lit(YES_STR).alias(INDEX_VISIBLE_COLUMN),
         null().alias(INDEX_EXPRESSION_COLUMN),
         Expr::Wildcard {
             qualifier: None,
-            options: WildcardOptions::default(),
+            options: Box::new(WildcardOptions::default()),
         },
     ];
 
@@ -471,7 +440,10 @@ pub async fn show_index(
         (INDEX_SUB_PART_COLUMN, INDEX_SUB_PART_COLUMN),
         (INDEX_PACKED_COLUMN, INDEX_PACKED_COLUMN),
         (COLUMN_NULLABLE_COLUMN, COLUMN_NULLABLE_COLUMN),
-        (INDEX_INDEX_TYPE_COLUMN, INDEX_INDEX_TYPE_COLUMN),
+        (
+            key_column_usage::GREPTIME_INDEX_TYPE,
+            INDEX_INDEX_TYPE_COLUMN,
+        ),
         (COLUMN_COMMENT_COLUMN, COLUMN_COMMENT_COLUMN),
         (INDEX_COMMENT_COLUMN, INDEX_COMMENT_COLUMN),
         (INDEX_VISIBLE_COLUMN, INDEX_VISIBLE_COLUMN),
@@ -492,6 +464,52 @@ pub async fn show_index(
         query_ctx,
         KEY_COLUMN_USAGE,
         select,
+        projects,
+        filters,
+        like_field,
+        sort,
+        stmt.kind,
+    )
+    .await
+}
+
+/// Execute `SHOW REGION` statement.
+pub async fn show_region(
+    stmt: ShowRegion,
+    query_engine: &QueryEngineRef,
+    catalog_manager: &CatalogManagerRef,
+    query_ctx: QueryContextRef,
+) -> Result<Output> {
+    let schema_name = if let Some(database) = stmt.database {
+        database
+    } else {
+        query_ctx.current_schema()
+    };
+
+    let filters = vec![
+        col(region_peers::TABLE_NAME).eq(lit(&stmt.table)),
+        col(region_peers::TABLE_SCHEMA).eq(lit(schema_name.clone())),
+        col(region_peers::TABLE_CATALOG).eq(lit(query_ctx.current_catalog())),
+    ];
+    let projects = vec![
+        (region_peers::TABLE_NAME, "Table"),
+        (region_peers::REGION_ID, "Region"),
+        (region_peers::PEER_ID, "Peer"),
+        (region_peers::IS_LEADER, "Leader"),
+    ];
+
+    let like_field = None;
+    let sort = vec![
+        col(columns::REGION_ID).sort(true, true),
+        col(columns::PEER_ID).sort(true, true),
+    ];
+
+    query_from_information_schema_table(
+        query_engine,
+        catalog_manager,
+        query_ctx,
+        REGION_PEERS,
+        vec![],
         projects,
         filters,
         like_field,
@@ -678,6 +696,7 @@ pub fn show_variable(stmt: ShowVariables, query_ctx: QueryContextRef) -> Result<
     let value = match variable.as_str() {
         "SYSTEM_TIME_ZONE" | "SYSTEM_TIMEZONE" => get_timezone(None).to_string(),
         "TIME_ZONE" | "TIMEZONE" => query_ctx.timezone().to_string(),
+        "READ_PREFERENCE" => query_ctx.read_preference().to_string(),
         "DATESTYLE" => {
             let (style, order) = *query_ctx.configuration_parameter().pg_datetime_style();
             format!("{}, {}", style, order)
@@ -746,10 +765,7 @@ pub async fn show_search_path(_query_ctx: QueryContextRef) -> Result<Output> {
 
 pub fn show_create_database(database_name: &str, options: OptionMap) -> Result<Output> {
     let stmt = CreateDatabase {
-        name: ObjectName(vec![Ident {
-            value: database_name.to_string(),
-            quote_style: None,
-        }]),
+        name: ObjectName(vec![Ident::new(database_name)]),
         if_not_exists: true,
         options,
     };
@@ -934,6 +950,35 @@ pub async fn show_flows(
     .await
 }
 
+#[cfg(feature = "enterprise")]
+pub async fn show_triggers(
+    stmt: sql::statements::show::trigger::ShowTriggers,
+    query_engine: &QueryEngineRef,
+    catalog_manager: &CatalogManagerRef,
+    query_ctx: QueryContextRef,
+) -> Result<Output> {
+    const TRIGGER_NAME: &str = "trigger_name";
+    const TRIGGERS_COLUMN: &str = "Triggers";
+
+    let projects = vec![(TRIGGER_NAME, TRIGGERS_COLUMN)];
+    let like_field = Some(TRIGGER_NAME);
+    let sort = vec![col(TRIGGER_NAME).sort(true, true)];
+
+    query_from_information_schema_table(
+        query_engine,
+        catalog_manager,
+        query_ctx,
+        catalog::information_schema::TRIGGERS,
+        vec![],
+        projects,
+        vec![],
+        like_field,
+        sort,
+        stmt.kind,
+    )
+    .await
+}
+
 pub fn show_create_flow(
     flow_name: ObjectName,
     flow_val: FlowInfoValue,
@@ -942,7 +987,15 @@ pub fn show_create_flow(
     let mut parser_ctx =
         ParserContext::new(query_ctx.sql_dialect(), flow_val.raw_sql()).context(error::SqlSnafu)?;
 
-    let query = parser_ctx.parser_query().context(error::SqlSnafu)?;
+    let query = parser_ctx.parse_statement().context(error::SqlSnafu)?;
+
+    // since prom ql will parse `now()` to a fixed time, we need to not use it for generating raw query
+    let raw_query = match &query {
+        Statement::Tql(_) => flow_val.raw_sql().clone(),
+        _ => query.to_string(),
+    };
+
+    let query = Box::new(SqlOrTql::try_from_statement(query, &raw_query).context(error::SqlSnafu)?);
 
     let comment = if flow_val.comment().is_empty() {
         None
@@ -952,10 +1005,7 @@ pub fn show_create_flow(
 
     let stmt = CreateFlow {
         flow_name,
-        sink_table_name: ObjectName(vec![Ident {
-            value: flow_val.sink_table_name().table_name.clone(),
-            quote_style: None,
-        }]),
+        sink_table_name: ObjectName(vec![Ident::new(&flow_val.sink_table_name().table_name)]),
         // notice we don't want `OR REPLACE` and `IF NOT EXISTS` in same sql since it's unclear what to do
         // so we set `or_replace` to false.
         or_replace: false,
@@ -1210,6 +1260,50 @@ fn parse_file_table_format(options: &HashMap<String, String>) -> Result<Box<dyn 
             Format::Orc(format) => Box::new(format),
         },
     )
+}
+
+pub async fn show_processlist(
+    stmt: ShowProcessList,
+    query_engine: &QueryEngineRef,
+    catalog_manager: &CatalogManagerRef,
+    query_ctx: QueryContextRef,
+) -> Result<Output> {
+    let projects = if stmt.full {
+        vec![
+            (process_list::ID, "Id"),
+            (process_list::CATALOG, "Catalog"),
+            (process_list::SCHEMAS, "Schema"),
+            (process_list::CLIENT, "Client"),
+            (process_list::FRONTEND, "Frontend"),
+            (process_list::START_TIMESTAMP, "Start Time"),
+            (process_list::ELAPSED_TIME, "Elapsed Time"),
+            (process_list::QUERY, "Query"),
+        ]
+    } else {
+        vec![
+            (process_list::ID, "Id"),
+            (process_list::CATALOG, "Catalog"),
+            (process_list::QUERY, "Query"),
+            (process_list::ELAPSED_TIME, "Elapsed Time"),
+        ]
+    };
+
+    let filters = vec![];
+    let like_field = None;
+    let sort = vec![col("id").sort(true, true)];
+    query_from_information_schema_table(
+        query_engine,
+        catalog_manager,
+        query_ctx.clone(),
+        "process_list",
+        vec![],
+        projects.clone(),
+        filters,
+        like_field,
+        sort,
+        ShowKind::All,
+    )
+    .await
 }
 
 #[cfg(test)]

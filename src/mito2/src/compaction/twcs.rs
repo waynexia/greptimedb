@@ -15,16 +15,21 @@
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
+use std::num::NonZeroU64;
 
-use common_telemetry::{info, trace};
+use common_base::readable_size::ReadableSize;
+use common_telemetry::info;
 use common_time::timestamp::TimeUnit;
 use common_time::timestamp_millis::BucketAligned;
 use common_time::Timestamp;
+use store_api::storage::RegionId;
 
 use crate::compaction::buckets::infer_time_bucket;
 use crate::compaction::compactor::CompactionRegion;
 use crate::compaction::picker::{Picker, PickerOutput};
-use crate::compaction::run::{find_sorted_runs, reduce_runs, Item};
+use crate::compaction::run::{
+    find_sorted_runs, merge_seq_files, reduce_runs, FileGroup, Item, Ranged,
+};
 use crate::compaction::{get_expired_ssts, CompactionOutput};
 use crate::sst::file::{overlaps, FileHandle, Level};
 use crate::sst::version::LevelMeta;
@@ -35,14 +40,8 @@ const LEVEL_COMPACTED: Level = 1;
 /// candidates.
 #[derive(Debug)]
 pub struct TwcsPicker {
-    /// Max allowed sorted runs in active window.
-    pub max_active_window_runs: usize,
-    /// Max allowed files in active window.
-    pub max_active_window_files: usize,
-    /// Max allowed sorted runs in inactive windows.
-    pub max_inactive_window_runs: usize,
-    /// Max allowed files in inactive windows.
-    pub max_inactive_window_files: usize,
+    /// Minimum file num to trigger a compaction.
+    pub trigger_file_num: usize,
     /// Compaction time window in seconds.
     pub time_window_seconds: Option<i64>,
     /// Max allowed compaction output file size.
@@ -53,89 +52,49 @@ pub struct TwcsPicker {
 
 impl TwcsPicker {
     /// Builds compaction output from files.
-    /// For active writing window, we allow for at most `max_active_window_runs` files to alleviate
-    /// fragmentation. For other windows, we allow at most 1 file at each window.
     fn build_output(
         &self,
+        region_id: RegionId,
         time_windows: &mut BTreeMap<i64, Window>,
         active_window: Option<i64>,
     ) -> Vec<CompactionOutput> {
         let mut output = vec![];
         for (window, files) in time_windows {
-            let sorted_runs = find_sorted_runs(&mut files.files);
+            if files.files.is_empty() {
+                continue;
+            }
+            let mut files_to_merge: Vec<_> = files.files().cloned().collect();
+            let sorted_runs = find_sorted_runs(&mut files_to_merge);
+            let found_runs = sorted_runs.len();
+            // We only remove deletion markers if we found less than 2 runs and not in append mode.
+            // because after compaction there will be no overlapping files.
+            let filter_deleted = !files.overlapping && found_runs <= 2 && !self.append_mode;
 
-            let (max_runs, max_files) = if let Some(active_window) = active_window
-                && *window == active_window
-            {
-                (self.max_active_window_runs, self.max_active_window_files)
+            let inputs = if found_runs > 1 {
+                reduce_runs(sorted_runs)
             } else {
-                (
-                    self.max_inactive_window_runs,
-                    self.max_inactive_window_files,
-                )
+                let run = sorted_runs.last().unwrap();
+                if run.items().len() < self.trigger_file_num {
+                    continue;
+                }
+                // no overlapping files, try merge small files
+                merge_seq_files(run.items(), self.max_output_file_size)
             };
 
-            let found_runs = sorted_runs.len();
-            // We only remove deletion markers once no file in current window overlaps with any other window
-            // and region is not in append mode.
-            let filter_deleted =
-                !files.overlapping && (found_runs == 1 || max_runs == 1) && !self.append_mode;
-
-            let inputs = if found_runs > max_runs {
-                let files_to_compact = reduce_runs(sorted_runs, max_runs);
-                let files_to_compact_len = files_to_compact.len();
-                info!(
-                    "Building compaction output, active window: {:?}, \
-                        current window: {}, \
-                        max runs: {}, \
-                        found runs: {}, \
-                        output size: {}, \
-                        max output size: {:?}, \
-                        remove deletion markers: {}",
-                    active_window,
+            if !inputs.is_empty() {
+                log_pick_result(
+                    region_id,
                     *window,
-                    max_runs,
+                    active_window,
                     found_runs,
-                    files_to_compact_len,
-                    self.max_output_file_size,
-                    filter_deleted
-                );
-                files_to_compact
-            } else if files.files.len() > max_files {
-                info!(
-                    "Enforcing max file num in window: {}, active: {:?}, max: {}, current: {}, max output size: {:?}, filter delete: {}",
-                    *window,
-                    active_window,
-                    max_files,
                     files.files.len(),
                     self.max_output_file_size,
                     filter_deleted,
+                    &inputs,
                 );
-                // Files in window exceeds file num limit
-                vec![enforce_file_num(&files.files, max_files)]
-            } else {
-                trace!("Skip building compaction output, active window: {:?}, current window: {}, max runs: {}, found runs: {}, ", active_window, *window, max_runs, found_runs);
-                continue;
-            };
-
-            let split_inputs = if !filter_deleted
-                && let Some(max_output_file_size) = self.max_output_file_size
-            {
-                let len_before_split = inputs.len();
-                let maybe_split = enforce_max_output_size(inputs, max_output_file_size);
-                if maybe_split.len() != len_before_split {
-                    info!("Compaction output file size exceeds threshold {}, split compaction inputs to: {:?}", max_output_file_size, maybe_split);
-                }
-                maybe_split
-            } else {
-                inputs
-            };
-
-            for input in split_inputs {
-                debug_assert!(input.len() > 1);
                 output.push(CompactionOutput {
                     output_level: LEVEL_COMPACTED, // always compact to l1
-                    inputs: input,
+                    inputs: inputs.into_iter().flat_map(|fg| fg.into_files()).collect(),
                     filter_deleted,
                     output_time_range: None, // we do not enforce output time range in twcs compactions.
                 });
@@ -145,66 +104,50 @@ impl TwcsPicker {
     }
 }
 
-/// Limits the size of compaction output in a naive manner.
-/// todo(hl): we can find the output file size more precisely by checking the time range
-/// of each row group and adding the sizes of those non-overlapping row groups. But now
-/// we'd better not to expose the SST details in this level.
-fn enforce_max_output_size(
-    inputs: Vec<Vec<FileHandle>>,
-    max_output_file_size: u64,
-) -> Vec<Vec<FileHandle>> {
-    inputs
-        .into_iter()
-        .flat_map(|input| {
-            debug_assert!(input.len() > 1);
-            let estimated_output_size = input.iter().map(|f| f.size()).sum::<u64>();
-            if estimated_output_size < max_output_file_size {
-                // total file size does not exceed the threshold, just return the original input.
-                return vec![input];
-            }
-            let mut splits = vec![];
-            let mut new_input = vec![];
-            let mut new_input_size = 0;
-            for f in input {
-                if new_input_size + f.size() > max_output_file_size {
-                    splits.push(std::mem::take(&mut new_input));
-                    new_input_size = 0;
-                }
-                new_input_size += f.size();
-                new_input.push(f);
-            }
-            if !new_input.is_empty() {
-                splits.push(new_input);
-            }
-            splits
+#[allow(clippy::too_many_arguments)]
+fn log_pick_result(
+    region_id: RegionId,
+    window: i64,
+    active_window: Option<i64>,
+    found_runs: usize,
+    file_num: usize,
+    max_output_file_size: Option<u64>,
+    filter_deleted: bool,
+    inputs: &[FileGroup],
+) {
+    let input_file_str: Vec<String> = inputs
+        .iter()
+        .map(|f| {
+            let range = f.range();
+            let start = range.0.to_iso8601_string();
+            let end = range.1.to_iso8601_string();
+            let num_rows = f.num_rows();
+            format!(
+                "FileGroup{{id: {:?}, range: ({}, {}), size: {}, num rows: {} }}",
+                f.file_ids(),
+                start,
+                end,
+                ReadableSize(f.size() as u64),
+                num_rows
+            )
         })
-        .filter(|p| p.len() > 1)
-        .collect()
-}
-
-/// Merges consecutive files so that file num does not exceed `max_file_num`, and chooses
-/// the solution with minimum overhead according to files sizes to be merged.
-/// `enforce_file_num` only merges consecutive files so that it won't create overlapping outputs.
-/// `runs` must be sorted according to time ranges.
-fn enforce_file_num<T: Item>(files: &[T], max_file_num: usize) -> Vec<T> {
-    debug_assert!(files.len() > max_file_num);
-    let to_merge = files.len() - max_file_num + 1;
-    let mut min_penalty = usize::MAX;
-    let mut min_idx = 0;
-
-    for idx in 0..=(files.len() - to_merge) {
-        let current_penalty: usize = files
-            .iter()
-            .skip(idx)
-            .take(to_merge)
-            .map(|f| f.size())
-            .sum();
-        if current_penalty < min_penalty {
-            min_penalty = current_penalty;
-            min_idx = idx;
-        }
-    }
-    files.iter().skip(min_idx).take(to_merge).cloned().collect()
+        .collect();
+    let window_str = Timestamp::new_second(window).to_iso8601_string();
+    let active_window_str = active_window.map(|s| Timestamp::new_second(s).to_iso8601_string());
+    let max_output_file_size = max_output_file_size.map(|size| ReadableSize(size).to_string());
+    info!(
+        "Region ({:?}) compaction pick result: current window: {}, active window: {:?}, \
+            found runs: {}, file num: {}, max output file size: {:?}, filter deleted: {}, \
+            input files: {:?}",
+        region_id,
+        window_str,
+        active_window_str,
+        found_runs,
+        file_num,
+        max_output_file_size,
+        filter_deleted,
+        input_file_str
+    );
 }
 
 impl Picker for TwcsPicker {
@@ -240,16 +183,18 @@ impl Picker for TwcsPicker {
         // Assign files to windows
         let mut windows =
             assign_to_windows(levels.iter().flat_map(LevelMeta::files), time_window_size);
-        let outputs = self.build_output(&mut windows, active_window);
+        let outputs = self.build_output(region_id, &mut windows, active_window);
 
         if outputs.is_empty() && expired_ssts.is_empty() {
             return None;
         }
 
+        let max_file_size = self.max_output_file_size.map(|v| v as usize);
         Some(PickerOutput {
             outputs,
             expired_ssts,
             time_window_size,
+            max_file_size,
         })
     }
 }
@@ -257,7 +202,9 @@ impl Picker for TwcsPicker {
 struct Window {
     start: Timestamp,
     end: Timestamp,
-    files: Vec<FileHandle>,
+    // Mapping from file sequence to file groups. Files with the same sequence is considered
+    // created from the same compaction task.
+    files: HashMap<Option<NonZeroU64>, FileGroup>,
     time_window: i64,
     overlapping: bool,
 }
@@ -266,10 +213,11 @@ impl Window {
     /// Creates a new [Window] with given file.
     fn new_with_file(file: FileHandle) -> Self {
         let (start, end) = file.time_range();
+        let files = HashMap::from([(file.meta_ref().sequence, FileGroup::new_with_file(file))]);
         Self {
             start,
             end,
-            files: vec![file],
+            files,
             time_window: 0,
             overlapping: false,
         }
@@ -285,7 +233,19 @@ impl Window {
         let (start, end) = file.time_range();
         self.start = self.start.min(start);
         self.end = self.end.max(end);
-        self.files.push(file);
+
+        match self.files.entry(file.meta_ref().sequence) {
+            Entry::Occupied(mut o) => {
+                o.get_mut().add_file(file);
+            }
+            Entry::Vacant(v) => {
+                v.insert(FileGroup::new_with_file(file));
+            }
+        }
+    }
+
+    fn files(&self) -> impl Iterator<Item = &FileGroup> {
+        self.files.values()
     }
 }
 
@@ -368,12 +328,10 @@ fn find_latest_window_in_seconds<'a>(
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-    use std::sync::Arc;
 
     use super::*;
-    use crate::compaction::test_util::{new_file_handle, new_file_handles};
-    use crate::sst::file::{FileId, FileMeta, Level};
-    use crate::test_util::NoopFilePurger;
+    use crate::compaction::test_util::{new_file_handle, new_file_handle_with_sequence};
+    use crate::sst::file::{FileId, Level};
 
     #[test]
     fn test_get_latest_window_in_seconds() {
@@ -432,7 +390,9 @@ mod tests {
             .iter(),
             3,
         );
-        assert_eq!(5, windows.get(&0).unwrap().files.len());
+        let fgs = &windows.get(&0).unwrap().files;
+        assert_eq!(1, fgs.len());
+        assert_eq!(fgs.values().map(|f| f.files().len()).sum::<usize>(), 5);
 
         let files = [FileId::random(); 3];
         let windows = assign_to_windows(
@@ -446,15 +406,62 @@ mod tests {
         );
         assert_eq!(
             files[0],
-            windows.get(&0).unwrap().files.first().unwrap().file_id()
+            windows.get(&0).unwrap().files().next().unwrap().files()[0]
+                .file_id()
+                .file_id()
         );
         assert_eq!(
             files[1],
-            windows.get(&3).unwrap().files.first().unwrap().file_id()
+            windows.get(&3).unwrap().files().next().unwrap().files()[0]
+                .file_id()
+                .file_id()
         );
         assert_eq!(
             files[2],
-            windows.get(&12).unwrap().files.first().unwrap().file_id()
+            windows.get(&12).unwrap().files().next().unwrap().files()[0]
+                .file_id()
+                .file_id()
+        );
+    }
+
+    #[test]
+    fn test_assign_file_groups_to_windows() {
+        let files = [
+            FileId::random(),
+            FileId::random(),
+            FileId::random(),
+            FileId::random(),
+        ];
+        let windows = assign_to_windows(
+            [
+                new_file_handle_with_sequence(files[0], 0, 999, 0, 1),
+                new_file_handle_with_sequence(files[1], 0, 999, 0, 1),
+                new_file_handle_with_sequence(files[2], 0, 999, 0, 2),
+                new_file_handle_with_sequence(files[3], 0, 999, 0, 2),
+            ]
+            .iter(),
+            3,
+        );
+        assert_eq!(windows.len(), 1);
+        let fgs = &windows.get(&0).unwrap().files;
+        assert_eq!(2, fgs.len());
+        assert_eq!(
+            fgs.get(&NonZeroU64::new(1))
+                .unwrap()
+                .files()
+                .iter()
+                .map(|f| f.file_id().file_id())
+                .collect::<HashSet<_>>(),
+            [files[0], files[1]].into_iter().collect()
+        );
+        assert_eq!(
+            fgs.get(&NonZeroU64::new(2))
+                .unwrap()
+                .files()
+                .iter()
+                .map(|f| f.file_id().file_id())
+                .collect::<HashSet<_>>(),
+            [files[2], files[3]].into_iter().collect()
         );
     }
 
@@ -469,8 +476,26 @@ mod tests {
         ];
         files[0].set_compacting(true);
         files[2].set_compacting(true);
-        let windows = assign_to_windows(files.iter(), 3);
-        assert_eq!(3, windows.get(&0).unwrap().files.len());
+        let mut windows = assign_to_windows(files.iter(), 3);
+        let window0 = windows.remove(&0).unwrap();
+        assert_eq!(1, window0.files.len());
+        let candidates = window0
+            .files
+            .into_values()
+            .flat_map(|fg| fg.into_files())
+            .map(|f| f.file_id().file_id())
+            .collect::<HashSet<_>>();
+        assert_eq!(candidates.len(), 3);
+        assert_eq!(
+            candidates,
+            [
+                files[1].file_id().file_id(),
+                files[3].file_id().file_id(),
+                files[4].file_id().file_id()
+            ]
+            .into_iter()
+            .collect::<HashSet<_>>()
+        );
     }
 
     /// (Window value, overlapping, files' time ranges in window)
@@ -499,9 +524,11 @@ mod tests {
             let mut file_ranges = actual_window
                 .files
                 .iter()
-                .map(|f| {
-                    let (s, e) = f.time_range();
-                    (s.value(), e.value())
+                .flat_map(|(_, f)| {
+                    f.files().iter().map(|f| {
+                        let (s, e) = f.time_range();
+                        (s.value(), e.value())
+                    })
                 })
                 .collect::<Vec<_>>();
             file_ranges.sort_unstable_by(|l, r| l.0.cmp(&r.0).then(l.1.cmp(&r.1)));
@@ -614,25 +641,31 @@ mod tests {
 
     impl CompactionPickerTestCase {
         fn check(&self) {
+            let file_id_to_idx = self
+                .input_files
+                .iter()
+                .enumerate()
+                .map(|(idx, file)| (file.file_id(), idx))
+                .collect::<HashMap<_, _>>();
             let mut windows = assign_to_windows(self.input_files.iter(), self.window_size);
             let active_window =
                 find_latest_window_in_seconds(self.input_files.iter(), self.window_size);
             let output = TwcsPicker {
-                max_active_window_runs: 4,
-                max_active_window_files: usize::MAX,
-                max_inactive_window_runs: 1,
-                max_inactive_window_files: usize::MAX,
+                trigger_file_num: 4,
                 time_window_seconds: None,
                 max_output_file_size: None,
                 append_mode: false,
             }
-            .build_output(&mut windows, active_window);
+            .build_output(RegionId::from_u64(0), &mut windows, active_window);
 
             let output = output
                 .iter()
                 .map(|o| {
-                    let input_file_ids =
-                        o.inputs.iter().map(|f| f.file_id()).collect::<HashSet<_>>();
+                    let input_file_ids = o
+                        .inputs
+                        .iter()
+                        .map(|f| file_id_to_idx.get(&f.file_id()).copied().unwrap())
+                        .collect::<HashSet<_>>();
                     (input_file_ids, o.output_level)
                 })
                 .collect::<Vec<_>>();
@@ -641,11 +674,7 @@ mod tests {
                 .expected_outputs
                 .iter()
                 .map(|o| {
-                    let input_file_ids = o
-                        .input_files
-                        .iter()
-                        .map(|idx| self.input_files[*idx].file_id())
-                        .collect::<HashSet<_>>();
+                    let input_file_ids = o.input_files.iter().copied().collect::<HashSet<_>>();
                     (input_file_ids, o.output_level)
                 })
                 .collect::<Vec<_>>();
@@ -658,73 +687,18 @@ mod tests {
         output_level: Level,
     }
 
-    fn check_enforce_file_num(
-        input_files: &[(i64, i64, u64)],
-        max_file_num: usize,
-        files_to_merge: &[(i64, i64)],
-    ) {
-        let mut files = new_file_handles(input_files);
-        // ensure sorted
-        find_sorted_runs(&mut files);
-        let mut to_merge = enforce_file_num(&files, max_file_num);
-        to_merge.sort_unstable_by_key(|f| f.time_range().0);
-        assert_eq!(
-            files_to_merge.to_vec(),
-            to_merge
-                .iter()
-                .map(|f| {
-                    let (start, end) = f.time_range();
-                    (start.value(), end.value())
-                })
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn test_enforce_file_num() {
-        check_enforce_file_num(
-            &[(0, 300, 2), (100, 200, 1), (200, 400, 1)],
-            2,
-            &[(100, 200), (200, 400)],
-        );
-
-        check_enforce_file_num(
-            &[(0, 300, 200), (100, 200, 100), (200, 400, 100)],
-            1,
-            &[(0, 300), (100, 200), (200, 400)],
-        );
-    }
-
     #[test]
     fn test_build_twcs_output() {
         let file_ids = (0..4).map(|_| FileId::random()).collect::<Vec<_>>();
 
+        // Case 1: 2 runs found in each time window.
         CompactionPickerTestCase {
             window_size: 3,
             input_files: [
-                new_file_handle(file_ids[0], -2000, -3, 0),
-                new_file_handle(file_ids[1], -3000, -100, 0),
-                new_file_handle(file_ids[2], 0, 2999, 0), //active windows
-                new_file_handle(file_ids[3], 50, 2998, 0), //active windows
-            ]
-            .to_vec(),
-            expected_outputs: vec![ExpectedOutput {
-                input_files: vec![0, 1],
-                output_level: 1,
-            }],
-        }
-        .check();
-
-        let file_ids = (0..6).map(|_| FileId::random()).collect::<Vec<_>>();
-        CompactionPickerTestCase {
-            window_size: 3,
-            input_files: [
-                new_file_handle(file_ids[0], -2000, -3, 0),
-                new_file_handle(file_ids[1], -3000, -100, 0),
-                new_file_handle(file_ids[2], 0, 2999, 0),
-                new_file_handle(file_ids[3], 50, 2998, 0),
-                new_file_handle(file_ids[4], 11, 2990, 0),
-                new_file_handle(file_ids[5], 50, 4998, 0),
+                new_file_handle_with_sequence(file_ids[0], -2000, -3, 0, 1),
+                new_file_handle_with_sequence(file_ids[1], -3000, -100, 0, 2),
+                new_file_handle_with_sequence(file_ids[2], 0, 2999, 0, 3), //active windows
+                new_file_handle_with_sequence(file_ids[3], 50, 2998, 0, 4), //active windows
             ]
             .to_vec(),
             expected_outputs: vec![
@@ -733,51 +707,63 @@ mod tests {
                     output_level: 1,
                 },
                 ExpectedOutput {
-                    input_files: vec![2, 3, 4],
+                    input_files: vec![2, 3],
                     output_level: 1,
                 },
             ],
         }
         .check();
-    }
 
-    fn make_file_handles(inputs: &[(i64, i64, u64)]) -> Vec<FileHandle> {
-        inputs
-            .iter()
-            .map(|(start, end, size)| {
-                FileHandle::new(
-                    FileMeta {
-                        region_id: Default::default(),
-                        file_id: Default::default(),
-                        time_range: (
-                            Timestamp::new_millisecond(*start),
-                            Timestamp::new_millisecond(*end),
-                        ),
-                        level: 0,
-                        file_size: *size,
-                        available_indexes: Default::default(),
-                        index_file_size: 0,
-                        num_rows: 0,
-                        num_row_groups: 0,
-                        sequence: None,
-                    },
-                    Arc::new(NoopFilePurger),
-                )
-            })
-            .collect()
-    }
+        // Case 2:
+        //    -2000........-3
+        // -3000.....-100
+        //                    0..............2999
+        //                      50..........2998
+        //                     11.........2990
+        let file_ids = (0..6).map(|_| FileId::random()).collect::<Vec<_>>();
+        CompactionPickerTestCase {
+            window_size: 3,
+            input_files: [
+                new_file_handle_with_sequence(file_ids[0], -2000, -3, 0, 1),
+                new_file_handle_with_sequence(file_ids[1], -3000, -100, 0, 2),
+                new_file_handle_with_sequence(file_ids[2], 0, 2999, 0, 3),
+                new_file_handle_with_sequence(file_ids[3], 50, 2998, 0, 4),
+                new_file_handle_with_sequence(file_ids[4], 11, 2990, 0, 5),
+            ]
+            .to_vec(),
+            expected_outputs: vec![
+                ExpectedOutput {
+                    input_files: vec![0, 1],
+                    output_level: 1,
+                },
+                ExpectedOutput {
+                    input_files: vec![2, 4],
+                    output_level: 1,
+                },
+            ],
+        }
+        .check();
 
-    #[test]
-    fn test_limit_output_size() {
-        let mut files = make_file_handles(&[(1, 1, 1)].repeat(6));
-        let runs = find_sorted_runs(&mut files);
-        assert_eq!(6, runs.len());
-        let files_to_merge = reduce_runs(runs, 2);
-
-        let enforced = enforce_max_output_size(files_to_merge, 2);
-        assert_eq!(2, enforced.len());
-        assert_eq!(2, enforced[0].len());
-        assert_eq!(2, enforced[1].len());
+        // Case 3:
+        // A compaction may split output into several files that have overlapping time ranges and same sequence,
+        // we should treat these files as one FileGroup.
+        let file_ids = (0..6).map(|_| FileId::random()).collect::<Vec<_>>();
+        CompactionPickerTestCase {
+            window_size: 3,
+            input_files: [
+                new_file_handle_with_sequence(file_ids[0], 0, 2999, 1, 1),
+                new_file_handle_with_sequence(file_ids[1], 0, 2998, 1, 1),
+                new_file_handle_with_sequence(file_ids[2], 3000, 5999, 1, 2),
+                new_file_handle_with_sequence(file_ids[3], 3000, 5000, 1, 2),
+                new_file_handle_with_sequence(file_ids[4], 11, 2990, 0, 3),
+            ]
+            .to_vec(),
+            expected_outputs: vec![ExpectedOutput {
+                input_files: vec![0, 1, 4],
+                output_level: 1,
+            }],
+        }
+        .check();
     }
 
     // TODO(hl): TTL tester that checks if get_expired_ssts function works as expected.

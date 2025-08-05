@@ -32,12 +32,12 @@ use snafu::{OptionExt, ResultExt};
 use store_api::storage::ScanRequest;
 use table::metadata::TableType;
 
-use super::pg_namespace::oid_map::PGNamespaceOidMapRef;
-use super::{query_ctx, OID_COLUMN_NAME, PG_CLASS};
 use crate::error::{
     CreateRecordBatchSnafu, InternalSnafu, Result, UpgradeWeakCatalogManagerRefSnafu,
 };
 use crate::information_schema::Predicates;
+use crate::system_schema::pg_catalog::pg_namespace::oid_map::PGNamespaceOidMapRef;
+use crate::system_schema::pg_catalog::{query_ctx, OID_COLUMN_NAME, PG_CLASS};
 use crate::system_schema::utils::tables::{string_column, u32_column};
 use crate::system_schema::SystemTable;
 use crate::CatalogManager;
@@ -169,7 +169,7 @@ impl DfPartitionStream for PGClass {
 }
 
 /// Builds the `pg_catalog.pg_class` table row by row
-/// TODO(J0HN50N133): `relowner` is always the [`DUMMY_OWNER_ID`] cuz we don't have user.
+/// TODO(J0HN50N133): `relowner` is always the [`DUMMY_OWNER_ID`] because we don't have users.
 /// Once we have user system, make it the actual owner of the table.
 struct PGClassBuilder {
     schema: SchemaRef,

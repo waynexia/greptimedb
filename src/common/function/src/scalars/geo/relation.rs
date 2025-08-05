@@ -23,9 +23,9 @@ use geo::algorithm::contains::Contains;
 use geo::algorithm::intersects::Intersects;
 use geo::algorithm::within::Within;
 
-use super::helpers::{ensure_columns_len, ensure_columns_n};
-use super::wkt::parse_wkt;
 use crate::function::{Function, FunctionContext};
+use crate::scalars::geo::helpers::{ensure_columns_len, ensure_columns_n};
+use crate::scalars::geo::wkt::parse_wkt;
 
 /// Test if spatial relationship: contains
 #[derive(Clone, Debug, Default, Display)]
@@ -51,7 +51,7 @@ impl Function for STContains {
         )
     }
 
-    fn eval(&self, _func_ctx: FunctionContext, columns: &[VectorRef]) -> Result<VectorRef> {
+    fn eval(&self, _func_ctx: &FunctionContext, columns: &[VectorRef]) -> Result<VectorRef> {
         ensure_columns_n!(columns, 2);
 
         let wkt_this_vec = &columns[0];
@@ -105,7 +105,7 @@ impl Function for STWithin {
         )
     }
 
-    fn eval(&self, _func_ctx: FunctionContext, columns: &[VectorRef]) -> Result<VectorRef> {
+    fn eval(&self, _func_ctx: &FunctionContext, columns: &[VectorRef]) -> Result<VectorRef> {
         ensure_columns_n!(columns, 2);
 
         let wkt_this_vec = &columns[0];
@@ -159,7 +159,7 @@ impl Function for STIntersects {
         )
     }
 
-    fn eval(&self, _func_ctx: FunctionContext, columns: &[VectorRef]) -> Result<VectorRef> {
+    fn eval(&self, _func_ctx: &FunctionContext, columns: &[VectorRef]) -> Result<VectorRef> {
         ensure_columns_n!(columns, 2);
 
         let wkt_this_vec = &columns[0];

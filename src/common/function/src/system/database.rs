@@ -18,7 +18,8 @@ use std::sync::Arc;
 use common_query::error::Result;
 use common_query::prelude::{Signature, Volatility};
 use datatypes::prelude::{ConcreteDataType, ScalarVector};
-use datatypes::vectors::{StringVector, VectorRef};
+use datatypes::vectors::{StringVector, UInt32Vector, VectorRef};
+use derive_more::Display;
 
 use crate::function::{Function, FunctionContext};
 
@@ -30,9 +31,22 @@ pub struct DatabaseFunction;
 pub struct CurrentSchemaFunction;
 pub struct SessionUserFunction;
 
+pub struct ReadPreferenceFunction;
+
+#[derive(Display)]
+#[display("{}", self.name())]
+pub struct PgBackendPidFunction;
+
+#[derive(Display)]
+#[display("{}", self.name())]
+pub struct ConnectionIdFunction;
+
 const DATABASE_FUNCTION_NAME: &str = "database";
 const CURRENT_SCHEMA_FUNCTION_NAME: &str = "current_schema";
 const SESSION_USER_FUNCTION_NAME: &str = "session_user";
+const READ_PREFERENCE_FUNCTION_NAME: &str = "read_preference";
+const PG_BACKEND_PID: &str = "pg_backend_pid";
+const CONNECTION_ID: &str = "connection_id";
 
 impl Function for DatabaseFunction {
     fn name(&self) -> &str {
@@ -47,7 +61,7 @@ impl Function for DatabaseFunction {
         Signature::nullary(Volatility::Immutable)
     }
 
-    fn eval(&self, func_ctx: FunctionContext, _columns: &[VectorRef]) -> Result<VectorRef> {
+    fn eval(&self, func_ctx: &FunctionContext, _columns: &[VectorRef]) -> Result<VectorRef> {
         let db = func_ctx.query_ctx.current_schema();
 
         Ok(Arc::new(StringVector::from_slice(&[&db])) as _)
@@ -67,7 +81,7 @@ impl Function for CurrentSchemaFunction {
         Signature::uniform(0, vec![], Volatility::Immutable)
     }
 
-    fn eval(&self, func_ctx: FunctionContext, _columns: &[VectorRef]) -> Result<VectorRef> {
+    fn eval(&self, func_ctx: &FunctionContext, _columns: &[VectorRef]) -> Result<VectorRef> {
         let db = func_ctx.query_ctx.current_schema();
 
         Ok(Arc::new(StringVector::from_slice(&[&db])) as _)
@@ -87,10 +101,70 @@ impl Function for SessionUserFunction {
         Signature::uniform(0, vec![], Volatility::Immutable)
     }
 
-    fn eval(&self, func_ctx: FunctionContext, _columns: &[VectorRef]) -> Result<VectorRef> {
+    fn eval(&self, func_ctx: &FunctionContext, _columns: &[VectorRef]) -> Result<VectorRef> {
         let user = func_ctx.query_ctx.current_user();
 
         Ok(Arc::new(StringVector::from_slice(&[user.username()])) as _)
+    }
+}
+
+impl Function for ReadPreferenceFunction {
+    fn name(&self) -> &str {
+        READ_PREFERENCE_FUNCTION_NAME
+    }
+
+    fn return_type(&self, _input_types: &[ConcreteDataType]) -> Result<ConcreteDataType> {
+        Ok(ConcreteDataType::string_datatype())
+    }
+
+    fn signature(&self) -> Signature {
+        Signature::nullary(Volatility::Immutable)
+    }
+
+    fn eval(&self, func_ctx: &FunctionContext, _columns: &[VectorRef]) -> Result<VectorRef> {
+        let read_preference = func_ctx.query_ctx.read_preference();
+
+        Ok(Arc::new(StringVector::from_slice(&[read_preference.as_ref()])) as _)
+    }
+}
+
+impl Function for PgBackendPidFunction {
+    fn name(&self) -> &str {
+        PG_BACKEND_PID
+    }
+
+    fn return_type(&self, _input_types: &[ConcreteDataType]) -> Result<ConcreteDataType> {
+        Ok(ConcreteDataType::uint64_datatype())
+    }
+
+    fn signature(&self) -> Signature {
+        Signature::nullary(Volatility::Immutable)
+    }
+
+    fn eval(&self, func_ctx: &FunctionContext, _columns: &[VectorRef]) -> Result<VectorRef> {
+        let pid = func_ctx.query_ctx.process_id();
+
+        Ok(Arc::new(UInt32Vector::from_slice([pid])) as _)
+    }
+}
+
+impl Function for ConnectionIdFunction {
+    fn name(&self) -> &str {
+        CONNECTION_ID
+    }
+
+    fn return_type(&self, _input_types: &[ConcreteDataType]) -> Result<ConcreteDataType> {
+        Ok(ConcreteDataType::uint64_datatype())
+    }
+
+    fn signature(&self) -> Signature {
+        Signature::nullary(Volatility::Immutable)
+    }
+
+    fn eval(&self, func_ctx: &FunctionContext, _columns: &[VectorRef]) -> Result<VectorRef> {
+        let pid = func_ctx.query_ctx.process_id();
+
+        Ok(Arc::new(UInt32Vector::from_slice([pid])) as _)
     }
 }
 
@@ -109,6 +183,12 @@ impl fmt::Display for CurrentSchemaFunction {
 impl fmt::Display for SessionUserFunction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "SESSION_USER")
+    }
+}
+
+impl fmt::Display for ReadPreferenceFunction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "READ_PREFERENCE")
     }
 }
 
@@ -138,7 +218,7 @@ mod tests {
             query_ctx,
             ..Default::default()
         };
-        let vector = build.eval(func_ctx, &[]).unwrap();
+        let vector = build.eval(&func_ctx, &[]).unwrap();
         let expect: VectorRef = Arc::new(StringVector::from(vec!["test_db"]));
         assert_eq!(expect, vector);
     }

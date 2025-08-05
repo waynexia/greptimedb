@@ -58,7 +58,7 @@ impl App for Instance {
         false
     }
 
-    async fn stop(&self) -> Result<()> {
+    async fn stop(&mut self) -> Result<()> {
         Ok(())
     }
 }
@@ -75,6 +75,7 @@ impl Command {
             APP_NAME,
             &opts,
             &TracingOptions::default(),
+            None,
             None,
         );
 
@@ -145,6 +146,7 @@ mod tests {
         let output_dir = tempfile::tempdir().unwrap();
         let cli = cli::Command::parse_from([
             "cli",
+            "data",
             "export",
             "--addr",
             "127.0.0.1:4000",

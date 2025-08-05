@@ -21,6 +21,7 @@ use common_telemetry::debug;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::functions::all_default_functions;
 use datafusion_physical_expr::PhysicalExpr;
+use datafusion_substrait::logical_plan::consumer::DefaultSubstraitConsumer;
 use datatypes::data_type::ConcreteDataType as CDT;
 use snafu::{ensure, OptionExt, ResultExt};
 use substrait_proto::proto::expression::field_reference::ReferenceType::DirectReference;
@@ -88,15 +89,13 @@ pub(crate) async fn from_scalar_fn_to_df_fn_impl(
     };
     let schema = input_schema.to_df_schema()?;
 
-    let df_expr = substrait::df_logical_plan::consumer::from_substrait_rex(
-        &SessionStateBuilder::new()
-            .with_scalar_functions(all_default_functions())
-            .build(),
-        &e,
-        &schema,
-        &extensions.to_extensions(),
-    )
-    .await;
+    let extensions = extensions.to_extensions();
+    let session_state = SessionStateBuilder::new()
+        .with_scalar_functions(all_default_functions())
+        .build();
+    let consumer = DefaultSubstraitConsumer::new(&extensions, &session_state);
+    let df_expr =
+        substrait::df_logical_plan::consumer::from_substrait_rex(&consumer, &e, &schema).await;
     let expr = df_expr.context({
         DatafusionSnafu {
             context: "Failed to convert substrait scalar function to datafusion scalar function",
@@ -477,11 +476,27 @@ impl TypedExpr {
                 let substrait_expr = s.value.as_ref().with_context(|| InvalidQuerySnafu {
                     reason: "SingularOrList expression without value",
                 })?;
+                let typed_expr =
+                    TypedExpr::from_substrait_rex(substrait_expr, input_schema, extensions).await?;
                 // Note that we didn't impl support to in list expr
                 if !s.options.is_empty() {
-                    return not_impl_err!("In list expression is not supported");
+                    let mut list = Vec::with_capacity(s.options.len());
+                    for opt in s.options.iter() {
+                        let opt_expr =
+                            TypedExpr::from_substrait_rex(opt, input_schema, extensions).await?;
+                        list.push(opt_expr.expr);
+                    }
+                    let in_list_expr = ScalarExpr::InList {
+                        expr: Box::new(typed_expr.expr),
+                        list,
+                    };
+                    Ok(TypedExpr::new(
+                        in_list_expr,
+                        ColumnType::new_nullable(CDT::boolean_datatype()),
+                    ))
+                } else {
+                    Ok(typed_expr)
                 }
-                TypedExpr::from_substrait_rex(substrait_expr, input_schema, extensions).await
             }
             Some(RexType::Selection(field_ref)) => match &field_ref.reference_type {
                 Some(DirectReference(direct)) => match &direct.reference_type.as_ref() {

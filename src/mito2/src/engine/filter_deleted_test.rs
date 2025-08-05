@@ -28,7 +28,7 @@ use crate::test_util::{
 async fn test_scan_without_filtering_deleted() {
     common_telemetry::init_default_ut_logging();
 
-    let mut env = TestEnv::new();
+    let mut env = TestEnv::new().await;
     let engine = env.create_engine(MitoConfig::default()).await;
 
     let region_id = RegionId::new(1, 1);
@@ -45,7 +45,6 @@ async fn test_scan_without_filtering_deleted() {
         .await;
     let request = CreateRequestBuilder::new()
         .insert_option("compaction.type", "twcs")
-        .insert_option("compaction.twcs.max_active_window_runs", "10")
         .build();
 
     let column_schemas = rows_schema(&request);
@@ -92,11 +91,12 @@ async fn test_scan_without_filtering_deleted() {
     assert_eq!(expected, sort_batches_and_print(&batches, &["tag_0", "ts"]));
 
     // Tries to use seq scan to test it under append mode.
-    let scan = engine
+    let mut scan = engine
         .scan_region(region_id, ScanRequest::default())
         .unwrap();
+    scan.set_filter_deleted(false);
 
-    let seq_scan = scan.scan_without_filter_deleted().unwrap();
+    let seq_scan = scan.seq_scan().await.unwrap();
 
     let stream = seq_scan.build_stream().unwrap();
     let batches = RecordBatches::try_collect(stream).await.unwrap();

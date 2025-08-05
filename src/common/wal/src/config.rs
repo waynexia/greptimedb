@@ -15,6 +15,8 @@
 pub mod kafka;
 pub mod raft_engine;
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
 use crate::config::kafka::{DatanodeKafkaConfig, MetasrvKafkaConfig};
@@ -51,10 +53,30 @@ impl From<DatanodeWalConfig> for MetasrvWalConfig {
             DatanodeWalConfig::RaftEngine(_) => Self::RaftEngine,
             DatanodeWalConfig::Kafka(config) => Self::Kafka(MetasrvKafkaConfig {
                 connection: config.connection,
-                backoff: config.backoff,
                 kafka_topic: config.kafka_topic,
                 auto_create_topics: config.auto_create_topics,
+                auto_prune_interval: config.auto_prune_interval,
+                trigger_flush_threshold: config.trigger_flush_threshold,
+                auto_prune_parallelism: config.auto_prune_parallelism,
             }),
+        }
+    }
+}
+
+impl MetasrvWalConfig {
+    /// Returns if active wal pruning is enabled.
+    pub fn enable_active_wal_pruning(&self) -> bool {
+        match self {
+            MetasrvWalConfig::RaftEngine => false,
+            MetasrvWalConfig::Kafka(config) => config.auto_prune_interval > Duration::ZERO,
+        }
+    }
+
+    /// Gets the kafka connection config.
+    pub fn remote_wal_options(&self) -> Option<&MetasrvKafkaConfig> {
+        match self {
+            MetasrvWalConfig::RaftEngine => None,
+            MetasrvWalConfig::Kafka(config) => Some(config),
         }
     }
 }
@@ -65,7 +87,6 @@ impl From<MetasrvWalConfig> for DatanodeWalConfig {
             MetasrvWalConfig::RaftEngine => Self::RaftEngine(RaftEngineConfig::default()),
             MetasrvWalConfig::Kafka(config) => Self::Kafka(DatanodeKafkaConfig {
                 connection: config.connection,
-                backoff: config.backoff,
                 kafka_topic: config.kafka_topic,
                 ..Default::default()
             }),
@@ -84,7 +105,6 @@ mod tests {
     use tests::kafka::common::KafkaTopicConfig;
 
     use super::*;
-    use crate::config::kafka::common::BackoffConfig;
     use crate::config::{DatanodeKafkaConfig, MetasrvKafkaConfig};
     use crate::TopicSelectorType;
 
@@ -138,12 +158,7 @@ mod tests {
             provider = "kafka"
             broker_endpoints = ["127.0.0.1:9092"]
             max_batch_bytes = "1MB"
-            linger = "200ms"
             consumer_wait_timeout = "100ms"
-            backoff_init = "500ms"
-            backoff_max = "10s"
-            backoff_base = 2
-            backoff_deadline = "5mins"
             num_topics = 32
             num_partitions = 1
             selector_type = "round_robin"
@@ -175,12 +190,6 @@ mod tests {
                     client_key_path: None,
                 }),
             },
-            backoff: BackoffConfig {
-                init: Duration::from_millis(500),
-                max: Duration::from_secs(10),
-                base: 2,
-                deadline: Some(Duration::from_secs(60 * 5)),
-            },
             kafka_topic: KafkaTopicConfig {
                 num_topics: 32,
                 selector_type: TopicSelectorType::RoundRobin,
@@ -190,6 +199,9 @@ mod tests {
                 create_topic_timeout: Duration::from_secs(30),
             },
             auto_create_topics: true,
+            auto_prune_interval: Duration::from_secs(0),
+            trigger_flush_threshold: 0,
+            auto_prune_parallelism: 10,
         };
         assert_eq!(metasrv_wal_config, MetasrvWalConfig::Kafka(expected));
 
@@ -212,12 +224,6 @@ mod tests {
             },
             max_batch_bytes: ReadableSize::mb(1),
             consumer_wait_timeout: Duration::from_millis(100),
-            backoff: BackoffConfig {
-                init: Duration::from_millis(500),
-                max: Duration::from_secs(10),
-                base: 2,
-                deadline: Some(Duration::from_secs(60 * 5)),
-            },
             kafka_topic: KafkaTopicConfig {
                 num_topics: 32,
                 selector_type: TopicSelectorType::RoundRobin,

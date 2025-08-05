@@ -15,7 +15,6 @@
 use std::sync::Arc;
 
 use api::prom_store::remote::ReadRequest;
-use api::v1::RowInsertRequests;
 use axum::body::Bytes;
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderValue, StatusCode};
@@ -28,16 +27,21 @@ use common_telemetry::tracing;
 use hyper::HeaderMap;
 use lazy_static::lazy_static;
 use object_pool::Pool;
+use pipeline::util::to_pipeline_version;
+use pipeline::PipelineDefinition;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use session::context::{Channel, QueryContext};
 use snafu::prelude::*;
 
-use super::header::{write_cost_header_map, GREPTIME_DB_HEADER_METRICS};
-use crate::error::{self, Result};
-use crate::prom_store::{snappy_decompress, zstd_decompress};
-use crate::proto::PromWriteRequest;
-use crate::query_handler::{PromStoreProtocolHandlerRef, PromStoreResponse};
+use crate::error::{self, InternalSnafu, PipelineSnafu, Result};
+use crate::http::extractor::PipelineInfo;
+use crate::http::header::{write_cost_header_map, GREPTIME_DB_HEADER_METRICS};
+use crate::http::PromValidationMode;
+use crate::prom_row_builder::TablesBuilder;
+use crate::prom_store::{extract_schema_from_read_request, snappy_decompress, zstd_decompress};
+use crate::proto::{PromSeriesProcessor, PromWriteRequest};
+use crate::query_handler::{PipelineHandlerRef, PromStoreProtocolHandlerRef, PromStoreResponse};
 
 pub const PHYSICAL_TABLE_PARAM: &str = "physical_table";
 lazy_static! {
@@ -48,6 +52,14 @@ lazy_static! {
 pub const DEFAULT_ENCODING: &str = "snappy";
 pub const VM_ENCODING: &str = "zstd";
 pub const VM_PROTO_VERSION: &str = "1";
+
+#[derive(Clone)]
+pub struct PromStoreState {
+    pub prom_store_handler: PromStoreProtocolHandlerRef,
+    pub pipeline_handler: Option<PipelineHandlerRef>,
+    pub prom_store_with_metric_engine: bool,
+    pub prom_validation_mode: PromValidationMode,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RemoteWriteQuery {
@@ -69,132 +81,84 @@ impl Default for RemoteWriteQuery {
     }
 }
 
-/// Same with [remote_write] but won't store data to metric engine.
-#[axum_macros::debug_handler]
-pub async fn route_write_without_metric_engine(
-    handler: State<PromStoreProtocolHandlerRef>,
-    query: Query<RemoteWriteQuery>,
-    extension: Extension<QueryContext>,
-    content_encoding: TypedHeader<headers::ContentEncoding>,
-    raw_body: Bytes,
-) -> Result<impl IntoResponse> {
-    remote_write_impl(
-        handler,
-        query,
-        extension,
-        content_encoding,
-        raw_body,
-        true,
-        false,
-    )
-    .await
-}
-
-/// Same with [remote_write] but won't store data to metric engine.
-/// And without strict_mode on will not check invalid UTF-8.
-#[axum_macros::debug_handler]
-pub async fn route_write_without_metric_engine_and_strict_mode(
-    handler: State<PromStoreProtocolHandlerRef>,
-    query: Query<RemoteWriteQuery>,
-    extension: Extension<QueryContext>,
-    content_encoding: TypedHeader<headers::ContentEncoding>,
-    raw_body: Bytes,
-) -> Result<impl IntoResponse> {
-    remote_write_impl(
-        handler,
-        query,
-        extension,
-        content_encoding,
-        raw_body,
-        false,
-        false,
-    )
-    .await
-}
-
 #[axum_macros::debug_handler]
 #[tracing::instrument(
     skip_all,
     fields(protocol = "prometheus", request_type = "remote_write")
 )]
 pub async fn remote_write(
-    handler: State<PromStoreProtocolHandlerRef>,
-    query: Query<RemoteWriteQuery>,
-    extension: Extension<QueryContext>,
-    content_encoding: TypedHeader<headers::ContentEncoding>,
-    raw_body: Bytes,
-) -> Result<impl IntoResponse> {
-    remote_write_impl(
-        handler,
-        query,
-        extension,
-        content_encoding,
-        raw_body,
-        true,
-        true,
-    )
-    .await
-}
-
-#[axum_macros::debug_handler]
-#[tracing::instrument(
-    skip_all,
-    fields(protocol = "prometheus", request_type = "remote_write")
-)]
-pub async fn remote_write_without_strict_mode(
-    handler: State<PromStoreProtocolHandlerRef>,
-    query: Query<RemoteWriteQuery>,
-    extension: Extension<QueryContext>,
-    content_encoding: TypedHeader<headers::ContentEncoding>,
-    raw_body: Bytes,
-) -> Result<impl IntoResponse> {
-    remote_write_impl(
-        handler,
-        query,
-        extension,
-        content_encoding,
-        raw_body,
-        false,
-        true,
-    )
-    .await
-}
-
-async fn remote_write_impl(
-    State(handler): State<PromStoreProtocolHandlerRef>,
+    State(state): State<PromStoreState>,
     Query(params): Query<RemoteWriteQuery>,
     Extension(mut query_ctx): Extension<QueryContext>,
+    pipeline_info: PipelineInfo,
     content_encoding: TypedHeader<headers::ContentEncoding>,
     body: Bytes,
-    is_strict_mode: bool,
-    is_metric_engine: bool,
 ) -> Result<impl IntoResponse> {
-    // VictoriaMetrics handshake
+    let PromStoreState {
+        prom_store_handler,
+        pipeline_handler,
+        prom_store_with_metric_engine,
+        prom_validation_mode,
+    } = state;
+
     if let Some(_vm_handshake) = params.get_vm_proto_version {
         return Ok(VM_PROTO_VERSION.into_response());
     }
 
     let db = params.db.clone().unwrap_or_default();
     query_ctx.set_channel(Channel::Prometheus);
+    if let Some(physical_table) = params.physical_table {
+        query_ctx.set_extension(PHYSICAL_TABLE_PARAM, physical_table);
+    }
+    let query_ctx = Arc::new(query_ctx);
     let _timer = crate::metrics::METRIC_HTTP_PROM_STORE_WRITE_ELAPSED
         .with_label_values(&[db.as_str()])
         .start_timer();
 
     let is_zstd = content_encoding.contains(VM_ENCODING);
-    let (request, samples) = decode_remote_write_request(is_zstd, body, is_strict_mode).await?;
 
-    if let Some(physical_table) = params.physical_table {
-        query_ctx.set_extension(PHYSICAL_TABLE_PARAM, physical_table);
+    let mut processor = PromSeriesProcessor::default_processor();
+
+    if let Some(pipeline_name) = pipeline_info.pipeline_name {
+        let pipeline_def = PipelineDefinition::from_name(
+            &pipeline_name,
+            to_pipeline_version(pipeline_info.pipeline_version.as_deref())
+                .context(PipelineSnafu)?,
+            None,
+        )
+        .context(PipelineSnafu)?;
+        let pipeline_handler = pipeline_handler.context(InternalSnafu {
+            err_msg: "pipeline handler is not set".to_string(),
+        })?;
+
+        processor.set_pipeline(pipeline_handler, query_ctx.clone(), pipeline_def);
     }
-    let query_ctx = Arc::new(query_ctx);
 
-    let output = handler.write(request, query_ctx, is_metric_engine).await?;
-    crate::metrics::PROM_STORE_REMOTE_WRITE_SAMPLES.inc_by(samples as u64);
-    Ok((
-        StatusCode::NO_CONTENT,
-        write_cost_header_map(output.meta.cost),
-    )
-        .into_response())
+    let mut req = decode_remote_write_request(is_zstd, body, prom_validation_mode, &mut processor)?;
+
+    let req = if processor.use_pipeline {
+        processor.exec_pipeline().await?
+    } else {
+        req.as_insert_requests()
+    };
+
+    let mut cost = 0;
+    for (temp_ctx, reqs) in req.as_req_iter(query_ctx) {
+        let cnt: u64 = reqs
+            .inserts
+            .iter()
+            .filter_map(|s| s.rows.as_ref().map(|r| r.rows.len() as u64))
+            .sum();
+        let output = prom_store_handler
+            .write(reqs, temp_ctx, prom_store_with_metric_engine)
+            .await?;
+        crate::metrics::PROM_STORE_REMOTE_WRITE_SAMPLES
+            .with_label_values(&[db.as_str()])
+            .inc_by(cnt);
+        cost += output.meta.cost;
+    }
+
+    Ok((StatusCode::NO_CONTENT, write_cost_header_map(cost)).into_response())
 }
 
 impl IntoResponse for PromStoreResponse {
@@ -222,21 +186,27 @@ impl IntoResponse for PromStoreResponse {
     fields(protocol = "prometheus", request_type = "remote_read")
 )]
 pub async fn remote_read(
-    State(handler): State<PromStoreProtocolHandlerRef>,
+    State(state): State<PromStoreState>,
     Query(params): Query<RemoteWriteQuery>,
     Extension(mut query_ctx): Extension<QueryContext>,
     body: Bytes,
 ) -> Result<PromStoreResponse> {
     let db = params.db.clone().unwrap_or_default();
     query_ctx.set_channel(Channel::Prometheus);
+
+    let request = decode_remote_read_request(body).await?;
+
+    // Extract schema from special labels and set it in query context
+    if let Some(schema) = extract_schema_from_read_request(&request) {
+        query_ctx.set_current_schema(&schema);
+    }
+
     let query_ctx = Arc::new(query_ctx);
     let _timer = crate::metrics::METRIC_HTTP_PROM_STORE_READ_ELAPSED
         .with_label_values(&[db.as_str()])
         .start_timer();
 
-    let request = decode_remote_read_request(body).await?;
-
-    handler.read(request, query_ctx).await
+    state.prom_store_handler.read(request, query_ctx).await
 }
 
 fn try_decompress(is_zstd: bool, body: &[u8]) -> Result<Bytes> {
@@ -247,11 +217,12 @@ fn try_decompress(is_zstd: bool, body: &[u8]) -> Result<Bytes> {
     }))
 }
 
-async fn decode_remote_write_request(
+pub fn decode_remote_write_request(
     is_zstd: bool,
     body: Bytes,
-    is_strict_mode: bool,
-) -> Result<(RowInsertRequests, usize)> {
+    prom_validation_mode: PromValidationMode,
+    processor: &mut PromSeriesProcessor,
+) -> Result<TablesBuilder> {
     let _timer = crate::metrics::METRIC_HTTP_PROM_STORE_DECODE_ELAPSED.start_timer();
 
     // due to vmagent's limitation, there is a chance that vmagent is
@@ -268,10 +239,11 @@ async fn decode_remote_write_request(
     };
 
     let mut request = PROM_WRITE_REQUEST_POOL.pull(PromWriteRequest::default);
+
     request
-        .merge(buf, is_strict_mode)
+        .merge(buf, prom_validation_mode, processor)
         .context(error::DecodePromRemoteRequestSnafu)?;
-    Ok(request.as_row_insert_requests())
+    Ok(std::mem::take(&mut request.table_data))
 }
 
 async fn decode_remote_read_request(body: Bytes) -> Result<ReadRequest> {

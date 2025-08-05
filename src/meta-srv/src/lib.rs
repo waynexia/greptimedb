@@ -14,10 +14,11 @@
 
 #![feature(result_flattening)]
 #![feature(assert_matches)]
-#![feature(extract_if)]
+#![feature(hash_set_entry)]
+#![feature(let_chains)]
 
 pub mod bootstrap;
-mod cache_invalidator;
+pub mod cache_invalidator;
 pub mod cluster;
 pub mod election;
 pub mod error;
@@ -27,9 +28,10 @@ pub mod handler;
 pub mod key;
 pub mod lease;
 pub mod metasrv;
-mod metrics;
+pub mod metrics;
 #[cfg(feature = "mock")]
 pub mod mocks;
+pub mod node_excluder;
 pub mod procedure;
 pub mod pubsub;
 pub mod region;

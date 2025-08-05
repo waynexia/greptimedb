@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 
 use api::prom_store::remote::label_matcher::Type as MatcherType;
-use api::prom_store::remote::{Label, Query, Sample, TimeSeries, WriteRequest};
+use api::prom_store::remote::{Label, Query, ReadRequest, Sample, TimeSeries, WriteRequest};
 use api::v1::RowInsertRequests;
 use common_grpc::precision::Precision;
 use common_query::prelude::{GREPTIME_TIMESTAMP, GREPTIME_VALUE};
@@ -39,8 +39,16 @@ use crate::error::{self, Result};
 use crate::row_writer::{self, MultiTableData};
 
 pub const METRIC_NAME_LABEL: &str = "__name__";
-
 pub const METRIC_NAME_LABEL_BYTES: &[u8] = b"__name__";
+
+pub const DATABASE_LABEL: &str = "__database__";
+pub const DATABASE_LABEL_BYTES: &[u8] = b"__database__";
+
+pub const SCHEMA_LABEL: &str = "__schema__";
+pub const SCHEMA_LABEL_BYTES: &[u8] = b"__schema__";
+
+pub const PHYSICAL_TABLE_LABEL: &str = "__physical_table__";
+pub const PHYSICAL_TABLE_LABEL_BYTES: &[u8] = b"__physical_table__";
 
 /// The same as `FIELD_COLUMN_MATCHER` in `promql` crate
 pub const FIELD_NAME_LABEL: &str = "__field__";
@@ -68,6 +76,29 @@ pub fn table_name(q: &Query) -> Result<String> {
         })
 }
 
+/// Extract schema from remote read request. Returns the first schema found from any query's matchers.
+/// Prioritizes __schema__ over __database__ labels.
+pub fn extract_schema_from_read_request(request: &ReadRequest) -> Option<String> {
+    for query in &request.queries {
+        for matcher in &query.matchers {
+            if matcher.name == SCHEMA_LABEL && matcher.r#type == MatcherType::Eq as i32 {
+                return Some(matcher.value.clone());
+            }
+        }
+    }
+
+    // If no __schema__ found, look for __database__
+    for query in &request.queries {
+        for matcher in &query.matchers {
+            if matcher.name == DATABASE_LABEL && matcher.r#type == MatcherType::Eq as i32 {
+                return Some(matcher.value.clone());
+            }
+        }
+    }
+
+    None
+}
+
 /// Create a DataFrame from a remote Query
 #[tracing::instrument(skip_all)]
 pub fn query_to_plan(dataframe: DataFrame, q: &Query) -> Result<LogicalPlan> {
@@ -86,7 +117,7 @@ pub fn query_to_plan(dataframe: DataFrame, q: &Query) -> Result<LogicalPlan> {
     for m in label_matches {
         let name = &m.name;
 
-        if name == METRIC_NAME_LABEL {
+        if name == METRIC_NAME_LABEL || name == SCHEMA_LABEL || name == DATABASE_LABEL {
             continue;
         }
 
@@ -473,6 +504,71 @@ pub fn mock_timeseries() -> Vec<TimeSeries> {
             ..Default::default()
         },
     ]
+}
+
+/// Add new labels to the mock timeseries.
+pub fn mock_timeseries_new_label() -> Vec<TimeSeries> {
+    let ts_demo_metrics = TimeSeries {
+        labels: vec![
+            new_label(METRIC_NAME_LABEL.to_string(), "demo_metrics".to_string()),
+            new_label("idc".to_string(), "idc3".to_string()),
+            new_label("new_label1".to_string(), "foo".to_string()),
+        ],
+        samples: vec![Sample {
+            value: 42.0,
+            timestamp: 3000,
+        }],
+        ..Default::default()
+    };
+    let ts_multi_labels = TimeSeries {
+        labels: vec![
+            new_label(METRIC_NAME_LABEL.to_string(), "metric1".to_string()),
+            new_label("idc".to_string(), "idc4".to_string()),
+            new_label("env".to_string(), "prod".to_string()),
+            new_label("host".to_string(), "host9".to_string()),
+            new_label("new_label2".to_string(), "bar".to_string()),
+        ],
+        samples: vec![Sample {
+            value: 99.0,
+            timestamp: 4000,
+        }],
+        ..Default::default()
+    };
+
+    vec![ts_demo_metrics, ts_multi_labels]
+}
+
+/// Add new labels to the mock timeseries.
+pub fn mock_timeseries_special_labels() -> Vec<TimeSeries> {
+    let idc3_schema = TimeSeries {
+        labels: vec![
+            new_label(METRIC_NAME_LABEL.to_string(), "idc3_lo_table".to_string()),
+            new_label("__database__".to_string(), "idc3".to_string()),
+            new_label("__physical_table__".to_string(), "f1".to_string()),
+        ],
+        samples: vec![Sample {
+            value: 42.0,
+            timestamp: 3000,
+        }],
+        ..Default::default()
+    };
+    let idc4_schema = TimeSeries {
+        labels: vec![
+            new_label(
+                METRIC_NAME_LABEL.to_string(),
+                "idc4_local_table".to_string(),
+            ),
+            new_label("__database__".to_string(), "idc4".to_string()),
+            new_label("__physical_table__".to_string(), "f2".to_string()),
+        ],
+        samples: vec![Sample {
+            value: 99.0,
+            timestamp: 4000,
+        }],
+        ..Default::default()
+    };
+
+    vec![idc3_schema, idc4_schema]
 }
 
 #[cfg(test)]

@@ -19,9 +19,10 @@ use api::v1::Rows;
 use common_error::ext::ErrorExt;
 use common_error::status_code::StatusCode;
 use common_recordbatch::RecordBatches;
+use either::Either;
 use store_api::region_engine::{RegionEngine, RegionRole};
 use store_api::region_request::{
-    RegionCloseRequest, RegionOpenRequest, RegionPutRequest, RegionRequest,
+    PathType, RegionCloseRequest, RegionOpenRequest, RegionPutRequest, RegionRequest,
 };
 use store_api::storage::{RegionId, ScanRequest};
 use tokio::sync::oneshot;
@@ -36,7 +37,7 @@ use crate::test_util::{
 
 #[tokio::test]
 async fn test_engine_open_empty() {
-    let mut env = TestEnv::with_prefix("open-empty");
+    let mut env = TestEnv::with_prefix("open-empty").await;
     let engine = env.create_engine(MitoConfig::default()).await;
 
     let region_id = RegionId::new(1, 1);
@@ -45,7 +46,8 @@ async fn test_engine_open_empty() {
             region_id,
             RegionRequest::Open(RegionOpenRequest {
                 engine: String::new(),
-                region_dir: "empty".to_string(),
+                table_dir: "empty".to_string(),
+                path_type: PathType::Bare,
                 options: HashMap::default(),
                 skip_wal_replay: false,
             }),
@@ -63,12 +65,12 @@ async fn test_engine_open_empty() {
 
 #[tokio::test]
 async fn test_engine_open_existing() {
-    let mut env = TestEnv::with_prefix("open-exiting");
+    let mut env = TestEnv::with_prefix("open-exiting").await;
     let engine = env.create_engine(MitoConfig::default()).await;
 
     let region_id = RegionId::new(1, 1);
     let request = CreateRequestBuilder::new().build();
-    let region_dir = request.region_dir.clone();
+    let table_dir = request.table_dir.clone();
     engine
         .handle_request(region_id, RegionRequest::Create(request))
         .await
@@ -79,7 +81,8 @@ async fn test_engine_open_existing() {
             region_id,
             RegionRequest::Open(RegionOpenRequest {
                 engine: String::new(),
-                region_dir,
+                table_dir,
+                path_type: PathType::Bare,
                 options: HashMap::default(),
                 skip_wal_replay: false,
             }),
@@ -90,36 +93,36 @@ async fn test_engine_open_existing() {
 
 #[tokio::test]
 async fn test_engine_reopen_region() {
-    let mut env = TestEnv::with_prefix("reopen-region");
+    let mut env = TestEnv::with_prefix("reopen-region").await;
     let engine = env.create_engine(MitoConfig::default()).await;
 
     let region_id = RegionId::new(1, 1);
     let request = CreateRequestBuilder::new().build();
-    let region_dir = request.region_dir.clone();
+    let table_dir = request.table_dir.clone();
     engine
         .handle_request(region_id, RegionRequest::Create(request))
         .await
         .unwrap();
 
-    reopen_region(&engine, region_id, region_dir, false, Default::default()).await;
+    reopen_region(&engine, region_id, table_dir, false, Default::default()).await;
     assert!(engine.is_region_exists(region_id));
 }
 
 #[tokio::test]
 async fn test_engine_open_readonly() {
-    let mut env = TestEnv::new();
+    let mut env = TestEnv::new().await;
     let engine = env.create_engine(MitoConfig::default()).await;
 
     let region_id = RegionId::new(1, 1);
     let request = CreateRequestBuilder::new().build();
-    let region_dir = request.region_dir.clone();
+    let table_dir = request.table_dir.clone();
     let column_schemas = rows_schema(&request);
     engine
         .handle_request(region_id, RegionRequest::Create(request))
         .await
         .unwrap();
 
-    reopen_region(&engine, region_id, region_dir, false, Default::default()).await;
+    reopen_region(&engine, region_id, table_dir, false, Default::default()).await;
 
     // Region is readonly.
     let rows = Rows {
@@ -150,12 +153,12 @@ async fn test_engine_open_readonly() {
 
 #[tokio::test]
 async fn test_engine_region_open_with_options() {
-    let mut env = TestEnv::new();
+    let mut env = TestEnv::new().await;
     let engine = env.create_engine(MitoConfig::default()).await;
 
     let region_id = RegionId::new(1, 1);
     let request = CreateRequestBuilder::new().build();
-    let region_dir = request.region_dir.clone();
+    let table_dir = request.table_dir.clone();
     engine
         .handle_request(region_id, RegionRequest::Create(request))
         .await
@@ -173,7 +176,8 @@ async fn test_engine_region_open_with_options() {
             region_id,
             RegionRequest::Open(RegionOpenRequest {
                 engine: String::new(),
-                region_dir,
+                table_dir,
+                path_type: PathType::Bare,
                 options: HashMap::from([("ttl".to_string(), "4d".to_string())]),
                 skip_wal_replay: false,
             }),
@@ -190,7 +194,7 @@ async fn test_engine_region_open_with_options() {
 
 #[tokio::test]
 async fn test_engine_region_open_with_custom_store() {
-    let mut env = TestEnv::new();
+    let mut env = TestEnv::new().await;
     let engine = env
         .create_engine_with_multiple_object_stores(MitoConfig::default(), None, None, &["Gcs"])
         .await;
@@ -198,7 +202,7 @@ async fn test_engine_region_open_with_custom_store() {
     let request = CreateRequestBuilder::new()
         .insert_option("storage", "Gcs")
         .build();
-    let region_dir = request.region_dir.clone();
+    let table_dir = request.table_dir.clone();
 
     // Create a custom region.
     engine
@@ -218,7 +222,8 @@ async fn test_engine_region_open_with_custom_store() {
             region_id,
             RegionRequest::Open(RegionOpenRequest {
                 engine: String::new(),
-                region_dir,
+                table_dir,
+                path_type: PathType::Bare,
                 options: HashMap::from([("storage".to_string(), "Gcs".to_string())]),
                 skip_wal_replay: false,
             }),
@@ -231,20 +236,20 @@ async fn test_engine_region_open_with_custom_store() {
     let object_store_manager = env.get_object_store_manager().unwrap();
     assert!(!object_store_manager
         .default_object_store()
-        .exists(region.access_layer.region_dir())
+        .exists(&region.access_layer.build_region_dir(region_id))
         .await
         .unwrap());
     assert!(object_store_manager
         .find("Gcs")
         .unwrap()
-        .exists(region.access_layer.region_dir())
+        .exists(&region.access_layer.build_region_dir(region_id))
         .await
         .unwrap());
 }
 
 #[tokio::test]
 async fn test_open_region_skip_wal_replay() {
-    let mut env = TestEnv::new();
+    let mut env = TestEnv::new().await;
     let engine = env.create_engine(MitoConfig::default()).await;
 
     let region_id = RegionId::new(1, 1);
@@ -260,7 +265,7 @@ async fn test_open_region_skip_wal_replay() {
         .await;
 
     let request = CreateRequestBuilder::new().build();
-    let region_dir = request.region_dir.clone();
+    let table_dir = request.table_dir.clone();
 
     let column_schemas = rows_schema(&request);
     engine
@@ -289,7 +294,8 @@ async fn test_open_region_skip_wal_replay() {
             region_id,
             RegionRequest::Open(RegionOpenRequest {
                 engine: String::new(),
-                region_dir: region_dir.to_string(),
+                table_dir: table_dir.to_string(),
+                path_type: PathType::Bare,
                 options: Default::default(),
                 skip_wal_replay: true,
             }),
@@ -318,7 +324,8 @@ async fn test_open_region_skip_wal_replay() {
             region_id,
             RegionRequest::Open(RegionOpenRequest {
                 engine: String::new(),
-                region_dir,
+                table_dir,
+                path_type: PathType::Bare,
                 options: Default::default(),
                 skip_wal_replay: false,
             }),
@@ -344,7 +351,7 @@ async fn test_open_region_skip_wal_replay() {
 
 #[tokio::test]
 async fn test_open_region_wait_for_opening_region_ok() {
-    let mut env = TestEnv::with_prefix("wait-for-opening-region-ok");
+    let mut env = TestEnv::with_prefix("wait-for-opening-region-ok").await;
     let engine = env.create_engine(MitoConfig::default()).await;
     let region_id = RegionId::new(1, 1);
     let worker = engine.inner.workers.worker(region_id);
@@ -359,7 +366,8 @@ async fn test_open_region_wait_for_opening_region_ok() {
                 region_id,
                 RegionRequest::Open(RegionOpenRequest {
                     engine: String::new(),
-                    region_dir: "empty".to_string(),
+                    table_dir: "empty".to_string(),
+                    path_type: PathType::Bare,
                     options: HashMap::default(),
                     skip_wal_replay: false,
                 }),
@@ -383,7 +391,7 @@ async fn test_open_region_wait_for_opening_region_ok() {
 
 #[tokio::test]
 async fn test_open_region_wait_for_opening_region_err() {
-    let mut env = TestEnv::with_prefix("wait-for-opening-region-err");
+    let mut env = TestEnv::with_prefix("wait-for-opening-region-err").await;
     let engine = env.create_engine(MitoConfig::default()).await;
     let region_id = RegionId::new(1, 1);
     let worker = engine.inner.workers.worker(region_id);
@@ -398,7 +406,8 @@ async fn test_open_region_wait_for_opening_region_err() {
                 region_id,
                 RegionRequest::Open(RegionOpenRequest {
                     engine: String::new(),
-                    region_dir: "empty".to_string(),
+                    table_dir: "empty".to_string(),
+                    path_type: PathType::Bare,
                     options: HashMap::default(),
                     skip_wal_replay: false,
                 }),
@@ -428,7 +437,7 @@ async fn test_open_region_wait_for_opening_region_err() {
 
 #[tokio::test]
 async fn test_open_compaction_region() {
-    let mut env = TestEnv::new();
+    let mut env = TestEnv::new().await;
     let mut mito_config = MitoConfig::default();
     mito_config
         .sanitize(&env.data_home().display().to_string())
@@ -449,7 +458,7 @@ async fn test_open_compaction_region() {
         )
         .await;
     let request = CreateRequestBuilder::new().build();
-    let region_dir = request.region_dir.clone();
+    let table_dir = request.table_dir.clone();
     engine
         .handle_request(region_id, RegionRequest::Create(request))
         .await
@@ -465,7 +474,8 @@ async fn test_open_compaction_region() {
 
     let req = OpenCompactionRegionRequest {
         region_id,
-        region_dir: region_dir.clone(),
+        table_dir: table_dir.clone(),
+        path_type: PathType::Bare,
         region_options: RegionOptions::default(),
         max_parallelism: 1,
     };
@@ -474,7 +484,7 @@ async fn test_open_compaction_region() {
         &req,
         &mito_config,
         object_store_manager.clone(),
-        schema_metadata_manager,
+        Either::Right(schema_metadata_manager),
     )
     .await
     .unwrap();

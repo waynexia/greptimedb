@@ -42,6 +42,20 @@ pub enum Error {
         location: Location,
     },
 
+    #[snafu(display("Failed to batch open mito region"))]
+    BatchOpenMitoRegion {
+        source: BoxedError,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("No open region result for region {}", region_id))]
+    NoOpenRegionResult {
+        region_id: RegionId,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("Failed to close mito region, region id: {}", region_id))]
     CloseMitoRegion {
         region_id: RegionId,
@@ -61,6 +75,14 @@ pub enum Error {
 
     #[snafu(display("Failed to serialize column metadata"))]
     SerializeColumnMetadata {
+        #[snafu(source)]
+        error: serde_json::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Failed to serialize region manifest info"))]
+    SerializeRegionManifestInfo {
         #[snafu(source)]
         error: serde_json::Error,
         #[snafu(implicit)]
@@ -100,7 +122,7 @@ pub enum Error {
 
     #[snafu(display("Failed to encode primary key"))]
     EncodePrimaryKey {
-        source: mito2::error::Error,
+        source: mito_codec::error::Error,
         #[snafu(implicit)]
         location: Location,
     },
@@ -118,6 +140,7 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+
     #[snafu(display("Mito delete operation fails"))]
     MitoDeleteOperation {
         source: BoxedError,
@@ -127,6 +150,13 @@ pub enum Error {
 
     #[snafu(display("Mito catchup operation fails"))]
     MitoCatchupOperation {
+        source: BoxedError,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Mito sync operation fails"))]
+    MitoSyncOperation {
         source: BoxedError,
         #[snafu(implicit)]
         location: Location,
@@ -259,6 +289,21 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+
+    #[snafu(display("Expected metric manifest info, region: {}", region_id))]
+    MetricManifestInfo {
+        region_id: RegionId,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Failed to start repeated task: {}", name))]
+    StartRepeatedTask {
+        name: String,
+        source: common_runtime::error::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -289,7 +334,9 @@ impl ErrorExt for Error {
             | DecodeColumnValue { .. }
             | ParseRegionId { .. }
             | InvalidMetadata { .. }
-            | SetSkippingIndexOption { .. } => StatusCode::Unexpected,
+            | SetSkippingIndexOption { .. }
+            | SerializeRegionManifestInfo { .. }
+            | NoOpenRegionResult { .. } => StatusCode::Unexpected,
 
             PhysicalRegionNotFound { .. } | LogicalRegionNotFound { .. } => {
                 StatusCode::RegionNotFound
@@ -304,11 +351,17 @@ impl ErrorExt for Error {
             | MitoWriteOperation { source, .. }
             | MitoCatchupOperation { source, .. }
             | MitoFlushOperation { source, .. }
-            | MitoDeleteOperation { source, .. } => source.status_code(),
+            | MitoDeleteOperation { source, .. }
+            | MitoSyncOperation { source, .. }
+            | BatchOpenMitoRegion { source, .. } => source.status_code(),
 
             EncodePrimaryKey { source, .. } => source.status_code(),
 
             CollectRecordBatchStream { source, .. } => source.status_code(),
+
+            StartRepeatedTask { source, .. } => source.status_code(),
+
+            MetricManifestInfo { .. } => StatusCode::Internal,
         }
     }
 

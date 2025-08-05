@@ -12,16 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::str::FromStr;
+
 use snafu::ResultExt;
-use sqlparser::ast::{Ident, Query};
+use sqlparser::ast::{Ident, Query, Value};
 use sqlparser::dialect::Dialect;
 use sqlparser::keywords::Keyword;
 use sqlparser::parser::{Parser, ParserError, ParserOptions};
-use sqlparser::tokenizer::{Token, TokenWithLocation};
+use sqlparser::tokenizer::{Token, TokenWithSpan};
 
 use crate::ast::{Expr, ObjectName};
 use crate::error::{self, Result, SyntaxSnafu};
 use crate::parsers::tql_parser;
+use crate::statements::kill::Kill;
 use crate::statements::statement::Statement;
 use crate::statements::transform_statements;
 
@@ -112,7 +115,7 @@ impl ParserContext<'_> {
             .try_with_sql(sql)
             .context(SyntaxSnafu)?;
 
-        let function_name = parser.parse_identifier(false).context(SyntaxSnafu)?;
+        let function_name = parser.parse_identifier().context(SyntaxSnafu)?;
         parser
             .parse_function(ObjectName(vec![function_name]))
             .context(SyntaxSnafu)
@@ -121,76 +124,118 @@ impl ParserContext<'_> {
     /// Parses parser context to a set of statements.
     pub fn parse_statement(&mut self) -> Result<Statement> {
         match self.parser.peek_token().token {
-            Token::Word(w) => {
-                match w.keyword {
-                    Keyword::CREATE => {
-                        let _ = self.parser.next_token();
-                        self.parse_create()
-                    }
-
-                    Keyword::EXPLAIN => {
-                        let _ = self.parser.next_token();
-                        self.parse_explain()
-                    }
-
-                    Keyword::SHOW => {
-                        let _ = self.parser.next_token();
-                        self.parse_show()
-                    }
-
-                    Keyword::DELETE => self.parse_delete(),
-
-                    Keyword::DESCRIBE | Keyword::DESC => {
-                        let _ = self.parser.next_token();
-                        self.parse_describe()
-                    }
-
-                    Keyword::INSERT => self.parse_insert(),
-
-                    Keyword::SELECT | Keyword::WITH | Keyword::VALUES => self.parse_query(),
-
-                    Keyword::ALTER => self.parse_alter(),
-
-                    Keyword::DROP => self.parse_drop(),
-
-                    Keyword::COPY => self.parse_copy(),
-
-                    Keyword::TRUNCATE => self.parse_truncate(),
-
-                    Keyword::SET => self.parse_set_variables(),
-
-                    Keyword::ADMIN => self.parse_admin_command(),
-
-                    Keyword::NoKeyword
-                        if w.quote_style.is_none() && w.value.to_uppercase() == tql_parser::TQL =>
-                    {
-                        self.parse_tql()
-                    }
-
-                    Keyword::DECLARE => self.parse_declare_cursor(),
-
-                    Keyword::FETCH => self.parse_fetch_cursor(),
-
-                    Keyword::CLOSE => self.parse_close_cursor(),
-
-                    Keyword::USE => {
-                        let _ = self.parser.next_token();
-
-                        let database_name = self.parser.parse_identifier(false).context(
-                            error::UnexpectedSnafu {
-                                expected: "a database name",
-                                actual: self.peek_token_as_string(),
-                            },
-                        )?;
-                        Ok(Statement::Use(
-                            Self::canonicalize_identifier(database_name).value,
-                        ))
-                    }
-
-                    // todo(hl) support more statements.
-                    _ => self.unsupported(self.peek_token_as_string()),
+            Token::Word(w) => match w.keyword {
+                Keyword::CREATE => {
+                    let _ = self.parser.next_token();
+                    self.parse_create()
                 }
-            }
+
+                Keyword::EXPLAIN => {
+                    let _ = self.parser.next_token();
+                    self.parse_explain()
+                }
+
+                Keyword::SHOW => {
+                    let _ = self.parser.next_token();
+                    self.parse_show()
+                }
+
+                Keyword::DELETE => self.parse_delete(),
+
+                Keyword::DESCRIBE | Keyword::DESC => {
+                    let _ = self.parser.next_token();
+                    self.parse_describe()
+                }
+
+                Keyword::INSERT => self.parse_insert(),
+
+                Keyword::REPLACE => self.parse_replace(),
+
+                Keyword::SELECT | Keyword::VALUES => self.parse_query(),
+
+                Keyword::WITH => self.parse_with_tql(),
+
+                Keyword::ALTER => self.parse_alter(),
+
+                Keyword::DROP => self.parse_drop(),
+
+                Keyword::COPY => self.parse_copy(),
+
+                Keyword::TRUNCATE => self.parse_truncate(),
+
+                Keyword::SET => self.parse_set_variables(),
+
+                Keyword::ADMIN => self.parse_admin_command(),
+
+                Keyword::NoKeyword
+                    if w.quote_style.is_none() && w.value.to_uppercase() == tql_parser::TQL =>
+                {
+                    self.parse_tql()
+                }
+
+                Keyword::DECLARE => self.parse_declare_cursor(),
+
+                Keyword::FETCH => self.parse_fetch_cursor(),
+
+                Keyword::CLOSE => self.parse_close_cursor(),
+
+                Keyword::USE => {
+                    let _ = self.parser.next_token();
+
+                    let database_name = self.parser.parse_identifier().with_context(|_| {
+                        error::UnexpectedSnafu {
+                            expected: "a database name",
+                            actual: self.peek_token_as_string(),
+                        }
+                    })?;
+                    Ok(Statement::Use(
+                        Self::canonicalize_identifier(database_name).value,
+                    ))
+                }
+
+                Keyword::KILL => {
+                    let _ = self.parser.next_token();
+                    let kill = if self.parser.parse_keyword(Keyword::QUERY) {
+                        // MySQL KILL QUERY <connection id> statements
+                        let connection_id_exp =
+                            self.parser.parse_number_value().with_context(|_| {
+                                error::UnexpectedSnafu {
+                                    expected: "MySQL numeric connection id",
+                                    actual: self.peek_token_as_string(),
+                                }
+                            })?;
+                        let Value::Number(s, _) = connection_id_exp else {
+                            return error::UnexpectedTokenSnafu {
+                                expected: "MySQL numeric connection id",
+                                actual: connection_id_exp.to_string(),
+                            }
+                            .fail();
+                        };
+
+                        let connection_id = u32::from_str(&s).map_err(|_| {
+                            error::UnexpectedTokenSnafu {
+                                expected: "MySQL numeric connection id",
+                                actual: s,
+                            }
+                            .build()
+                        })?;
+                        Kill::ConnectionId(connection_id)
+                    } else {
+                        let process_id_ident =
+                            self.parser.parse_literal_string().with_context(|_| {
+                                error::UnexpectedSnafu {
+                                    expected: "process id string literal",
+                                    actual: self.peek_token_as_string(),
+                                }
+                            })?;
+                        Kill::ProcessId(process_id_ident)
+                    };
+
+                    Ok(Statement::Kill(kill))
+                }
+
+                _ => self.unsupported(self.peek_token_as_string()),
+            },
             Token::LParen => self.parse_query(),
             unexpected => self.unsupported(unexpected.to_string()),
         }
@@ -220,7 +265,7 @@ impl ParserContext<'_> {
     }
 
     // Report unexpected token
-    pub(crate) fn expected<T>(&self, expected: &str, found: TokenWithLocation) -> Result<T> {
+    pub(crate) fn expected<T>(&self, expected: &str, found: TokenWithSpan) -> Result<T> {
         Err(ParserError::ParserError(format!(
             "Expected {expected}, found: {found}",
         )))
@@ -253,10 +298,7 @@ impl ParserContext<'_> {
         if ident.quote_style.is_some() {
             ident
         } else {
-            Ident {
-                value: ident.value.to_lowercase(),
-                quote_style: None,
-            }
+            Ident::new(ident.value.to_lowercase())
         }
     }
 
@@ -277,14 +319,6 @@ impl ParserContext<'_> {
     /// we don't want to write it again and again.
     pub(crate) fn parse_object_name(&mut self) -> std::result::Result<ObjectName, ParserError> {
         self.parser.parse_object_name(false)
-    }
-
-    /// Simply a shortcut for sqlparser's same name method `parse_identifier`,
-    /// but with constant argument "false".
-    /// Because the argument is always "false" for us (it's introduced by BigQuery),
-    /// we don't want to write it again and again.
-    pub(crate) fn parse_identifier(parser: &mut Parser) -> std::result::Result<Ident, ParserError> {
-        parser.parse_identifier(false)
     }
 }
 
@@ -439,5 +473,192 @@ mod tests {
         let sql = "DEALLOCATE stmt2";
         let stmt_name = ParserContext::parse_mysql_deallocate_stmt(sql, &MySqlDialect {}).unwrap();
         assert_eq!(stmt_name, "stmt2");
+    }
+
+    #[test]
+    pub fn test_parse_kill_query_statement() {
+        use crate::statements::kill::Kill;
+
+        // Test MySQL-style KILL QUERY with connection ID
+        let sql = "KILL QUERY 123";
+        let statements =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
+
+        assert_eq!(statements.len(), 1);
+        match &statements[0] {
+            Statement::Kill(Kill::ConnectionId(connection_id)) => {
+                assert_eq!(*connection_id, 123);
+            }
+            _ => panic!("Expected Kill::ConnectionId statement"),
+        }
+
+        // Test with larger connection ID
+        let sql = "KILL QUERY 999999";
+        let statements =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
+
+        assert_eq!(statements.len(), 1);
+        match &statements[0] {
+            Statement::Kill(Kill::ConnectionId(connection_id)) => {
+                assert_eq!(*connection_id, 999999);
+            }
+            _ => panic!("Expected Kill::ConnectionId statement"),
+        }
+    }
+
+    #[test]
+    pub fn test_parse_kill_process_statement() {
+        use crate::statements::kill::Kill;
+
+        // Test KILL with process ID string
+        let sql = "KILL 'process-123'";
+        let statements =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
+
+        assert_eq!(statements.len(), 1);
+        match &statements[0] {
+            Statement::Kill(Kill::ProcessId(process_id)) => {
+                assert_eq!(process_id, "process-123");
+            }
+            _ => panic!("Expected Kill::ProcessId statement"),
+        }
+
+        // Test with double quotes
+        let sql = "KILL \"process-456\"";
+        let statements =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
+
+        assert_eq!(statements.len(), 1);
+        match &statements[0] {
+            Statement::Kill(Kill::ProcessId(process_id)) => {
+                assert_eq!(process_id, "process-456");
+            }
+            _ => panic!("Expected Kill::ProcessId statement"),
+        }
+
+        // Test with UUID-like process ID
+        let sql = "KILL 'f47ac10b-58cc-4372-a567-0e02b2c3d479'";
+        let statements =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
+
+        assert_eq!(statements.len(), 1);
+        match &statements[0] {
+            Statement::Kill(Kill::ProcessId(process_id)) => {
+                assert_eq!(process_id, "f47ac10b-58cc-4372-a567-0e02b2c3d479");
+            }
+            _ => panic!("Expected Kill::ProcessId statement"),
+        }
+    }
+
+    #[test]
+    pub fn test_parse_kill_statement_errors() {
+        // Test KILL QUERY without connection ID
+        let sql = "KILL QUERY";
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
+        assert!(result.is_err());
+
+        // Test KILL QUERY with non-numeric connection ID
+        let sql = "KILL QUERY 'not-a-number'";
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
+        assert!(result.is_err());
+
+        // Test KILL without any argument
+        let sql = "KILL";
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
+        assert!(result.is_err());
+
+        // Test KILL QUERY with connection ID that's too large for u32
+        let sql = "KILL QUERY 4294967296"; // u32::MAX + 1
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    pub fn test_parse_kill_statement_edge_cases() {
+        use crate::statements::kill::Kill;
+
+        // Test KILL QUERY with zero connection ID
+        let sql = "KILL QUERY 0";
+        let statements =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
+
+        assert_eq!(statements.len(), 1);
+        match &statements[0] {
+            Statement::Kill(Kill::ConnectionId(connection_id)) => {
+                assert_eq!(*connection_id, 0);
+            }
+            _ => panic!("Expected Kill::ConnectionId statement"),
+        }
+
+        // Test KILL QUERY with maximum u32 value
+        let sql = "KILL QUERY 4294967295"; // u32::MAX
+        let statements =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
+
+        assert_eq!(statements.len(), 1);
+        match &statements[0] {
+            Statement::Kill(Kill::ConnectionId(connection_id)) => {
+                assert_eq!(*connection_id, 4294967295);
+            }
+            _ => panic!("Expected Kill::ConnectionId statement"),
+        }
+
+        // Test KILL with empty string process ID
+        let sql = "KILL ''";
+        let statements =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
+
+        assert_eq!(statements.len(), 1);
+        match &statements[0] {
+            Statement::Kill(Kill::ProcessId(process_id)) => {
+                assert_eq!(process_id, "");
+            }
+            _ => panic!("Expected Kill::ProcessId statement"),
+        }
+    }
+
+    #[test]
+    pub fn test_parse_kill_statement_case_insensitive() {
+        use crate::statements::kill::Kill;
+
+        // Test lowercase
+        let sql = "kill query 123";
+        let statements =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
+
+        assert_eq!(statements.len(), 1);
+        match &statements[0] {
+            Statement::Kill(Kill::ConnectionId(connection_id)) => {
+                assert_eq!(*connection_id, 123);
+            }
+            _ => panic!("Expected Kill::ConnectionId statement"),
+        }
+
+        // Test mixed case
+        let sql = "Kill Query 456";
+        let statements =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
+
+        assert_eq!(statements.len(), 1);
+        match &statements[0] {
+            Statement::Kill(Kill::ConnectionId(connection_id)) => {
+                assert_eq!(*connection_id, 456);
+            }
+            _ => panic!("Expected Kill::ConnectionId statement"),
+        }
     }
 }

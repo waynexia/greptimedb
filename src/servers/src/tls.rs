@@ -22,7 +22,7 @@ use std::sync::{Arc, RwLock};
 use common_telemetry::{error, info};
 use notify::{EventKind, RecursiveMode, Watcher};
 use rustls::ServerConfig;
-use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
+use rustls_pemfile::{certs, read_one, Item};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
@@ -62,6 +62,8 @@ pub struct TlsOption {
     #[serde(default)]
     pub key_path: String,
     #[serde(default)]
+    pub ca_cert_path: String,
+    #[serde(default)]
     pub watch: bool,
 }
 
@@ -89,34 +91,28 @@ impl TlsOption {
             return Ok(None);
         }
         let cert = certs(&mut BufReader::new(
-            File::open(&self.cert_path).context(InternalIoSnafu)?,
+            File::open(&self.cert_path)
+                .inspect_err(|e| error!(e; "Failed to open {}", self.cert_path))
+                .context(InternalIoSnafu)?,
         ))
         .collect::<std::result::Result<Vec<CertificateDer>, IoError>>()
         .context(InternalIoSnafu)?;
 
-        let key = {
-            let mut pkcs8 = pkcs8_private_keys(&mut BufReader::new(
-                File::open(&self.key_path).context(InternalIoSnafu)?,
-            ))
-            .map(|key| key.map(PrivateKeyDer::from))
-            .collect::<std::result::Result<Vec<PrivateKeyDer>, IoError>>()
-            .context(InternalIoSnafu)?;
-
-            if !pkcs8.is_empty() {
-                pkcs8.remove(0)
-            } else {
-                let mut rsa = rsa_private_keys(&mut BufReader::new(
-                    File::open(&self.key_path).context(InternalIoSnafu)?,
-                ))
-                .map(|key| key.map(PrivateKeyDer::from))
-                .collect::<std::result::Result<Vec<PrivateKeyDer>, IoError>>()
-                .context(InternalIoSnafu)?;
-                if !rsa.is_empty() {
-                    rsa.remove(0)
-                } else {
-                    return Err(IoError::new(ErrorKind::InvalidInput, "invalid key"))
-                        .context(InternalIoSnafu);
-                }
+        let mut key_reader = BufReader::new(
+            File::open(&self.key_path)
+                .inspect_err(|e| error!(e; "Failed to open {}", self.key_path))
+                .context(InternalIoSnafu)?,
+        );
+        let key = match read_one(&mut key_reader)
+            .inspect_err(|e| error!(e; "Failed to read {}", self.key_path))
+            .context(InternalIoSnafu)?
+        {
+            Some(Item::Pkcs1Key(key)) => PrivateKeyDer::from(key),
+            Some(Item::Pkcs8Key(key)) => PrivateKeyDer::from(key),
+            Some(Item::Sec1Key(key)) => PrivateKeyDer::from(key),
+            _ => {
+                return Err(IoError::new(ErrorKind::InvalidInput, "invalid key"))
+                    .context(InternalIoSnafu);
             }
         };
 
@@ -225,6 +221,8 @@ pub fn maybe_watch_tls_config(tls_server_config: Arc<ReloadableTlsServerConfig>)
                         info!("Detected TLS cert/key file change: {:?}", event);
                         if let Err(err) = tls_server_config_for_watcher.reload() {
                             error!(err; "Failed to reload TLS server config");
+                        } else {
+                            info!("Reloaded TLS cert/key file successfully.");
                         }
                     }
                     _ => {}
@@ -257,6 +255,7 @@ mod tests {
                 mode: Disable,
                 cert_path: "/path/to/cert_path".to_string(),
                 key_path: "/path/to/key_path".to_string(),
+                ca_cert_path: String::new(),
                 watch: false
             },
             TlsOption::new(
@@ -396,11 +395,14 @@ mod tests {
         let _ = install_ring_crypto_provider();
 
         let dir = tempfile::tempdir().unwrap();
-        let cert_path = dir.path().join("serevr.crt");
+        let cert_path = dir.path().join("server.crt");
         let key_path = dir.path().join("server.key");
 
         std::fs::copy("tests/ssl/server.crt", &cert_path).expect("failed to copy cert to tmpdir");
         std::fs::copy("tests/ssl/server-rsa.key", &key_path).expect("failed to copy key to tmpdir");
+
+        assert!(std::fs::exists(&cert_path).unwrap());
+        assert!(std::fs::exists(&key_path).unwrap());
 
         let server_tls = TlsOption {
             mode: TlsMode::Require,
@@ -414,6 +416,7 @@ mod tests {
                 .into_os_string()
                 .into_string()
                 .expect("failed to convert path to string"),
+            ca_cert_path: String::new(),
             watch: true,
         };
 
@@ -425,18 +428,26 @@ mod tests {
         assert_eq!(0, server_config.get_version());
         assert!(server_config.get_server_config().is_some());
 
-        std::fs::copy("tests/ssl/server-pkcs8.key", &key_path)
-            .expect("failed to copy key to tmpdir");
+        let tmp_file = key_path.with_extension("tmp");
+        std::fs::copy("tests/ssl/server-pkcs8.key", &tmp_file)
+            .expect("Failed to copy temp key file");
+        std::fs::rename(&tmp_file, &key_path).expect("Failed to rename temp key file");
 
-        // waiting for async load
-        #[cfg(not(target_os = "windows"))]
-        let timeout_millis = 300;
-        #[cfg(target_os = "windows")]
-        let timeout_millis = 2000;
+        const MAX_RETRIES: usize = 30;
+        let mut retries = 0;
+        let mut version_updated = false;
 
-        std::thread::sleep(std::time::Duration::from_millis(timeout_millis));
+        while retries < MAX_RETRIES {
+            if server_config.get_version() > 0 {
+                version_updated = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            retries += 1;
+        }
 
-        assert!(server_config.get_version() > 1);
+        assert!(version_updated, "TLS config did not reload in time");
+        assert!(server_config.get_version() > 0);
         assert!(server_config.get_server_config().is_some());
     }
 }

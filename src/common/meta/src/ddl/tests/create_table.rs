@@ -16,7 +16,9 @@ use std::assert_matches::assert_matches;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use api::v1::meta::Partition;
+use api::region::RegionResponse;
+use api::v1::meta::{Partition, Peer};
+use api::v1::region::{region_request, RegionRequest};
 use api::v1::{ColumnDataType, SemanticType};
 use common_error::ext::ErrorExt;
 use common_error::status_code::StatusCode;
@@ -24,7 +26,12 @@ use common_procedure::{Context as ProcedureContext, Procedure, ProcedureId, Stat
 use common_procedure_test::{
     execute_procedure_until, execute_procedure_until_done, MockContextProvider,
 };
+use datatypes::prelude::ConcreteDataType;
+use datatypes::schema::ColumnSchema;
+use store_api::metadata::ColumnMetadata;
+use store_api::metric_engine_consts::TABLE_COLUMN_METADATA_EXTENSION_KEY;
 use store_api::storage::RegionId;
+use tokio::sync::mpsc;
 
 use crate::ddl::create_table::{CreateTableProcedure, CreateTableState};
 use crate::ddl::test_util::columns::TestColumnDefBuilder;
@@ -32,13 +39,72 @@ use crate::ddl::test_util::create_table::{
     build_raw_table_info_from_expr, TestCreateTableExprBuilder,
 };
 use crate::ddl::test_util::datanode_handler::{
-    NaiveDatanodeHandler, RetryErrorDatanodeHandler, UnexpectedErrorDatanodeHandler,
+    DatanodeWatcher, NaiveDatanodeHandler, RetryErrorDatanodeHandler,
+    UnexpectedErrorDatanodeHandler,
 };
-use crate::error::Error;
+use crate::ddl::test_util::{assert_column_name, get_raw_table_info};
+use crate::error::{Error, Result};
 use crate::key::table_route::TableRouteValue;
 use crate::kv_backend::memory::MemoryKvBackend;
 use crate::rpc::ddl::CreateTableTask;
 use crate::test_util::{new_ddl_context, new_ddl_context_with_kv_backend, MockDatanodeManager};
+
+fn create_request_handler(_peer: Peer, request: RegionRequest) -> Result<RegionResponse> {
+    let _ = _peer;
+    if let region_request::Body::Create(_) = request.body.unwrap() {
+        let mut response = RegionResponse::new(0);
+
+        response.extensions.insert(
+            TABLE_COLUMN_METADATA_EXTENSION_KEY.to_string(),
+            ColumnMetadata::encode_list(&[
+                ColumnMetadata {
+                    column_schema: ColumnSchema::new(
+                        "ts",
+                        ConcreteDataType::timestamp_millisecond_datatype(),
+                        false,
+                    ),
+                    semantic_type: SemanticType::Timestamp,
+                    column_id: 0,
+                },
+                ColumnMetadata {
+                    column_schema: ColumnSchema::new(
+                        "host",
+                        ConcreteDataType::float64_datatype(),
+                        false,
+                    ),
+                    semantic_type: SemanticType::Tag,
+                    column_id: 1,
+                },
+                ColumnMetadata {
+                    column_schema: ColumnSchema::new(
+                        "cpu",
+                        ConcreteDataType::float64_datatype(),
+                        false,
+                    ),
+                    semantic_type: SemanticType::Tag,
+                    column_id: 2,
+                },
+            ])
+            .unwrap(),
+        );
+        return Ok(response);
+    }
+
+    Ok(RegionResponse::new(0))
+}
+
+fn assert_create_request(
+    peer: Peer,
+    request: RegionRequest,
+    expected_peer_id: u64,
+    expected_region_id: RegionId,
+) {
+    assert_eq!(peer.id, expected_peer_id);
+    let Some(region_request::Body::Create(req)) = request.body else {
+        unreachable!();
+    };
+    assert_eq!(req.region_id, expected_region_id);
+}
 
 pub(crate) fn test_create_table_task(name: &str) -> CreateTableTask {
     let create_table = TestCreateTableExprBuilder::default()
@@ -75,10 +141,7 @@ pub(crate) fn test_create_table_task(name: &str) -> CreateTableTask {
     CreateTableTask {
         create_table,
         // Single region
-        partitions: vec![Partition {
-            column_list: vec![],
-            value_list: vec![],
-        }],
+        partitions: vec![Partition::default()],
         table_info,
     }
 }
@@ -87,7 +150,6 @@ pub(crate) fn test_create_table_task(name: &str) -> CreateTableTask {
 async fn test_on_prepare_table_exists_err() {
     let node_manager = Arc::new(MockDatanodeManager::new(()));
     let ddl_context = new_ddl_context(node_manager);
-    let cluster_id = 1;
     let task = test_create_table_task("foo");
     assert!(!task.create_table.create_if_not_exists);
     // Puts a value to table name key.
@@ -100,7 +162,7 @@ async fn test_on_prepare_table_exists_err() {
         )
         .await
         .unwrap();
-    let mut procedure = CreateTableProcedure::new(cluster_id, task, ddl_context);
+    let mut procedure = CreateTableProcedure::new(task, ddl_context);
     let err = procedure.on_prepare().await.unwrap_err();
     assert_matches!(err, Error::TableAlreadyExists { .. });
     assert_eq!(err.status_code(), StatusCode::TableAlreadyExists);
@@ -110,7 +172,6 @@ async fn test_on_prepare_table_exists_err() {
 async fn test_on_prepare_with_create_if_table_exists() {
     let node_manager = Arc::new(MockDatanodeManager::new(()));
     let ddl_context = new_ddl_context(node_manager);
-    let cluster_id = 1;
     let mut task = test_create_table_task("foo");
     task.create_table.create_if_not_exists = true;
     task.table_info.ident.table_id = 1024;
@@ -124,7 +185,7 @@ async fn test_on_prepare_with_create_if_table_exists() {
         )
         .await
         .unwrap();
-    let mut procedure = CreateTableProcedure::new(cluster_id, task, ddl_context);
+    let mut procedure = CreateTableProcedure::new(task, ddl_context);
     let status = procedure.on_prepare().await.unwrap();
     assert_matches!(status, Status::Done { output: Some(..) });
     let table_id = *status.downcast_output_ref::<u32>().unwrap();
@@ -135,29 +196,18 @@ async fn test_on_prepare_with_create_if_table_exists() {
 async fn test_on_prepare_without_create_if_table_exists() {
     let node_manager = Arc::new(MockDatanodeManager::new(()));
     let ddl_context = new_ddl_context(node_manager);
-    let cluster_id = 1;
     let mut task = test_create_table_task("foo");
     task.create_table.create_if_not_exists = true;
-    let mut procedure = CreateTableProcedure::new(cluster_id, task, ddl_context);
+    let mut procedure = CreateTableProcedure::new(task, ddl_context);
     let status = procedure.on_prepare().await.unwrap();
-    assert_matches!(status, Status::Executing { persist: true });
+    assert_matches!(
+        status,
+        Status::Executing {
+            persist: true,
+            clean_poisons: false
+        }
+    );
     assert_eq!(procedure.table_id(), 1024);
-}
-
-#[tokio::test]
-async fn test_on_prepare_with_no_partition_err() {
-    let node_manager = Arc::new(MockDatanodeManager::new(()));
-    let ddl_context = new_ddl_context(node_manager);
-    let cluster_id = 1;
-    let mut task = test_create_table_task("foo");
-    task.partitions = vec![];
-    task.create_table.create_if_not_exists = true;
-    let mut procedure = CreateTableProcedure::new(cluster_id, task, ddl_context);
-    let err = procedure.on_prepare().await.unwrap_err();
-    assert_matches!(err, Error::Unexpected { .. });
-    assert!(err
-        .to_string()
-        .contains("The number of partitions must be greater than 0"),);
 }
 
 #[tokio::test]
@@ -165,10 +215,9 @@ async fn test_on_datanode_create_regions_should_retry() {
     common_telemetry::init_default_ut_logging();
     let node_manager = Arc::new(MockDatanodeManager::new(RetryErrorDatanodeHandler));
     let ddl_context = new_ddl_context(node_manager);
-    let cluster_id = 1;
     let task = test_create_table_task("foo");
     assert!(!task.create_table.create_if_not_exists);
-    let mut procedure = CreateTableProcedure::new(cluster_id, task, ddl_context);
+    let mut procedure = CreateTableProcedure::new(task, ddl_context);
     procedure.on_prepare().await.unwrap();
     let ctx = ProcedureContext {
         procedure_id: ProcedureId::random(),
@@ -183,10 +232,9 @@ async fn test_on_datanode_create_regions_should_not_retry() {
     common_telemetry::init_default_ut_logging();
     let node_manager = Arc::new(MockDatanodeManager::new(UnexpectedErrorDatanodeHandler));
     let ddl_context = new_ddl_context(node_manager);
-    let cluster_id = 1;
     let task = test_create_table_task("foo");
     assert!(!task.create_table.create_if_not_exists);
-    let mut procedure = CreateTableProcedure::new(cluster_id, task, ddl_context);
+    let mut procedure = CreateTableProcedure::new(task, ddl_context);
     procedure.on_prepare().await.unwrap();
     let ctx = ProcedureContext {
         procedure_id: ProcedureId::random(),
@@ -201,10 +249,9 @@ async fn test_on_create_metadata_error() {
     common_telemetry::init_default_ut_logging();
     let node_manager = Arc::new(MockDatanodeManager::new(NaiveDatanodeHandler));
     let ddl_context = new_ddl_context(node_manager);
-    let cluster_id = 1;
     let task = test_create_table_task("foo");
     assert!(!task.create_table.create_if_not_exists);
-    let mut procedure = CreateTableProcedure::new(cluster_id, task.clone(), ddl_context.clone());
+    let mut procedure = CreateTableProcedure::new(task.clone(), ddl_context.clone());
     procedure.on_prepare().await.unwrap();
     let ctx = ProcedureContext {
         procedure_id: ProcedureId::random(),
@@ -231,12 +278,13 @@ async fn test_on_create_metadata_error() {
 #[tokio::test]
 async fn test_on_create_metadata() {
     common_telemetry::init_default_ut_logging();
-    let node_manager = Arc::new(MockDatanodeManager::new(NaiveDatanodeHandler));
+    let (tx, mut rx) = mpsc::channel(8);
+    let datanode_handler = DatanodeWatcher::new(tx).with_handler(create_request_handler);
+    let node_manager = Arc::new(MockDatanodeManager::new(datanode_handler));
     let ddl_context = new_ddl_context(node_manager);
-    let cluster_id = 1;
     let task = test_create_table_task("foo");
     assert!(!task.create_table.create_if_not_exists);
-    let mut procedure = CreateTableProcedure::new(cluster_id, task, ddl_context);
+    let mut procedure = CreateTableProcedure::new(task, ddl_context.clone());
     procedure.on_prepare().await.unwrap();
     let ctx = ProcedureContext {
         procedure_id: ProcedureId::random(),
@@ -245,20 +293,26 @@ async fn test_on_create_metadata() {
     procedure.execute(&ctx).await.unwrap();
     // Triggers procedure to create table metadata
     let status = procedure.execute(&ctx).await.unwrap();
-    let table_id = status.downcast_output_ref::<u32>().unwrap();
-    assert_eq!(*table_id, 1024);
+    let table_id = *status.downcast_output_ref::<u32>().unwrap();
+    assert_eq!(table_id, 1024);
+
+    let (peer, request) = rx.try_recv().unwrap();
+    rx.try_recv().unwrap_err();
+    assert_create_request(peer, request, 0, RegionId::new(table_id, 0));
+
+    let table_info = get_raw_table_info(&ddl_context, table_id).await;
+    assert_column_name(&table_info, &["ts", "host", "cpu"]);
+    assert_eq!(table_info.meta.column_ids, vec![0, 1, 2]);
 }
 
 #[tokio::test]
 async fn test_memory_region_keeper_guard_dropped_on_procedure_done() {
-    let cluster_id = 1;
-
     let node_manager = Arc::new(MockDatanodeManager::new(NaiveDatanodeHandler));
     let kv_backend = Arc::new(MemoryKvBackend::new());
     let ddl_context = new_ddl_context_with_kv_backend(node_manager, kv_backend);
 
     let task = test_create_table_task("foo");
-    let mut procedure = CreateTableProcedure::new(cluster_id, task, ddl_context.clone());
+    let mut procedure = CreateTableProcedure::new(task, ddl_context.clone());
 
     execute_procedure_until(&mut procedure, |p| {
         p.creator.data.state == CreateTableState::CreateMetadata

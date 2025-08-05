@@ -115,6 +115,7 @@ impl Picker for WindowedCompactionPicker {
             outputs,
             expired_ssts,
             time_window_size: time_window,
+            max_file_size: None, // todo (hl): we may need to support `max_file_size` parameter in manual compaction.
         })
     }
 }
@@ -211,9 +212,9 @@ mod tests {
     use crate::compaction::window::{file_time_bucket_span, WindowedCompactionPicker};
     use crate::region::options::RegionOptions;
     use crate::sst::file::{FileId, FileMeta, Level};
+    use crate::sst::file_purger::NoopFilePurger;
     use crate::sst::version::SstVersion;
     use crate::test_util::memtable_util::metadata_for_test;
-    use crate::test_util::NoopFilePurger;
 
     fn build_version(
         files: &[(FileId, i64, i64, Level)],
@@ -312,7 +313,7 @@ mod tests {
         assert_eq!(3, outputs.len());
 
         assert_eq!(1, outputs[0].inputs.len());
-        assert_eq!(files[0].0, outputs[0].inputs[0].file_id());
+        assert_eq!(files[0].0, outputs[0].inputs[0].file_id().file_id());
         assert_eq!(
             TimestampRange::new(
                 Timestamp::new_millisecond(0),
@@ -331,7 +332,7 @@ mod tests {
         );
 
         assert_eq!(1, outputs[2].inputs.len());
-        assert_eq!(files[1].0, outputs[2].inputs[0].file_id());
+        assert_eq!(files[1].0, outputs[2].inputs[0].file_id().file_id());
         assert_eq!(
             TimestampRange::new(
                 Timestamp::new_millisecond(2 * HOUR),

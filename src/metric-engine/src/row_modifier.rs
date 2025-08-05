@@ -18,7 +18,7 @@ use std::hash::Hash;
 use api::v1::value::ValueData;
 use api::v1::{ColumnDataType, ColumnSchema, Row, Rows, SemanticType, Value};
 use datatypes::value::ValueRef;
-use mito2::row_converter::SparsePrimaryKeyCodec;
+use mito_codec::row_converter::SparsePrimaryKeyCodec;
 use smallvec::SmallVec;
 use snafu::ResultExt;
 use store_api::codec::PrimaryKeyEncoding;
@@ -44,15 +44,17 @@ pub struct RowModifier {
     codec: SparsePrimaryKeyCodec,
 }
 
-impl RowModifier {
-    pub fn new() -> Self {
+impl Default for RowModifier {
+    fn default() -> Self {
         Self {
             codec: SparsePrimaryKeyCodec::schemaless(),
         }
     }
+}
 
+impl RowModifier {
     /// Modify rows with the given primary key encoding.
-    pub fn modify_rows(
+    pub(crate) fn modify_rows(
         &self,
         iter: RowsIter,
         table_id: TableId,
@@ -74,7 +76,7 @@ impl RowModifier {
 
         let mut buffer = vec![];
         for mut iter in iter.iter_mut() {
-            let (table_id, tsid) = self.fill_internal_columns(table_id, &iter);
+            let (table_id, tsid) = Self::fill_internal_columns(table_id, &iter);
             let mut values = Vec::with_capacity(num_output_column);
             buffer.clear();
             let internal_columns = [
@@ -135,7 +137,7 @@ impl RowModifier {
             options: None,
         });
         for iter in iter.iter_mut() {
-            let (table_id, tsid) = self.fill_internal_columns(table_id, &iter);
+            let (table_id, tsid) = Self::fill_internal_columns(table_id, &iter);
             iter.row.values.push(table_id);
             iter.row.values.push(tsid);
         }
@@ -144,22 +146,48 @@ impl RowModifier {
     }
 
     /// Fills internal columns of a row with table name and a hash of tag values.
-    fn fill_internal_columns(&self, table_id: TableId, iter: &RowIter<'_>) -> (Value, Value) {
-        let mut hasher = mur3::Hasher128::with_seed(TSID_HASH_SEED);
+    pub fn fill_internal_columns(table_id: TableId, iter: &RowIter<'_>) -> (Value, Value) {
+        let mut hasher = TsidGenerator::default();
         for (name, value) in iter.primary_keys_with_name() {
             // The type is checked before. So only null is ignored.
             if let Some(ValueData::StringValue(string)) = &value.value_data {
-                name.hash(&mut hasher);
-                string.hash(&mut hasher);
+                hasher.write_label(name, string);
             }
         }
-        // TSID is 64 bits, simply truncate the 128 bits hash
-        let (hash, _) = hasher.finish128();
+        let hash = hasher.finish();
 
         (
             ValueData::U32Value(table_id).into(),
             ValueData::U64Value(hash).into(),
         )
+    }
+}
+
+/// Tsid generator.
+pub struct TsidGenerator {
+    hasher: mur3::Hasher128,
+}
+
+impl Default for TsidGenerator {
+    fn default() -> Self {
+        Self {
+            hasher: mur3::Hasher128::with_seed(TSID_HASH_SEED),
+        }
+    }
+}
+
+impl TsidGenerator {
+    /// Writes a label pair to the generator.
+    pub fn write_label(&mut self, name: &str, value: &str) {
+        name.hash(&mut self.hasher);
+        value.hash(&mut self.hasher);
+    }
+
+    /// Generates a new TSID.
+    pub fn finish(&mut self) -> u64 {
+        // TSID is 64 bits, simply truncate the 128 bits hash
+        let (hash, _) = self.hasher.finish128();
+        hash
     }
 }
 
@@ -238,7 +266,7 @@ impl IterIndex {
 }
 
 /// Iterator of rows.
-pub(crate) struct RowsIter {
+pub struct RowsIter {
     rows: Rows,
     index: IterIndex,
 }
@@ -250,7 +278,7 @@ impl RowsIter {
     }
 
     /// Returns the iterator of rows.
-    fn iter_mut(&mut self) -> impl Iterator<Item = RowIter> {
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = RowIter> {
         self.rows.rows.iter_mut().map(|row| RowIter {
             row,
             index: &self.index,
@@ -267,7 +295,7 @@ impl RowsIter {
 }
 
 /// Iterator of a row.
-struct RowIter<'a> {
+pub struct RowIter<'a> {
     row: &'a mut Row,
     index: &'a IterIndex,
     schema: &'a Vec<ColumnSchema>,
@@ -287,7 +315,7 @@ impl RowIter<'_> {
     }
 
     /// Returns the primary keys.
-    fn primary_keys(&self) -> impl Iterator<Item = (ColumnId, ValueRef)> {
+    pub fn primary_keys(&self) -> impl Iterator<Item = (ColumnId, ValueRef)> {
         self.index.indices[..self.index.num_primary_key_column]
             .iter()
             .map(|idx| {
@@ -306,6 +334,13 @@ impl RowIter<'_> {
         self.index.indices[self.index.num_primary_key_column..]
             .iter()
             .map(|idx| std::mem::take(&mut self.row.values[idx.index]))
+    }
+
+    /// Returns value at given offset.
+    /// # Panics
+    /// Panics if offset out-of-bound
+    pub fn value_at(&self, idx: usize) -> &Value {
+        &self.row.values[idx]
     }
 }
 
@@ -352,7 +387,7 @@ mod tests {
     #[test]
     fn test_encode_sparse() {
         let name_to_column_id = test_name_to_column_id();
-        let encoder = RowModifier::new();
+        let encoder = RowModifier::default();
         let table_id = 1025;
         let schema = test_schema();
         let row = test_row("greptimedb", "127.0.0.1");
@@ -421,7 +456,7 @@ mod tests {
     #[test]
     fn test_encode_dense() {
         let name_to_column_id = test_name_to_column_id();
-        let encoder = RowModifier::new();
+        let encoder = RowModifier::default();
         let table_id = 1025;
         let schema = test_schema();
         let row = test_row("greptimedb", "127.0.0.1");
@@ -450,7 +485,6 @@ mod tests {
     #[test]
     fn test_fill_internal_columns() {
         let name_to_column_id = test_name_to_column_id();
-        let encoder = RowModifier::new();
         let table_id = 1025;
         let schema = test_schema();
         let row = test_row("greptimedb", "127.0.0.1");
@@ -460,7 +494,7 @@ mod tests {
         };
         let mut rows_iter = RowsIter::new(rows, &name_to_column_id);
         let row_iter = rows_iter.iter_mut().next().unwrap();
-        let (encoded_table_id, tsid) = encoder.fill_internal_columns(table_id, &row_iter);
+        let (encoded_table_id, tsid) = RowModifier::fill_internal_columns(table_id, &row_iter);
         assert_eq!(encoded_table_id, ValueData::U32Value(1025).into());
         assert_eq!(tsid, ValueData::U64Value(9442261431637846000).into());
 
@@ -488,7 +522,7 @@ mod tests {
         };
         let mut rows_iter = RowsIter::new(rows, &name_to_column_id);
         let row_iter = rows_iter.iter_mut().next().unwrap();
-        let (encoded_table_id, tsid) = encoder.fill_internal_columns(table_id, &row_iter);
+        let (encoded_table_id, tsid) = RowModifier::fill_internal_columns(table_id, &row_iter);
         assert_eq!(encoded_table_id, ValueData::U32Value(1025).into());
         assert_eq!(tsid, ValueData::U64Value(9442261431637846000).into());
     }

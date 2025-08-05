@@ -15,12 +15,13 @@
 use std::sync::Arc;
 
 use common_catalog::consts::{METRIC_ENGINE, MITO_ENGINE};
-use datatypes::schema::{Schema, SchemaRef};
+use datatypes::data_type::ConcreteDataType;
+use datatypes::schema::{ColumnSchema, Schema, SchemaRef};
 use datatypes::vectors::{Int64Vector, StringVector, VectorRef};
 
-use super::table_names::*;
+use crate::system_schema::information_schema::table_names::*;
 use crate::system_schema::utils::tables::{
-    bigint_column, datetime_column, string_column, string_columns,
+    bigint_column, string_column, string_columns, timestamp_micro_column,
 };
 
 const NO_VALUE: &str = "NO";
@@ -163,17 +164,17 @@ pub(super) fn get_schema_columns(table_name: &str) -> (SchemaRef, Vec<VectorRef>
                 string_column("EVENT_BODY"),
                 string_column("EVENT_DEFINITION"),
                 string_column("EVENT_TYPE"),
-                datetime_column("EXECUTE_AT"),
+                timestamp_micro_column("EXECUTE_AT"),
                 bigint_column("INTERVAL_VALUE"),
                 string_column("INTERVAL_FIELD"),
                 string_column("SQL_MODE"),
-                datetime_column("STARTS"),
-                datetime_column("ENDS"),
+                timestamp_micro_column("STARTS"),
+                timestamp_micro_column("ENDS"),
                 string_column("STATUS"),
                 string_column("ON_COMPLETION"),
-                datetime_column("CREATED"),
-                datetime_column("LAST_ALTERED"),
-                datetime_column("LAST_EXECUTED"),
+                timestamp_micro_column("CREATED"),
+                timestamp_micro_column("LAST_ALTERED"),
+                timestamp_micro_column("LAST_EXECUTED"),
                 string_column("EVENT_COMMENT"),
                 bigint_column("ORIGINATOR"),
                 string_column("CHARACTER_SET_CLIENT"),
@@ -204,10 +205,10 @@ pub(super) fn get_schema_columns(table_name: &str) -> (SchemaRef, Vec<VectorRef>
                 bigint_column("INITIAL_SIZE"),
                 bigint_column("MAXIMUM_SIZE"),
                 bigint_column("AUTOEXTEND_SIZE"),
-                datetime_column("CREATION_TIME"),
-                datetime_column("LAST_UPDATE_TIME"),
-                datetime_column("LAST_ACCESS_TIME"),
-                datetime_column("RECOVER_TIME"),
+                timestamp_micro_column("CREATION_TIME"),
+                timestamp_micro_column("LAST_UPDATE_TIME"),
+                timestamp_micro_column("LAST_ACCESS_TIME"),
+                timestamp_micro_column("RECOVER_TIME"),
                 bigint_column("TRANSACTION_COUNTER"),
                 string_column("VERSION"),
                 string_column("ROW_FORMAT"),
@@ -217,9 +218,9 @@ pub(super) fn get_schema_columns(table_name: &str) -> (SchemaRef, Vec<VectorRef>
                 bigint_column("MAX_DATA_LENGTH"),
                 bigint_column("INDEX_LENGTH"),
                 bigint_column("DATA_FREE"),
-                datetime_column("CREATE_TIME"),
-                datetime_column("UPDATE_TIME"),
-                datetime_column("CHECK_TIME"),
+                timestamp_micro_column("CREATE_TIME"),
+                timestamp_micro_column("UPDATE_TIME"),
+                timestamp_micro_column("CHECK_TIME"),
                 string_column("CHECKSUM"),
                 string_column("STATUS"),
                 string_column("EXTRA"),
@@ -330,8 +331,8 @@ pub(super) fn get_schema_columns(table_name: &str) -> (SchemaRef, Vec<VectorRef>
                 string_column("SQL_DATA_ACCESS"),
                 string_column("SQL_PATH"),
                 string_column("SECURITY_TYPE"),
-                datetime_column("CREATED"),
-                datetime_column("LAST_ALTERED"),
+                timestamp_micro_column("CREATED"),
+                timestamp_micro_column("LAST_ALTERED"),
                 string_column("SQL_MODE"),
                 string_column("ROUTINE_COMMENT"),
                 string_column("DEFINER"),
@@ -367,28 +368,18 @@ pub(super) fn get_schema_columns(table_name: &str) -> (SchemaRef, Vec<VectorRef>
 
         TRIGGERS => (
             vec![
-                string_column("TRIGGER_CATALOG"),
-                string_column("TRIGGER_SCHEMA"),
                 string_column("TRIGGER_NAME"),
-                string_column("EVENT_MANIPULATION"),
-                string_column("EVENT_OBJECT_CATALOG"),
-                string_column("EVENT_OBJECT_SCHEMA"),
-                string_column("EVENT_OBJECT_TABLE"),
-                bigint_column("ACTION_ORDER"),
-                string_column("ACTION_CONDITION"),
-                string_column("ACTION_STATEMENT"),
-                string_column("ACTION_ORIENTATION"),
-                string_column("ACTION_TIMING"),
-                string_column("ACTION_REFERENCE_OLD_TABLE"),
-                string_column("ACTION_REFERENCE_NEW_TABLE"),
-                string_column("ACTION_REFERENCE_OLD_ROW"),
-                string_column("ACTION_REFERENCE_NEW_ROW"),
-                datetime_column("CREATED"),
-                string_column("SQL_MODE"),
-                string_column("DEFINER"),
-                string_column("CHARACTER_SET_CLIENT"),
-                string_column("COLLATION_CONNECTION"),
-                string_column("DATABASE_COLLATION"),
+                ColumnSchema::new(
+                    "trigger_id",
+                    ConcreteDataType::uint64_datatype(),
+                    false,
+                ),
+                string_column("TRIGGER_DEFINITION"),
+                ColumnSchema::new(
+                    "flownode_id",
+                    ConcreteDataType::uint64_datatype(),
+                    true,
+                ),
             ],
             vec![],
         ),

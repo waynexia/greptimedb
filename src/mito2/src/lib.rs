@@ -18,17 +18,23 @@
 
 #![feature(let_chains)]
 #![feature(assert_matches)]
+#![feature(result_flattening)]
+#![feature(int_roundings)]
+#![feature(debug_closure_helpers)]
+#![feature(duration_constructors)]
 
 #[cfg(any(test, feature = "test"))]
 #[cfg_attr(feature = "test", allow(unused))]
 pub mod test_util;
 
-mod access_layer;
-mod cache;
+pub mod access_layer;
+pub mod cache;
 pub mod compaction;
 pub mod config;
 pub mod engine;
 pub mod error;
+#[cfg(feature = "enterprise")]
+pub mod extension;
 pub mod flush;
 pub mod manifest;
 pub mod memtable;
@@ -37,7 +43,6 @@ pub mod read;
 pub mod region;
 mod region_write_ctx;
 pub mod request;
-pub mod row_converter;
 pub mod schedule;
 pub mod sst;
 mod time_provider;

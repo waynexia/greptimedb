@@ -14,6 +14,7 @@
 
 pub(crate) mod close_downgraded_region;
 pub(crate) mod downgrade_leader_region;
+pub(crate) mod flush_leader_region;
 pub(crate) mod manager;
 pub(crate) mod migration_abort;
 pub(crate) mod migration_end;
@@ -25,7 +26,7 @@ pub(crate) mod update_metadata;
 pub(crate) mod upgrade_candidate_region;
 
 use std::any::Any;
-use std::fmt::Debug;
+use std::fmt::{Debug, Display};
 use std::time::Duration;
 
 use common_error::ext::BoxedError;
@@ -36,18 +37,19 @@ use common_meta::key::datanode_table::{DatanodeTableKey, DatanodeTableValue};
 use common_meta::key::table_info::TableInfoValue;
 use common_meta::key::table_route::TableRouteValue;
 use common_meta::key::{DeserializedValueWithBytes, TableMetadataManagerRef};
-use common_meta::lock_key::{CatalogLock, RegionLock, SchemaLock, TableLock};
+use common_meta::kv_backend::ResettableKvBackendRef;
+use common_meta::lock_key::{CatalogLock, RegionLock, SchemaLock};
 use common_meta::peer::Peer;
 use common_meta::region_keeper::{MemoryRegionKeeperRef, OperatingRegionGuard};
-use common_meta::ClusterId;
 use common_procedure::error::{
     Error as ProcedureError, FromJsonSnafu, Result as ProcedureResult, ToJsonSnafu,
 };
 use common_procedure::{Context as ProcedureContext, LockKey, Procedure, Status, StringKey};
-use common_telemetry::info;
+use common_telemetry::{error, info};
 use manager::RegionMigrationProcedureGuard;
 pub use manager::{
     RegionMigrationManagerRef, RegionMigrationProcedureTask, RegionMigrationProcedureTracker,
+    RegionMigrationTriggerReason,
 };
 use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt};
@@ -56,8 +58,14 @@ use tokio::time::Instant;
 
 use self::migration_start::RegionMigrationStart;
 use crate::error::{self, Result};
-use crate::metrics::{METRIC_META_REGION_MIGRATION_ERROR, METRIC_META_REGION_MIGRATION_EXECUTE};
+use crate::metrics::{
+    METRIC_META_REGION_MIGRATION_ERROR, METRIC_META_REGION_MIGRATION_EXECUTE,
+    METRIC_META_REGION_MIGRATION_STAGE_ELAPSED,
+};
 use crate::service::mailbox::MailboxRef;
+
+/// The default timeout for region migration.
+pub const DEFAULT_REGION_MIGRATION_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// It's shared in each step and available even after recovering.
 ///
@@ -70,8 +78,6 @@ pub struct PersistentContext {
     catalog: String,
     /// The table schema.
     schema: String,
-    /// The Id of the cluster.
-    cluster_id: ClusterId,
     /// The [Peer] of migration source.
     from_peer: Peer,
     /// The [Peer] of migration destination.
@@ -81,6 +87,9 @@ pub struct PersistentContext {
     /// The timeout for downgrading leader region and upgrading candidate region operations.
     #[serde(with = "humantime_serde", default = "default_timeout")]
     timeout: Duration,
+    /// The trigger reason of region migration.
+    #[serde(default)]
+    trigger_reason: RegionMigrationTriggerReason,
 }
 
 fn default_timeout() -> Duration {
@@ -93,13 +102,106 @@ impl PersistentContext {
         let lock_key = vec![
             CatalogLock::Read(&self.catalog).into(),
             SchemaLock::read(&self.catalog, &self.schema).into(),
-            // The optimistic updating of table route is not working very well,
-            // so we need to use the write lock here.
-            TableLock::Write(region_id.table_id()).into(),
             RegionLock::Write(region_id).into(),
         ];
 
         lock_key
+    }
+}
+
+/// Metrics of region migration.
+#[derive(Debug, Clone, Default)]
+pub struct Metrics {
+    /// Elapsed time of downgrading region and upgrading region.
+    operations_elapsed: Duration,
+    /// Elapsed time of flushing leader region.
+    flush_leader_region_elapsed: Duration,
+    /// Elapsed time of downgrading leader region.
+    downgrade_leader_region_elapsed: Duration,
+    /// Elapsed time of open candidate region.
+    open_candidate_region_elapsed: Duration,
+    /// Elapsed time of upgrade candidate region.
+    upgrade_candidate_region_elapsed: Duration,
+}
+
+impl Display for Metrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let total = self.flush_leader_region_elapsed
+            + self.downgrade_leader_region_elapsed
+            + self.open_candidate_region_elapsed
+            + self.upgrade_candidate_region_elapsed;
+        write!(
+            f,
+            "total: {:?}, flush_leader_region_elapsed: {:?}, downgrade_leader_region_elapsed: {:?}, open_candidate_region_elapsed: {:?}, upgrade_candidate_region_elapsed: {:?}",
+            total,
+            self.flush_leader_region_elapsed,
+            self.downgrade_leader_region_elapsed,
+            self.open_candidate_region_elapsed,
+            self.upgrade_candidate_region_elapsed
+        )
+    }
+}
+
+impl Metrics {
+    /// Updates the elapsed time of downgrading region and upgrading region.
+    pub fn update_operations_elapsed(&mut self, elapsed: Duration) {
+        self.operations_elapsed += elapsed;
+    }
+
+    /// Updates the elapsed time of flushing leader region.
+    pub fn update_flush_leader_region_elapsed(&mut self, elapsed: Duration) {
+        self.flush_leader_region_elapsed += elapsed;
+    }
+
+    /// Updates the elapsed time of downgrading leader region.
+    pub fn update_downgrade_leader_region_elapsed(&mut self, elapsed: Duration) {
+        self.downgrade_leader_region_elapsed += elapsed;
+    }
+
+    /// Updates the elapsed time of open candidate region.
+    pub fn update_open_candidate_region_elapsed(&mut self, elapsed: Duration) {
+        self.open_candidate_region_elapsed += elapsed;
+    }
+
+    /// Updates the elapsed time of upgrade candidate region.
+    pub fn update_upgrade_candidate_region_elapsed(&mut self, elapsed: Duration) {
+        self.upgrade_candidate_region_elapsed += elapsed;
+    }
+}
+
+impl Drop for Metrics {
+    fn drop(&mut self) {
+        let total = self.flush_leader_region_elapsed
+            + self.downgrade_leader_region_elapsed
+            + self.open_candidate_region_elapsed
+            + self.upgrade_candidate_region_elapsed;
+        METRIC_META_REGION_MIGRATION_STAGE_ELAPSED
+            .with_label_values(&["total"])
+            .observe(total.as_secs_f64());
+
+        if !self.flush_leader_region_elapsed.is_zero() {
+            METRIC_META_REGION_MIGRATION_STAGE_ELAPSED
+                .with_label_values(&["flush_leader_region"])
+                .observe(self.flush_leader_region_elapsed.as_secs_f64());
+        }
+
+        if !self.downgrade_leader_region_elapsed.is_zero() {
+            METRIC_META_REGION_MIGRATION_STAGE_ELAPSED
+                .with_label_values(&["downgrade_leader_region"])
+                .observe(self.downgrade_leader_region_elapsed.as_secs_f64());
+        }
+
+        if !self.open_candidate_region_elapsed.is_zero() {
+            METRIC_META_REGION_MIGRATION_STAGE_ELAPSED
+                .with_label_values(&["open_candidate_region"])
+                .observe(self.open_candidate_region_elapsed.as_secs_f64());
+        }
+
+        if !self.upgrade_candidate_region_elapsed.is_zero() {
+            METRIC_META_REGION_MIGRATION_STAGE_ELAPSED
+                .with_label_values(&["upgrade_candidate_region"])
+                .observe(self.upgrade_candidate_region_elapsed.as_secs_f64());
+        }
     }
 }
 
@@ -130,8 +232,10 @@ pub struct VolatileContext {
     leader_region_lease_deadline: Option<Instant>,
     /// The last_entry_id of leader region.
     leader_region_last_entry_id: Option<u64>,
-    /// Elapsed time of downgrading region and upgrading region.
-    operations_elapsed: Duration,
+    /// The last_entry_id of leader metadata region (Only used for metric engine).
+    leader_region_metadata_last_entry_id: Option<u64>,
+    /// Metrics of region migration.
+    metrics: Metrics,
 }
 
 impl VolatileContext {
@@ -151,6 +255,11 @@ impl VolatileContext {
     pub fn set_last_entry_id(&mut self, last_entry_id: u64) {
         self.leader_region_last_entry_id = Some(last_entry_id)
     }
+
+    /// Sets the `leader_region_metadata_last_entry_id`.
+    pub fn set_metadata_last_entry_id(&mut self, last_entry_id: u64) {
+        self.leader_region_metadata_last_entry_id = Some(last_entry_id);
+    }
 }
 
 /// Used to generate new [Context].
@@ -162,6 +271,7 @@ pub trait ContextFactory {
 #[derive(Clone)]
 pub struct DefaultContextFactory {
     volatile_ctx: VolatileContext,
+    in_memory_key: ResettableKvBackendRef,
     table_metadata_manager: TableMetadataManagerRef,
     opening_region_keeper: MemoryRegionKeeperRef,
     region_failure_detector_controller: RegionFailureDetectorControllerRef,
@@ -173,6 +283,7 @@ pub struct DefaultContextFactory {
 impl DefaultContextFactory {
     /// Returns an [`DefaultContextFactory`].
     pub fn new(
+        in_memory_key: ResettableKvBackendRef,
         table_metadata_manager: TableMetadataManagerRef,
         opening_region_keeper: MemoryRegionKeeperRef,
         region_failure_detector_controller: RegionFailureDetectorControllerRef,
@@ -182,6 +293,7 @@ impl DefaultContextFactory {
     ) -> Self {
         Self {
             volatile_ctx: VolatileContext::default(),
+            in_memory_key,
             table_metadata_manager,
             opening_region_keeper,
             region_failure_detector_controller,
@@ -197,6 +309,7 @@ impl ContextFactory for DefaultContextFactory {
         Context {
             persistent_ctx,
             volatile_ctx: self.volatile_ctx,
+            in_memory: self.in_memory_key,
             table_metadata_manager: self.table_metadata_manager,
             opening_region_keeper: self.opening_region_keeper,
             region_failure_detector_controller: self.region_failure_detector_controller,
@@ -211,6 +324,7 @@ impl ContextFactory for DefaultContextFactory {
 pub struct Context {
     persistent_ctx: PersistentContext,
     volatile_ctx: VolatileContext,
+    in_memory: ResettableKvBackendRef,
     table_metadata_manager: TableMetadataManagerRef,
     opening_region_keeper: MemoryRegionKeeperRef,
     region_failure_detector_controller: RegionFailureDetectorControllerRef,
@@ -224,12 +338,42 @@ impl Context {
     pub fn next_operation_timeout(&self) -> Option<Duration> {
         self.persistent_ctx
             .timeout
-            .checked_sub(self.volatile_ctx.operations_elapsed)
+            .checked_sub(self.volatile_ctx.metrics.operations_elapsed)
     }
 
     /// Updates operations elapsed.
     pub fn update_operations_elapsed(&mut self, instant: Instant) {
-        self.volatile_ctx.operations_elapsed += instant.elapsed();
+        self.volatile_ctx
+            .metrics
+            .update_operations_elapsed(instant.elapsed());
+    }
+
+    /// Updates the elapsed time of flushing leader region.
+    pub fn update_flush_leader_region_elapsed(&mut self, instant: Instant) {
+        self.volatile_ctx
+            .metrics
+            .update_flush_leader_region_elapsed(instant.elapsed());
+    }
+
+    /// Updates the elapsed time of downgrading leader region.
+    pub fn update_downgrade_leader_region_elapsed(&mut self, instant: Instant) {
+        self.volatile_ctx
+            .metrics
+            .update_downgrade_leader_region_elapsed(instant.elapsed());
+    }
+
+    /// Updates the elapsed time of open candidate region.
+    pub fn update_open_candidate_region_elapsed(&mut self, instant: Instant) {
+        self.volatile_ctx
+            .metrics
+            .update_open_candidate_region_elapsed(instant.elapsed());
+    }
+
+    /// Updates the elapsed time of upgrade candidate region.
+    pub fn update_upgrade_candidate_region_elapsed(&mut self, instant: Instant) {
+        self.volatile_ctx
+            .metrics
+            .update_upgrade_candidate_region_elapsed(instant.elapsed());
     }
 
     /// Returns address of meta server.
@@ -273,26 +417,37 @@ impl Context {
     /// The original failure detector was removed once the procedure was triggered.
     /// Now, we need to register the failure detector for the failed region again.
     pub async fn register_failure_detectors(&self) {
-        let cluster_id = self.persistent_ctx.cluster_id;
         let datanode_id = self.persistent_ctx.from_peer.id;
         let region_id = self.persistent_ctx.region_id;
 
         self.region_failure_detector_controller
-            .register_failure_detectors(vec![(cluster_id, datanode_id, region_id)])
+            .register_failure_detectors(vec![(datanode_id, region_id)])
             .await;
     }
 
     /// Notifies the RegionSupervisor to deregister failure detectors.
     ///
-    /// The original failure detectors was removed once the procedure was triggered.
-    /// However, the `from_peer` may still send the heartbeats contains the failed region.
+    /// The original failure detectors won't be removed once the procedure was triggered.
+    /// We need to deregister the failure detectors for the original region if the procedure is finished.
     pub async fn deregister_failure_detectors(&self) {
-        let cluster_id = self.persistent_ctx.cluster_id;
         let datanode_id = self.persistent_ctx.from_peer.id;
         let region_id = self.persistent_ctx.region_id;
 
         self.region_failure_detector_controller
-            .deregister_failure_detectors(vec![(cluster_id, datanode_id, region_id)])
+            .deregister_failure_detectors(vec![(datanode_id, region_id)])
+            .await;
+    }
+
+    /// Notifies the RegionSupervisor to deregister failure detectors for the candidate region on the destination peer.
+    ///
+    /// The candidate region may be created on the destination peer,
+    /// so we need to deregister the failure detectors for the candidate region if the procedure is aborted.
+    pub async fn deregister_failure_detectors_for_candidate_region(&self) {
+        let to_peer_id = self.persistent_ctx.to_peer.id;
+        let region_id = self.persistent_ctx.region_id;
+
+        self.region_failure_detector_controller
+            .deregister_failure_detectors(vec![(to_peer_id, region_id)])
             .await;
     }
 
@@ -396,7 +551,11 @@ pub(crate) trait State: Sync + Send + Debug {
     }
 
     /// Yields the next [State] and [Status].
-    async fn next(&mut self, ctx: &mut Context) -> Result<(Box<dyn State>, Status)>;
+    async fn next(
+        &mut self,
+        ctx: &mut Context,
+        procedure_ctx: &ProcedureContext,
+    ) -> Result<(Box<dyn State>, Status)>;
 
     /// Returns as [Any](std::any::Any).
     fn as_any(&self) -> &dyn Any;
@@ -458,11 +617,11 @@ impl RegionMigrationProcedure {
         } = serde_json::from_str(json).context(FromJsonSnafu)?;
 
         let guard = tracker.insert_running_procedure(&RegionMigrationProcedureTask {
-            cluster_id: persistent_ctx.cluster_id,
             region_id: persistent_ctx.region_id,
             from_peer: persistent_ctx.from_peer.clone(),
             to_peer: persistent_ctx.to_peer.clone(),
             timeout: persistent_ctx.timeout,
+            trigger_reason: persistent_ctx.trigger_reason,
         });
         let context = context_factory.new_context(persistent_ctx);
 
@@ -532,29 +691,45 @@ impl Procedure for RegionMigrationProcedure {
         true
     }
 
-    async fn execute(&mut self, _ctx: &ProcedureContext) -> ProcedureResult<Status> {
+    async fn execute(&mut self, ctx: &ProcedureContext) -> ProcedureResult<Status> {
         let state = &mut self.state;
 
         let name = state.name();
         let _timer = METRIC_META_REGION_MIGRATION_EXECUTE
             .with_label_values(&[name])
             .start_timer();
-        let (next, status) = state.next(&mut self.context).await.map_err(|e| {
-            if e.is_retryable() {
-                METRIC_META_REGION_MIGRATION_ERROR
-                    .with_label_values(&[name, "retryable"])
-                    .inc();
-                ProcedureError::retry_later(e)
-            } else {
-                METRIC_META_REGION_MIGRATION_ERROR
-                    .with_label_values(&[name, "external"])
-                    .inc();
-                ProcedureError::external(e)
+        match state.next(&mut self.context, ctx).await {
+            Ok((next, status)) => {
+                *state = next;
+                Ok(status)
             }
-        })?;
-
-        *state = next;
-        Ok(status)
+            Err(e) => {
+                if e.is_retryable() {
+                    METRIC_META_REGION_MIGRATION_ERROR
+                        .with_label_values(&[name, "retryable"])
+                        .inc();
+                    Err(ProcedureError::retry_later(e))
+                } else {
+                    // Consumes the opening region guard before deregistering the failure detectors.
+                    self.context.volatile_ctx.opening_region_guard.take();
+                    self.context
+                        .deregister_failure_detectors_for_candidate_region()
+                        .await;
+                    error!(
+                        e;
+                        "Region migration procedure failed, region_id: {}, from_peer: {}, to_peer: {}, {}",
+                        self.context.region_id(),
+                        self.context.persistent_ctx.from_peer,
+                        self.context.persistent_ctx.to_peer,
+                        self.context.volatile_ctx.metrics,
+                    );
+                    METRIC_META_REGION_MIGRATION_ERROR
+                        .with_label_values(&[name, "external"])
+                        .inc();
+                    Err(ProcedureError::external(e))
+                }
+            }
+        }
     }
 
     fn dump(&self) -> ProcedureResult<String> {
@@ -580,12 +755,15 @@ mod tests {
     use common_meta::key::test_utils::new_test_table_info;
     use common_meta::rpc::router::{Region, RegionRoute};
 
-    use super::migration_end::RegionMigrationEnd;
     use super::update_metadata::UpdateMetadata;
     use super::*;
     use crate::handler::HeartbeatMailbox;
     use crate::procedure::region_migration::open_candidate_region::OpenCandidateRegion;
     use crate::procedure::region_migration::test_util::*;
+    use crate::procedure::test_util::{
+        new_downgrade_region_reply, new_flush_region_reply, new_open_region_reply,
+        new_upgrade_region_reply,
+    };
     use crate::service::mailbox::Channel;
 
     fn new_persistent_context() -> PersistentContext {
@@ -620,7 +798,7 @@ mod tests {
         let procedure = RegionMigrationProcedure::new(persistent_context, context, None);
 
         let serialized = procedure.dump().unwrap();
-        let expected = r#"{"persistent_ctx":{"catalog":"greptime","schema":"public","cluster_id":0,"from_peer":{"id":1,"addr":""},"to_peer":{"id":2,"addr":""},"region_id":4398046511105,"timeout":"10s"},"state":{"region_migration_state":"RegionMigrationStart"}}"#;
+        let expected = r#"{"persistent_ctx":{"catalog":"greptime","schema":"public","from_peer":{"id":1,"addr":""},"to_peer":{"id":2,"addr":""},"region_id":4398046511105,"timeout":"10s","trigger_reason":"Unknown"},"state":{"region_migration_state":"RegionMigrationStart"}}"#;
         assert_eq!(expected, serialized);
     }
 
@@ -628,7 +806,7 @@ mod tests {
     fn test_backward_compatibility() {
         let persistent_ctx = test_util::new_persistent_context(1, 2, RegionId::new(1024, 1));
         // NOTES: Changes it will break backward compatibility.
-        let serialized = r#"{"catalog":"greptime","schema":"public","cluster_id":0,"from_peer":{"id":1,"addr":""},"to_peer":{"id":2,"addr":""},"region_id":4398046511105}"#;
+        let serialized = r#"{"catalog":"greptime","schema":"public","from_peer":{"id":1,"addr":""},"to_peer":{"id":2,"addr":""},"region_id":4398046511105}"#;
         let deserialized: PersistentContext = serde_json::from_str(serialized).unwrap();
 
         assert_eq!(persistent_ctx, deserialized);
@@ -640,15 +818,12 @@ mod tests {
     #[async_trait::async_trait]
     #[typetag::serde]
     impl State for MockState {
-        async fn next(&mut self, ctx: &mut Context) -> Result<(Box<dyn State>, Status)> {
-            let pc = &mut ctx.persistent_ctx;
-
-            if pc.cluster_id == 2 {
-                Ok((Box::new(RegionMigrationEnd), Status::done()))
-            } else {
-                pc.cluster_id += 1;
-                Ok((Box::new(MockState), Status::executing(false)))
-            }
+        async fn next(
+            &mut self,
+            _ctx: &mut Context,
+            _procedure_ctx: &ProcedureContext,
+        ) -> Result<(Box<dyn State>, Status)> {
+            Ok((Box::new(MockState), Status::done()))
         }
 
         fn as_any(&self) -> &dyn Any {
@@ -692,7 +867,6 @@ mod tests {
         for _ in 1..3 {
             status = Some(procedure.execute(&ctx).await.unwrap());
         }
-        assert_eq!(procedure.context.persistent_ctx.cluster_id, 2);
         assert!(status.unwrap().is_done());
     }
 
@@ -1099,6 +1273,15 @@ mod tests {
                 Some(mock_datanode_reply(
                     to_peer_id,
                     Arc::new(|id| Ok(new_open_region_reply(id, true, None))),
+                )),
+                Assertion::simple(assert_flush_leader_region, assert_no_persist),
+            ),
+            // Flush Leader Region
+            Step::next(
+                "Should be the flush leader region",
+                Some(mock_datanode_reply(
+                    from_peer_id,
+                    Arc::new(|id| Ok(new_flush_region_reply(id, true, None))),
                 )),
                 Assertion::simple(assert_update_metadata_downgrade, assert_no_persist),
             ),

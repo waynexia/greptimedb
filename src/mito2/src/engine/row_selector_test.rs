@@ -25,7 +25,7 @@ use crate::test_util::{
 };
 
 async fn test_last_row(append_mode: bool) {
-    let mut env = TestEnv::new();
+    let mut env = TestEnv::new().await;
     let engine = env.create_engine(MitoConfig::default()).await;
     let region_id = RegionId::new(1, 1);
 
@@ -95,6 +95,7 @@ async fn test_last_row(append_mode: bool) {
                 ..Default::default()
             },
         )
+        .await
         .unwrap();
     assert_eq!(3, scanner.num_files());
     assert_eq!(1, scanner.num_memtables());

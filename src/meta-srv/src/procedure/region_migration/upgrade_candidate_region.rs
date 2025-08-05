@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use api::v1::meta::MailboxMessage;
 use common_meta::instruction::{Instruction, InstructionReply, UpgradeRegion, UpgradeRegionReply};
-use common_procedure::Status;
+use common_procedure::{Context as ProcedureContext, Status};
 use common_telemetry::error;
 use serde::{Deserialize, Serialize};
 use snafu::{ensure, OptionExt, ResultExt};
@@ -53,10 +53,17 @@ impl Default for UpgradeCandidateRegion {
 #[async_trait::async_trait]
 #[typetag::serde]
 impl State for UpgradeCandidateRegion {
-    async fn next(&mut self, ctx: &mut Context) -> Result<(Box<dyn State>, Status)> {
+    async fn next(
+        &mut self,
+        ctx: &mut Context,
+        _procedure_ctx: &ProcedureContext,
+    ) -> Result<(Box<dyn State>, Status)> {
+        let now = Instant::now();
         if self.upgrade_region_with_retry(ctx).await {
+            ctx.update_upgrade_candidate_region_elapsed(now);
             Ok((Box::new(UpdateMetadata::Upgrade), Status::executing(false)))
         } else {
+            ctx.update_upgrade_candidate_region_elapsed(now);
             Ok((Box::new(UpdateMetadata::Rollback), Status::executing(false)))
         }
     }
@@ -76,10 +83,12 @@ impl UpgradeCandidateRegion {
         let pc = &ctx.persistent_ctx;
         let region_id = pc.region_id;
         let last_entry_id = ctx.volatile_ctx.leader_region_last_entry_id;
+        let metadata_last_entry_id = ctx.volatile_ctx.leader_region_metadata_last_entry_id;
 
         Instruction::UpgradeRegion(UpgradeRegion {
             region_id,
             last_entry_id,
+            metadata_last_entry_id,
             replay_timeout: Some(replay_timeout),
             location_id: Some(ctx.persistent_ctx.from_peer.id),
         })
@@ -112,7 +121,7 @@ impl UpgradeCandidateRegion {
 
         let msg = MailboxMessage::json_message(
             &format!("Upgrade candidate region: {}", region_id),
-            &format!("Meta@{}", ctx.server_addr()),
+            &format!("Metasrv@{}", ctx.server_addr()),
             &format!("Datanode-{}@{}", candidate.id, candidate.addr),
             common_time::util::current_time_millis(),
             &upgrade_instruction,
@@ -124,7 +133,7 @@ impl UpgradeCandidateRegion {
         let ch = Channel::Datanode(candidate.id);
         let receiver = ctx.mailbox.send(&ch, msg, operation_timeout).await?;
 
-        match receiver.await? {
+        match receiver.await {
             Ok(msg) => {
                 let reply = HeartbeatMailbox::json_reply(&msg)?;
                 let InstructionReply::UpgradeRegion(UpgradeRegionReply {
@@ -226,10 +235,12 @@ mod tests {
 
     use super::*;
     use crate::error::Error;
-    use crate::procedure::region_migration::test_util::{
-        new_close_region_reply, new_upgrade_region_reply, send_mock_reply, TestingEnv,
-    };
+    use crate::procedure::region_migration::manager::RegionMigrationTriggerReason;
+    use crate::procedure::region_migration::test_util::{new_procedure_context, TestingEnv};
     use crate::procedure::region_migration::{ContextFactory, PersistentContext};
+    use crate::procedure::test_util::{
+        new_close_region_reply, new_upgrade_region_reply, send_mock_reply,
+    };
 
     fn new_persistent_context() -> PersistentContext {
         PersistentContext {
@@ -238,8 +249,8 @@ mod tests {
             from_peer: Peer::empty(1),
             to_peer: Peer::empty(2),
             region_id: RegionId::new(1024, 1),
-            cluster_id: 0,
             timeout: Duration::from_millis(1000),
+            trigger_reason: RegionMigrationTriggerReason::Manual,
         }
     }
 
@@ -286,7 +297,8 @@ mod tests {
         let persistent_context = new_persistent_context();
         let env = TestingEnv::new();
         let mut ctx = env.context_factory().new_context(persistent_context);
-        ctx.volatile_ctx.operations_elapsed = ctx.persistent_ctx.timeout + Duration::from_secs(1);
+        ctx.volatile_ctx.metrics.operations_elapsed =
+            ctx.persistent_ctx.timeout + Duration::from_secs(1);
 
         let err = state.upgrade_region(&ctx).await.unwrap_err();
 
@@ -480,7 +492,8 @@ mod tests {
                 .unwrap();
         });
 
-        let (next, _) = state.next(&mut ctx).await.unwrap();
+        let procedure_ctx = new_procedure_context();
+        let (next, _) = state.next(&mut ctx, &procedure_ctx).await.unwrap();
 
         let update_metadata = next.as_any().downcast_ref::<UpdateMetadata>().unwrap();
 
@@ -538,8 +551,8 @@ mod tests {
                 .await
                 .unwrap();
         });
-
-        let (next, _) = state.next(&mut ctx).await.unwrap();
+        let procedure_ctx = new_procedure_context();
+        let (next, _) = state.next(&mut ctx, &procedure_ctx).await.unwrap();
 
         let update_metadata = next.as_any().downcast_ref::<UpdateMetadata>().unwrap();
         assert_matches!(update_metadata, UpdateMetadata::Rollback);
@@ -556,7 +569,8 @@ mod tests {
         let mut ctx = env.context_factory().new_context(persistent_context);
         let mailbox_ctx = env.mailbox_context();
         let mailbox = mailbox_ctx.mailbox().clone();
-        ctx.volatile_ctx.operations_elapsed = ctx.persistent_ctx.timeout + Duration::from_secs(1);
+        ctx.volatile_ctx.metrics.operations_elapsed =
+            ctx.persistent_ctx.timeout + Duration::from_secs(1);
 
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         mailbox_ctx
@@ -566,8 +580,8 @@ mod tests {
         send_mock_reply(mailbox, rx, |id| {
             Ok(new_upgrade_region_reply(id, false, true, None))
         });
-
-        let (next, _) = state.next(&mut ctx).await.unwrap();
+        let procedure_ctx = new_procedure_context();
+        let (next, _) = state.next(&mut ctx, &procedure_ctx).await.unwrap();
         let update_metadata = next.as_any().downcast_ref::<UpdateMetadata>().unwrap();
         assert_matches!(update_metadata, UpdateMetadata::Rollback);
     }

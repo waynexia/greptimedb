@@ -16,28 +16,27 @@
 
 use std::sync::{Arc, RwLock};
 
+use mito_codec::key_values::KeyValue;
 use store_api::metadata::RegionMetadataRef;
 use store_api::storage::{ColumnId, SequenceNumber};
-use table::predicate::Predicate;
 
 use crate::error::Result;
-use crate::memtable::bulk::part::BulkPart;
-use crate::memtable::key_values::KeyValue;
+use crate::memtable::bulk::part::{BulkPart, EncodedBulkPart};
 use crate::memtable::{
-    BoxedBatchIterator, KeyValues, Memtable, MemtableId, MemtableRanges, MemtableRef, MemtableStats,
+    KeyValues, Memtable, MemtableId, MemtableRanges, MemtableRef, MemtableStats, PredicateGroup,
 };
 
 #[allow(unused)]
 mod context;
 #[allow(unused)]
-pub(crate) mod part;
+pub mod part;
 mod part_reader;
 mod row_group_reader;
 
 #[derive(Debug)]
 pub struct BulkMemtable {
     id: MemtableId,
-    parts: RwLock<Vec<BulkPart>>,
+    parts: RwLock<Vec<EncodedBulkPart>>,
 }
 
 impl Memtable for BulkMemtable {
@@ -53,27 +52,26 @@ impl Memtable for BulkMemtable {
         unimplemented!()
     }
 
-    fn write_bulk(&self, fragment: BulkPart) -> Result<()> {
-        let mut parts = self.parts.write().unwrap();
-        parts.push(fragment);
+    fn write_bulk(&self, _fragment: BulkPart) -> Result<()> {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test"))]
     fn iter(
         &self,
         _projection: Option<&[ColumnId]>,
-        _predicate: Option<Predicate>,
+        _predicate: Option<table::predicate::Predicate>,
         _sequence: Option<SequenceNumber>,
-    ) -> Result<BoxedBatchIterator> {
+    ) -> Result<crate::memtable::BoxedBatchIterator> {
         todo!()
     }
 
     fn ranges(
         &self,
         _projection: Option<&[ColumnId]>,
-        _predicate: Option<Predicate>,
+        _predicate: PredicateGroup,
         _sequence: Option<SequenceNumber>,
-    ) -> MemtableRanges {
+    ) -> Result<MemtableRanges> {
         todo!()
     }
 

@@ -19,25 +19,24 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use catalog::CatalogManagerRef;
 use common_base::Plugins;
-use common_function::function::FunctionRef;
+use common_function::function_factory::ScalarFunctionFactory;
 use common_function::handlers::{
     FlowServiceHandlerRef, ProcedureServiceHandlerRef, TableMutationHandlerRef,
 };
-use common_function::scalars::aggregate::AggregateFunctionMetaRef;
 use common_function::state::FunctionState;
-use common_query::prelude::ScalarUdf;
 use common_telemetry::warn;
 use datafusion::dataframe::DataFrame;
 use datafusion::error::Result as DfResult;
 use datafusion::execution::context::{QueryPlanner, SessionConfig, SessionContext, SessionState};
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::SessionStateBuilder;
+use datafusion::physical_optimizer::enforce_sorting::EnforceSorting;
 use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion::physical_optimizer::sanity_checker::SanityCheckPlan;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
-use datafusion_expr::LogicalPlan as DfLogicalPlan;
+use datafusion_expr::{AggregateUDF, LogicalPlan as DfLogicalPlan};
 use datafusion_optimizer::analyzer::count_wildcard_rule::CountWildcardRule;
 use datafusion_optimizer::analyzer::{Analyzer, AnalyzerRule};
 use datafusion_optimizer::optimizer::Optimizer;
@@ -45,15 +44,21 @@ use promql::extension_plan::PromExtensionPlanner;
 use table::table::adapter::DfTableProviderAdapter;
 use table::TableRef;
 
-use crate::dist_plan::{DistExtensionPlanner, DistPlannerAnalyzer, MergeSortExtensionPlanner};
+use crate::dist_plan::{
+    DistExtensionPlanner, DistPlannerAnalyzer, DistPlannerOptions, MergeSortExtensionPlanner,
+};
+use crate::optimizer::constant_term::MatchesConstantTermOptimizer;
 use crate::optimizer::count_wildcard::CountWildcardToTimeIndexRule;
 use crate::optimizer::parallelize_scan::ParallelizeScan;
+use crate::optimizer::pass_distribution::PassDistribution;
 use crate::optimizer::remove_duplicate::RemoveDuplicate;
 use crate::optimizer::scan_hint::ScanHintRule;
 use crate::optimizer::string_normalization::StringNormalizationRule;
+use crate::optimizer::transcribe_atat::TranscribeAtatRule;
 use crate::optimizer::type_conversion::TypeConversionRule;
 use crate::optimizer::windowed_sort::WindowedSortPhysicalRule;
 use crate::optimizer::ExtensionAnalyzerRule;
+use crate::options::QueryOptions as QueryOptionsNew;
 use crate::query_engine::options::QueryOptions;
 use crate::query_engine::DefaultSerializer;
 use crate::range_select::planner::RangeSelectPlanner;
@@ -66,8 +71,8 @@ pub struct QueryEngineState {
     df_context: SessionContext,
     catalog_manager: CatalogManagerRef,
     function_state: Arc<FunctionState>,
-    udf_functions: Arc<RwLock<HashMap<String, FunctionRef>>>,
-    aggregate_functions: Arc<RwLock<HashMap<String, AggregateFunctionMetaRef>>>,
+    scalar_functions: Arc<RwLock<HashMap<String, ScalarFunctionFactory>>>,
+    aggr_functions: Arc<RwLock<HashMap<String, AggregateUDF>>>,
     extension_rules: Vec<Arc<dyn ExtensionAnalyzerRule + Send + Sync>>,
     plugins: Plugins,
 }
@@ -81,6 +86,7 @@ impl fmt::Debug for QueryEngineState {
 }
 
 impl QueryEngineState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         catalog_list: CatalogManagerRef,
         region_query_handler: Option<RegionQueryHandlerRef>,
@@ -89,9 +95,29 @@ impl QueryEngineState {
         flow_service_handler: Option<FlowServiceHandlerRef>,
         with_dist_planner: bool,
         plugins: Plugins,
+        options: QueryOptionsNew,
     ) -> Self {
         let runtime_env = Arc::new(RuntimeEnv::default());
-        let session_config = SessionConfig::new().with_create_default_catalog_and_schema(false);
+        let mut session_config = SessionConfig::new().with_create_default_catalog_and_schema(false);
+        if options.parallelism > 0 {
+            session_config = session_config.with_target_partitions(options.parallelism);
+        }
+        if options.allow_query_fallback {
+            session_config
+                .options_mut()
+                .extensions
+                .insert(DistPlannerOptions {
+                    allow_query_fallback: true,
+                });
+        }
+
+        // todo(hl): This serves as a workaround for https://github.com/GreptimeTeam/greptimedb/issues/5659
+        // and we can add that check back once we upgrade datafusion.
+        session_config
+            .options_mut()
+            .execution
+            .skip_physical_aggregate_schema_check = true;
+
         // Apply extension rules
         let mut extension_rules = Vec::new();
 
@@ -100,6 +126,7 @@ impl QueryEngineState {
 
         // Apply the datafusion rules
         let mut analyzer = Analyzer::new();
+        analyzer.rules.insert(0, Arc::new(TranscribeAtatRule));
         analyzer.rules.insert(0, Arc::new(StringNormalizationRule));
 
         // Use our custom rule instead to optimize the count(*) query
@@ -121,10 +148,20 @@ impl QueryEngineState {
         physical_optimizer
             .rules
             .insert(0, Arc::new(ParallelizeScan));
+        // Pass distribution requirement to MergeScanExec to avoid unnecessary shuffling
+        physical_optimizer
+            .rules
+            .insert(1, Arc::new(PassDistribution));
+        physical_optimizer
+            .rules
+            .insert(2, Arc::new(EnforceSorting {}));
         // Add rule for windowed sort
         physical_optimizer
             .rules
             .push(Arc::new(WindowedSortPhysicalRule));
+        physical_optimizer
+            .rules
+            .push(Arc::new(MatchesConstantTermOptimizer));
         // Add rule to remove duplicate nodes generated by other rules. Run this in the last.
         physical_optimizer.rules.push(Arc::new(RemoveDuplicate));
         // Place SanityCheckPlan at the end of the list to ensure that it runs after all other rules.
@@ -158,10 +195,10 @@ impl QueryEngineState {
                 procedure_service_handler,
                 flow_service_handler,
             }),
-            aggregate_functions: Arc::new(RwLock::new(HashMap::new())),
+            aggr_functions: Arc::new(RwLock::new(HashMap::new())),
             extension_rules,
             plugins,
-            udf_functions: Arc::new(RwLock::new(HashMap::new())),
+            scalar_functions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -194,47 +231,18 @@ impl QueryEngineState {
         self.session_state().optimize(&plan)
     }
 
-    /// Register an udf function.
-    /// Will override if the function with same name is already registered.
-    pub fn register_function(&self, func: FunctionRef) {
-        let name = func.name().to_string();
-        let x = self
-            .udf_functions
-            .write()
-            .unwrap()
-            .insert(name.clone(), func);
-
-        if x.is_some() {
-            warn!("Already registered udf function '{name}'");
-        }
-    }
-
-    /// Retrieve the udf function by name
-    pub fn udf_function(&self, function_name: &str) -> Option<FunctionRef> {
-        self.udf_functions
+    /// Retrieve the scalar function by name
+    pub fn scalar_function(&self, function_name: &str) -> Option<ScalarFunctionFactory> {
+        self.scalar_functions
             .read()
             .unwrap()
             .get(function_name)
             .cloned()
     }
 
-    /// Retrieve udf function names.
-    pub fn udf_names(&self) -> Vec<String> {
-        self.udf_functions.read().unwrap().keys().cloned().collect()
-    }
-
-    /// Retrieve the aggregate function by name
-    pub fn aggregate_function(&self, function_name: &str) -> Option<AggregateFunctionMetaRef> {
-        self.aggregate_functions
-            .read()
-            .unwrap()
-            .get(function_name)
-            .cloned()
-    }
-
-    /// Retrieve aggregate function names.
-    pub fn udaf_names(&self) -> Vec<String> {
-        self.aggregate_functions
+    /// Retrieve scalar function names.
+    pub fn scalar_names(&self) -> Vec<String> {
+        self.scalar_functions
             .read()
             .unwrap()
             .keys()
@@ -242,9 +250,38 @@ impl QueryEngineState {
             .collect()
     }
 
-    /// Register a [`ScalarUdf`].
-    pub fn register_udf(&self, udf: ScalarUdf) {
-        self.df_context.register_udf(udf.into());
+    /// Retrieve the aggregate function by name
+    pub fn aggr_function(&self, function_name: &str) -> Option<AggregateUDF> {
+        self.aggr_functions
+            .read()
+            .unwrap()
+            .get(function_name)
+            .cloned()
+    }
+
+    /// Retrieve aggregate function names.
+    pub fn aggr_names(&self) -> Vec<String> {
+        self.aggr_functions
+            .read()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// Register an scalar function.
+    /// Will override if the function with same name is already registered.
+    pub fn register_scalar_function(&self, func: ScalarFunctionFactory) {
+        let name = func.name().to_string();
+        let x = self
+            .scalar_functions
+            .write()
+            .unwrap()
+            .insert(name.clone(), func);
+
+        if x.is_some() {
+            warn!("Already registered scalar function '{name}'");
+        }
     }
 
     /// Register an aggregate function.
@@ -255,10 +292,10 @@ impl QueryEngineState {
     /// Panicking consideration: currently the aggregated functions are all statically registered,
     /// user cannot define their own aggregate functions on the fly. So we can panic here. If that
     /// invariant is broken in the future, we should return an error instead of panicking.
-    pub fn register_aggregate_function(&self, func: AggregateFunctionMetaRef) {
-        let name = func.name();
+    pub fn register_aggr_function(&self, func: AggregateUDF) {
+        let name = func.name().to_string();
         let x = self
-            .aggregate_functions
+            .aggr_functions
             .write()
             .unwrap()
             .insert(name.clone(), func);

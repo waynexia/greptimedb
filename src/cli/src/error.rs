@@ -17,8 +17,10 @@ use std::any::Any;
 use common_error::ext::{BoxedError, ErrorExt};
 use common_error::status_code::StatusCode;
 use common_macro::stack_trace_debug;
-use rustyline::error::ReadlineError;
+use common_meta::peer::Peer;
+use object_store::Error as ObjectStoreError;
 use snafu::{Location, Snafu};
+use store_api::storage::TableId;
 
 #[derive(Snafu)]
 #[snafu(visibility(pub))]
@@ -30,6 +32,7 @@ pub enum Error {
         location: Location,
         msg: String,
     },
+
     #[snafu(display("Failed to create default catalog and schema"))]
     InitMetadata {
         #[snafu(implicit)]
@@ -72,6 +75,20 @@ pub enum Error {
         source: common_meta::error::Error,
     },
 
+    #[snafu(display("Failed to get table metadata"))]
+    TableMetadata {
+        #[snafu(implicit)]
+        location: Location,
+        source: common_meta::error::Error,
+    },
+
+    #[snafu(display("Unexpected error: {}", msg))]
+    Unexpected {
+        msg: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("Missing config, msg: {}", msg))]
     MissingConfig {
         msg: String,
@@ -102,55 +119,6 @@ pub enum Error {
         error: reqwest::Error,
     },
 
-    #[snafu(display("Invalid REPL command: {reason}"))]
-    InvalidReplCommand { reason: String },
-
-    #[snafu(display("Cannot create REPL"))]
-    ReplCreation {
-        #[snafu(source)]
-        error: ReadlineError,
-        #[snafu(implicit)]
-        location: Location,
-    },
-
-    #[snafu(display("Error reading command"))]
-    Readline {
-        #[snafu(source)]
-        error: ReadlineError,
-        #[snafu(implicit)]
-        location: Location,
-    },
-
-    #[snafu(display("Failed to request database, sql: {sql}"))]
-    RequestDatabase {
-        sql: String,
-        #[snafu(source)]
-        source: client::Error,
-        #[snafu(implicit)]
-        location: Location,
-    },
-
-    #[snafu(display("Failed to collect RecordBatches"))]
-    CollectRecordBatches {
-        #[snafu(implicit)]
-        location: Location,
-        source: common_recordbatch::error::Error,
-    },
-
-    #[snafu(display("Failed to pretty print Recordbatches"))]
-    PrettyPrintRecordBatches {
-        #[snafu(implicit)]
-        location: Location,
-        source: common_recordbatch::error::Error,
-    },
-
-    #[snafu(display("Failed to start Meta client"))]
-    StartMetaClient {
-        #[snafu(implicit)]
-        location: Location,
-        source: meta_client::error::Error,
-    },
-
     #[snafu(display("Failed to parse SQL: {}", sql))]
     ParseSql {
         sql: String,
@@ -164,13 +132,6 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
         source: query::error::Error,
-    },
-
-    #[snafu(display("Failed to encode logical plan in substrait"))]
-    SubstraitEncodeLogicalPlan {
-        #[snafu(implicit)]
-        location: Location,
-        source: substrait::error::Error,
     },
 
     #[snafu(display("Failed to load layered config"))]
@@ -276,6 +237,82 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+
+    #[snafu(display("Table not found: {table_id}"))]
+    TableNotFound {
+        table_id: TableId,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("OpenDAL operator failed"))]
+    OpenDal {
+        #[snafu(implicit)]
+        location: Location,
+        #[snafu(source)]
+        error: ObjectStoreError,
+    },
+
+    #[snafu(display("S3 config need be set"))]
+    S3ConfigNotSet {
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Output directory not set"))]
+    OutputDirNotSet {
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Empty store addresses"))]
+    EmptyStoreAddrs {
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Unsupported memory backend"))]
+    UnsupportedMemoryBackend {
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("File path invalid: {}", msg))]
+    InvalidFilePath {
+        msg: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Invalid arguments: {}", msg))]
+    InvalidArguments {
+        msg: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Failed to init backend"))]
+    InitBackend {
+        #[snafu(implicit)]
+        location: Location,
+        #[snafu(source)]
+        error: ObjectStoreError,
+    },
+
+    #[snafu(display("Covert column schemas to defs failed"))]
+    CovertColumnSchemasToDefs {
+        #[snafu(implicit)]
+        location: Location,
+        source: operator::error::Error,
+    },
+
+    #[snafu(display("Failed to send request to datanode: {}", peer))]
+    SendRequestToDatanode {
+        peer: Peer,
+        #[snafu(implicit)]
+        location: Location,
+        source: common_meta::error::Error,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -283,34 +320,33 @@ pub type Result<T> = std::result::Result<T, Error>;
 impl ErrorExt for Error {
     fn status_code(&self) -> StatusCode {
         match self {
-            Error::InitMetadata { source, .. } | Error::InitDdlManager { source, .. } => {
-                source.status_code()
-            }
+            Error::InitMetadata { source, .. }
+            | Error::InitDdlManager { source, .. }
+            | Error::TableMetadata { source, .. } => source.status_code(),
 
             Error::MissingConfig { .. }
             | Error::LoadLayeredConfig { .. }
             | Error::IllegalConfig { .. }
-            | Error::InvalidReplCommand { .. }
             | Error::InitTimezone { .. }
             | Error::ConnectEtcd { .. }
             | Error::CreateDir { .. }
             | Error::EmptyResult { .. }
+            | Error::InvalidFilePath { .. }
+            | Error::UnsupportedMemoryBackend { .. }
+            | Error::InvalidArguments { .. }
             | Error::ParseProxyOpts { .. } => StatusCode::InvalidArguments,
+
+            Error::CovertColumnSchemasToDefs { source, .. } => source.status_code(),
+            Error::SendRequestToDatanode { source, .. } => source.status_code(),
 
             Error::StartProcedureManager { source, .. }
             | Error::StopProcedureManager { source, .. } => source.status_code(),
             Error::StartWalOptionsAllocator { source, .. } => source.status_code(),
-            Error::ReplCreation { .. } | Error::Readline { .. } | Error::HttpQuerySql { .. } => {
-                StatusCode::Internal
-            }
-            Error::RequestDatabase { source, .. } => source.status_code(),
-            Error::CollectRecordBatches { source, .. }
-            | Error::PrettyPrintRecordBatches { source, .. } => source.status_code(),
-            Error::StartMetaClient { source, .. } => source.status_code(),
+            Error::HttpQuerySql { .. } => StatusCode::Internal,
             Error::ParseSql { source, .. } | Error::PlanStatement { source, .. } => {
                 source.status_code()
             }
-            Error::SubstraitEncodeLogicalPlan { source, .. } => source.status_code(),
+            Error::Unexpected { .. } => StatusCode::Unexpected,
 
             Error::SerdeJson { .. }
             | Error::FileIo { .. }
@@ -319,11 +355,16 @@ impl ErrorExt for Error {
             | Error::BuildClient { .. } => StatusCode::Unexpected,
 
             Error::Other { source, .. } => source.status_code(),
+            Error::OpenDal { .. } | Error::InitBackend { .. } => StatusCode::Internal,
+            Error::S3ConfigNotSet { .. }
+            | Error::OutputDirNotSet { .. }
+            | Error::EmptyStoreAddrs { .. } => StatusCode::InvalidArguments,
 
             Error::BuildRuntime { source, .. } => source.status_code(),
 
             Error::CacheRequired { .. } | Error::BuildCacheRegistry { .. } => StatusCode::Internal,
             Error::MetaClientInit { source, .. } => source.status_code(),
+            Error::TableNotFound { .. } => StatusCode::TableNotFound,
             Error::SchemaNotFound { .. } => StatusCode::DatabaseNotFound,
         }
     }

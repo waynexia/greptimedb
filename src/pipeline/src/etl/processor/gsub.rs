@@ -14,18 +14,19 @@
 
 use regex::Regex;
 use snafu::{OptionExt, ResultExt};
+use vrl::prelude::Bytes;
+use vrl::value::{KeyString, Value as VrlValue};
 
-use crate::etl::error::{
+use crate::error::{
     Error, GsubPatternRequiredSnafu, GsubReplacementRequiredSnafu, KeyMustBeStringSnafu,
     ProcessorExpectStringSnafu, ProcessorMissingFieldSnafu, RegexSnafu, Result,
+    ValueMustBeMapSnafu,
 };
 use crate::etl::field::Fields;
 use crate::etl::processor::{
     yaml_bool, yaml_new_field, yaml_new_fields, yaml_string, FIELDS_NAME, FIELD_NAME,
     IGNORE_MISSING_NAME, PATTERN_NAME,
 };
-use crate::etl::value::Value;
-use crate::etl::PipelineMap;
 
 pub(crate) const PROCESSOR_GSUB: &str = "gsub";
 
@@ -41,16 +42,16 @@ pub struct GsubProcessor {
 }
 
 impl GsubProcessor {
-    fn process_string(&self, val: &str) -> Result<Value> {
+    fn process_string(&self, val: &str) -> Result<VrlValue> {
         let new_val = self.pattern.replace_all(val, &self.replacement).to_string();
-        let val = Value::String(new_val);
+        let val = VrlValue::Bytes(Bytes::from(new_val));
 
         Ok(val)
     }
 
-    fn process(&self, val: &Value) -> Result<Value> {
+    fn process(&self, val: &VrlValue) -> Result<VrlValue> {
         match val {
-            Value::String(val) => self.process_string(val),
+            VrlValue::Bytes(val) => self.process_string(String::from_utf8_lossy(val).as_ref()),
             _ => ProcessorExpectStringSnafu {
                 processor: PROCESSOR_GSUB,
                 v: val.clone(),
@@ -118,11 +119,12 @@ impl crate::etl::processor::Processor for GsubProcessor {
         self.ignore_missing
     }
 
-    fn exec_mut(&self, val: &mut PipelineMap) -> Result<()> {
+    fn exec_mut(&self, mut val: VrlValue) -> Result<VrlValue> {
         for field in self.fields.iter() {
             let index = field.input_field();
+            let val = val.as_object_mut().context(ValueMustBeMapSnafu)?;
             match val.get(index) {
-                Some(Value::Null) | None => {
+                Some(VrlValue::Null) | None => {
                     if !self.ignore_missing {
                         return ProcessorMissingFieldSnafu {
                             processor: self.kind(),
@@ -134,11 +136,11 @@ impl crate::etl::processor::Processor for GsubProcessor {
                 Some(v) => {
                     let result = self.process(v)?;
                     let output_index = field.target_or_input_field();
-                    val.insert(output_index.to_string(), result);
+                    val.insert(KeyString::from(output_index.to_string()), result);
                 }
             }
         }
-        Ok(())
+        Ok(val)
     }
 }
 
@@ -146,7 +148,6 @@ impl crate::etl::processor::Processor for GsubProcessor {
 mod tests {
     use super::*;
     use crate::etl::processor::gsub::GsubProcessor;
-    use crate::etl::value::Value;
 
     #[test]
     fn test_string_value() {
@@ -157,9 +158,9 @@ mod tests {
             ignore_missing: false,
         };
 
-        let val = Value::String("123".to_string());
+        let val = VrlValue::Bytes(Bytes::from("123"));
         let result = processor.process(&val).unwrap();
 
-        assert_eq!(result, Value::String("xxx".to_string()));
+        assert_eq!(result, VrlValue::Bytes(Bytes::from("xxx")));
     }
 }

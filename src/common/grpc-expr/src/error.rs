@@ -111,9 +111,9 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Fulltext index only supports string type, column: {column_name}, unexpected type: {column_type:?}"
+        "Fulltext or Skipping index only supports string type, column: {column_name}, unexpected type: {column_type:?}"
     ))]
-    InvalidFulltextColumnType {
+    InvalidStringIndexColumnType {
         column_name: String,
         column_type: ColumnDataType,
         #[snafu(implicit)]
@@ -153,6 +153,35 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+
+    #[snafu(display("Invalid index option"))]
+    InvalidIndexOption {
+        #[snafu(implicit)]
+        location: Location,
+        #[snafu(source)]
+        error: datatypes::error::Error,
+    },
+
+    #[snafu(display("Sql common error"))]
+    SqlCommon {
+        source: common_sql::error::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Missing required field in protobuf, column name: {}", column_name))]
+    ColumnNotFound {
+        column_name: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Need table metadata, but not found, table_id: {}", table_id))]
+    MissingTableMeta {
+        table_id: u32,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -173,14 +202,18 @@ impl ErrorExt for Error {
                 StatusCode::InvalidArguments
             }
 
-            Error::UnknownColumnDataType { .. } | Error::InvalidFulltextColumnType { .. } => {
+            Error::UnknownColumnDataType { .. } | Error::InvalidStringIndexColumnType { .. } => {
                 StatusCode::InvalidArguments
             }
             Error::InvalidSetTableOptionRequest { .. }
             | Error::InvalidUnsetTableOptionRequest { .. }
             | Error::InvalidSetFulltextOptionRequest { .. }
             | Error::InvalidSetSkippingIndexOptionRequest { .. }
-            | Error::MissingAlterIndexOption { .. } => StatusCode::InvalidArguments,
+            | Error::MissingAlterIndexOption { .. }
+            | Error::InvalidIndexOption { .. } => StatusCode::InvalidArguments,
+            Error::ColumnNotFound { .. } => StatusCode::TableColumnNotFound,
+            Error::SqlCommon { source, .. } => source.status_code(),
+            Error::MissingTableMeta { .. } => StatusCode::Unexpected,
         }
     }
 

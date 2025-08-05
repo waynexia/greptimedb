@@ -14,6 +14,7 @@
 
 #![feature(assert_matches)]
 #![feature(try_blocks)]
+#![feature(let_chains)]
 
 use std::any::Any;
 use std::fmt::{Debug, Formatter};
@@ -40,6 +41,7 @@ pub mod information_schema {
     pub use crate::system_schema::information_schema::*;
 }
 
+pub mod process_manager;
 pub mod table_source;
 
 #[async_trait::async_trait]
@@ -86,6 +88,14 @@ pub trait CatalogManager: Send + Sync {
         table_name: &str,
         query_ctx: Option<&QueryContext>,
     ) -> Result<Option<TableRef>>;
+
+    /// Returns the tables by table ids.
+    async fn tables_by_ids(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table_ids: &[TableId],
+    ) -> Result<Vec<TableRef>>;
 
     /// Returns all tables with a stream by catalog and schema.
     fn tables<'a>(

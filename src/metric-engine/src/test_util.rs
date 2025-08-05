@@ -16,20 +16,27 @@
 
 use api::v1::value::ValueData;
 use api::v1::{ColumnDataType, ColumnSchema as PbColumnSchema, Row, SemanticType, Value};
+use common_meta::ddl::utils::parse_column_metadatas;
+use common_telemetry::debug;
 use datatypes::prelude::ConcreteDataType;
 use datatypes::schema::ColumnSchema;
 use mito2::config::MitoConfig;
 use mito2::engine::MitoEngine;
 use mito2::test_util::TestEnv as MitoTestEnv;
 use object_store::util::join_dir;
+use object_store::ObjectStore;
 use store_api::metadata::ColumnMetadata;
 use store_api::metric_engine_consts::{
-    LOGICAL_TABLE_METADATA_KEY, METRIC_ENGINE_NAME, PHYSICAL_TABLE_METADATA_KEY,
+    ALTER_PHYSICAL_EXTENSION_KEY, LOGICAL_TABLE_METADATA_KEY, METRIC_ENGINE_NAME,
+    PHYSICAL_TABLE_METADATA_KEY, TABLE_COLUMN_METADATA_EXTENSION_KEY,
 };
+use store_api::path_utils::table_dir;
 use store_api::region_engine::RegionEngine;
 use store_api::region_request::{
-    AddColumn, AlterKind, RegionAlterRequest, RegionCreateRequest, RegionRequest,
+    AddColumn, AlterKind, PathType, RegionAlterRequest, RegionCreateRequest, RegionOpenRequest,
+    RegionRequest,
 };
+use store_api::storage::consts::ReservedColumnId;
 use store_api::storage::{ColumnId, RegionId};
 
 use crate::config::EngineConfig;
@@ -53,9 +60,14 @@ impl TestEnv {
 
     /// Returns a new env with specific `prefix` for test.
     pub async fn with_prefix(prefix: &str) -> Self {
-        let mut mito_env = MitoTestEnv::with_prefix(prefix);
+        Self::with_prefix_and_config(prefix, EngineConfig::default()).await
+    }
+
+    /// Returns a new env with specific `prefix` and `config` for test.
+    pub async fn with_prefix_and_config(prefix: &str, config: EngineConfig) -> Self {
+        let mut mito_env = MitoTestEnv::with_prefix(prefix).await;
         let mito = mito_env.create_engine(MitoConfig::default()).await;
-        let metric = MetricEngine::new(mito.clone(), EngineConfig::default());
+        let metric = MetricEngine::try_new(mito.clone(), config).unwrap();
         Self {
             mito_env,
             mito,
@@ -68,6 +80,10 @@ impl TestEnv {
         join_dir(&env_root, "data")
     }
 
+    pub fn get_object_store(&self) -> Option<ObjectStore> {
+        self.mito_env.get_object_store()
+    }
+
     /// Returns a reference to the engine.
     pub fn mito(&self) -> MitoEngine {
         self.mito.clone()
@@ -77,13 +93,37 @@ impl TestEnv {
         self.metric.clone()
     }
 
-    /// Create regions in [MetricEngine] under [`default_region_id`]
-    /// and region dir `"test_metric_region"`.
-    ///
-    /// This method will create one logical region with three columns `(ts, val, job)`
-    /// under [`default_logical_region_id`].
-    pub async fn init_metric_region(&self) {
+    /// Creates a new follower engine with the same config as the leader engine.
+    pub async fn create_follower_engine(&mut self) -> (MitoEngine, MetricEngine) {
+        let mito = self
+            .mito_env
+            .create_follower_engine(MitoConfig::default())
+            .await;
+        let metric = MetricEngine::try_new(mito.clone(), EngineConfig::default()).unwrap();
+
         let region_id = self.default_physical_region_id();
+        debug!("opening default physical region: {region_id}");
+        let physical_region_option = [(PHYSICAL_TABLE_METADATA_KEY.to_string(), String::new())]
+            .into_iter()
+            .collect();
+        metric
+            .handle_request(
+                region_id,
+                RegionRequest::Open(RegionOpenRequest {
+                    engine: METRIC_ENGINE_NAME.to_string(),
+                    table_dir: Self::default_table_dir(),
+                    path_type: PathType::Bare, // Use Bare path type for engine regions
+                    options: physical_region_option,
+                    skip_wal_replay: true,
+                }),
+            )
+            .await
+            .unwrap();
+        (mito, metric)
+    }
+
+    /// Create regions in [MetricEngine] with specific `physical_region_id`.
+    pub async fn create_physical_region(&self, physical_region_id: RegionId, table_dir: &str) {
         let region_create_request = RegionCreateRequest {
             engine: METRIC_ENGINE_NAME.to_string(),
             column_metadatas: vec![
@@ -110,26 +150,89 @@ impl TestEnv {
             options: [(PHYSICAL_TABLE_METADATA_KEY.to_string(), String::new())]
                 .into_iter()
                 .collect(),
-            region_dir: self.default_region_dir(),
+            table_dir: table_dir.to_string(),
+            path_type: PathType::Bare, // Use Bare path type for engine regions
         };
 
         // create physical region
-        self.metric()
-            .handle_request(region_id, RegionRequest::Create(region_create_request))
+        let response = self
+            .metric()
+            .handle_request(
+                physical_region_id,
+                RegionRequest::Create(region_create_request),
+            )
             .await
             .unwrap();
+        let column_metadatas =
+            parse_column_metadatas(&response.extensions, TABLE_COLUMN_METADATA_EXTENSION_KEY)
+                .unwrap();
+        assert_eq!(column_metadatas.len(), 4);
+    }
 
-        // create logical region
-        let region_id = self.default_logical_region_id();
+    /// Create logical region in [MetricEngine] with specific `physical_region_id` and `logical_region_id`.
+    pub async fn create_logical_region(
+        &self,
+        physical_region_id: RegionId,
+        logical_region_id: RegionId,
+    ) {
         let region_create_request = create_logical_region_request(
             &["job"],
-            self.default_physical_region_id(),
-            "test_metric_logical_region",
+            physical_region_id,
+            &table_dir("test", logical_region_id.table_id()),
         );
-        self.metric()
-            .handle_request(region_id, RegionRequest::Create(region_create_request))
+        let response = self
+            .metric()
+            .handle_request(
+                logical_region_id,
+                RegionRequest::Create(region_create_request),
+            )
             .await
             .unwrap();
+        let column_metadatas =
+            parse_column_metadatas(&response.extensions, ALTER_PHYSICAL_EXTENSION_KEY).unwrap();
+        assert_eq!(column_metadatas.len(), 5);
+        let column_names = column_metadatas
+            .iter()
+            .map(|c| c.column_schema.name.as_str())
+            .collect::<Vec<_>>();
+        let column_ids = column_metadatas
+            .iter()
+            .map(|c| c.column_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            column_names,
+            vec![
+                "greptime_timestamp",
+                "greptime_value",
+                "__table_id",
+                "__tsid",
+                "job",
+            ]
+        );
+        assert_eq!(
+            column_ids,
+            vec![
+                0,
+                1,
+                ReservedColumnId::table_id(),
+                ReservedColumnId::tsid(),
+                2,
+            ]
+        );
+    }
+
+    /// Create regions in [MetricEngine] under [`default_region_id`]
+    /// and region dir `"test_metric_region"`.
+    ///
+    /// This method will create one logical region with three columns `(ts, val, job)`
+    /// under [`default_logical_region_id`].
+    pub async fn init_metric_region(&self) {
+        let physical_region_id = self.default_physical_region_id();
+        self.create_physical_region(physical_region_id, &Self::default_table_dir())
+            .await;
+        let logical_region_id = self.default_logical_region_id();
+        self.create_logical_region(physical_region_id, logical_region_id)
+            .await;
     }
 
     pub fn metadata_region(&self) -> MetadataRegion {
@@ -150,8 +253,8 @@ impl TestEnv {
         RegionId::new(3, 2)
     }
 
-    /// Default region dir `test_metric_region`
-    pub fn default_region_dir(&self) -> String {
+    /// Default table dir `test_metric_table`
+    pub fn default_table_dir() -> String {
         "test_metric_region".to_string()
     }
 }
@@ -177,7 +280,6 @@ pub fn alter_logical_region_add_tag_columns(
         });
     }
     RegionAlterRequest {
-        schema_version: 0,
         kind: AlterKind::AddColumns {
             columns: new_columns,
         },
@@ -189,7 +291,7 @@ pub fn alter_logical_region_add_tag_columns(
 pub fn create_logical_region_request(
     tags: &[&str],
     physical_region_id: RegionId,
-    region_dir: &str,
+    table_dir: &str,
 ) -> RegionCreateRequest {
     let mut column_metadatas = vec![
         ColumnMetadata {
@@ -232,7 +334,32 @@ pub fn create_logical_region_request(
         )]
         .into_iter()
         .collect(),
-        region_dir: region_dir.to_string(),
+        table_dir: table_dir.to_string(),
+        path_type: PathType::Bare, // Use Bare path type for engine regions
+    }
+}
+
+/// Generate a [RegionAlterRequest] for logical region.
+/// Only need to specify tag column's name
+pub fn alter_logical_region_request(tags: &[&str]) -> RegionAlterRequest {
+    RegionAlterRequest {
+        kind: AlterKind::AddColumns {
+            columns: tags
+                .iter()
+                .map(|tag| AddColumn {
+                    column_metadata: ColumnMetadata {
+                        column_id: 0,
+                        semantic_type: SemanticType::Tag,
+                        column_schema: ColumnSchema::new(
+                            tag.to_string(),
+                            ConcreteDataType::string_datatype(),
+                            false,
+                        ),
+                    },
+                    location: None,
+                })
+                .collect::<Vec<_>>(),
+        },
     }
 }
 
@@ -311,14 +438,15 @@ mod test {
         let builder = Fs::default().root(&env.data_home());
         let object_store = ObjectStore::new(builder).unwrap().finish();
 
-        let region_dir = "test_metric_region";
+        let table_dir = TestEnv::default_table_dir();
+        let region_dir = join_dir(&table_dir, "1_0000000002");
         // assert metadata region's dir
-        let metadata_region_dir = join_dir(region_dir, METADATA_REGION_SUBDIR);
+        let metadata_region_dir = join_dir(&region_dir, METADATA_REGION_SUBDIR);
         let exist = object_store.exists(&metadata_region_dir).await.unwrap();
         assert!(exist);
 
         // assert data region's dir
-        let data_region_dir = join_dir(region_dir, DATA_REGION_SUBDIR);
+        let data_region_dir = join_dir(&region_dir, DATA_REGION_SUBDIR);
         let exist = object_store.exists(&data_region_dir).await.unwrap();
         assert!(exist);
 

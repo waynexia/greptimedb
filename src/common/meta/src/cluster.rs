@@ -15,7 +15,7 @@
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::str::FromStr;
 
-use api::v1::meta::HeartbeatRequest;
+use api::v1::meta::{DatanodeWorkloads, HeartbeatRequest};
 use common_error::ext::ErrorExt;
 use lazy_static::lazy_static;
 use regex::Regex;
@@ -27,8 +27,8 @@ use crate::error::{
     DecodeJsonSnafu, EncodeJsonSnafu, Error, FromUtf8Snafu, InvalidNodeInfoKeySnafu,
     InvalidRoleSnafu, ParseNumSnafu, Result,
 };
+use crate::key::flow::flow_state::FlowStat;
 use crate::peer::Peer;
-use crate::ClusterId;
 
 const CLUSTER_NODE_INFO_PREFIX: &str = "__meta_cluster_node_info";
 
@@ -53,17 +53,15 @@ pub trait ClusterInfo {
     /// List all region stats in the cluster.
     async fn list_region_stats(&self) -> std::result::Result<Vec<RegionStat>, Self::Error>;
 
+    /// List all flow stats in the cluster.
+    async fn list_flow_stats(&self) -> std::result::Result<Option<FlowStat>, Self::Error>;
+
     // TODO(jeremy): Other info, like region status, etc.
 }
 
-/// The key of [NodeInfo] in the storage. The format is `__meta_cluster_node_info-{cluster_id}-{role}-{node_id}`.
-///
-/// This key cannot be used to describe the `Metasrv` because the `Metasrv` does not have
-/// a `cluster_id`, it serves multiple clusters.
+/// The key of [NodeInfo] in the storage. The format is `__meta_cluster_node_info-0-{role}-{node_id}`.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct NodeInfoKey {
-    /// The cluster id.
-    pub cluster_id: ClusterId,
     /// The role of the node. It can be `[Role::Datanode]` or `[Role::Frontend]`.
     pub role: Role,
     /// The node id.
@@ -86,24 +84,15 @@ impl NodeInfoKey {
             _ => peer.id,
         };
 
-        Some(NodeInfoKey {
-            cluster_id: header.cluster_id,
-            role,
-            node_id,
-        })
+        Some(NodeInfoKey { role, node_id })
     }
 
-    pub fn key_prefix_with_cluster_id(cluster_id: u64) -> String {
-        format!("{}-{}-", CLUSTER_NODE_INFO_PREFIX, cluster_id)
+    pub fn key_prefix() -> String {
+        format!("{}-0-", CLUSTER_NODE_INFO_PREFIX)
     }
 
-    pub fn key_prefix_with_role(cluster_id: ClusterId, role: Role) -> String {
-        format!(
-            "{}-{}-{}-",
-            CLUSTER_NODE_INFO_PREFIX,
-            cluster_id,
-            i32::from(role)
-        )
+    pub fn key_prefix_with_role(role: Role) -> String {
+        format!("{}-0-{}-", CLUSTER_NODE_INFO_PREFIX, i32::from(role))
     }
 }
 
@@ -172,6 +161,8 @@ pub struct DatanodeStatus {
     pub leader_regions: usize,
     /// How many follower regions on this node.
     pub follower_regions: usize,
+    /// The workloads of the datanode.
+    pub workloads: DatanodeWorkloads,
 }
 
 /// The status of a frontend.
@@ -195,15 +186,10 @@ impl FromStr for NodeInfoKey {
         let caps = CLUSTER_NODE_INFO_PREFIX_PATTERN
             .captures(key)
             .context(InvalidNodeInfoKeySnafu { key })?;
-
         ensure!(caps.len() == 4, InvalidNodeInfoKeySnafu { key });
 
-        let cluster_id = caps[1].to_string();
         let role = caps[2].to_string();
         let node_id = caps[3].to_string();
-        let cluster_id: u64 = cluster_id.parse().context(ParseNumSnafu {
-            err_msg: format!("invalid cluster_id: {cluster_id}"),
-        })?;
         let role: i32 = role.parse().context(ParseNumSnafu {
             err_msg: format!("invalid role {role}"),
         })?;
@@ -212,11 +198,7 @@ impl FromStr for NodeInfoKey {
             err_msg: format!("invalid node_id: {node_id}"),
         })?;
 
-        Ok(Self {
-            cluster_id,
-            role,
-            node_id,
-        })
+        Ok(Self { role, node_id })
     }
 }
 
@@ -232,12 +214,11 @@ impl TryFrom<Vec<u8>> for NodeInfoKey {
     }
 }
 
-impl From<NodeInfoKey> for Vec<u8> {
-    fn from(key: NodeInfoKey) -> Self {
+impl From<&NodeInfoKey> for Vec<u8> {
+    fn from(key: &NodeInfoKey) -> Self {
         format!(
-            "{}-{}-{}-{}",
+            "{}-0-{}-{}",
             CLUSTER_NODE_INFO_PREFIX,
-            key.cluster_id,
             i32::from(key.role),
             key.node_id
         )
@@ -302,6 +283,8 @@ impl TryFrom<i32> for Role {
 mod tests {
     use std::assert_matches::assert_matches;
 
+    use common_workload::DatanodeWorkloadType;
+
     use super::*;
     use crate::cluster::Role::{Datanode, Frontend};
     use crate::cluster::{DatanodeStatus, NodeInfo, NodeInfoKey, NodeStatus};
@@ -310,15 +293,13 @@ mod tests {
     #[test]
     fn test_node_info_key_round_trip() {
         let key = NodeInfoKey {
-            cluster_id: 1,
             role: Datanode,
             node_id: 2,
         };
 
-        let key_bytes: Vec<u8> = key.into();
+        let key_bytes: Vec<u8> = (&key).into();
         let new_key: NodeInfoKey = key_bytes.try_into().unwrap();
 
-        assert_eq!(1, new_key.cluster_id);
         assert_eq!(Datanode, new_key.role);
         assert_eq!(2, new_key.node_id);
     }
@@ -336,6 +317,9 @@ mod tests {
                 wcus: 2,
                 leader_regions: 3,
                 follower_regions: 4,
+                workloads: DatanodeWorkloads {
+                    types: vec![DatanodeWorkloadType::Hybrid.to_i32()],
+                },
             }),
             version: "".to_string(),
             git_commit: "".to_string(),
@@ -355,6 +339,7 @@ mod tests {
                     wcus: 2,
                     leader_regions: 3,
                     follower_regions: 4,
+                    ..
                 }),
                 start_time_ms: 1,
                 ..
@@ -364,11 +349,11 @@ mod tests {
 
     #[test]
     fn test_node_info_key_prefix() {
-        let prefix = NodeInfoKey::key_prefix_with_cluster_id(1);
-        assert_eq!(prefix, "__meta_cluster_node_info-1-");
+        let prefix = NodeInfoKey::key_prefix();
+        assert_eq!(prefix, "__meta_cluster_node_info-0-");
 
-        let prefix = NodeInfoKey::key_prefix_with_role(2, Frontend);
-        assert_eq!(prefix, "__meta_cluster_node_info-2-1-");
+        let prefix = NodeInfoKey::key_prefix_with_role(Frontend);
+        assert_eq!(prefix, "__meta_cluster_node_info-0-1-");
     }
 
     #[test]

@@ -31,9 +31,10 @@ lazy_static! {
         "table operator alter table"
     )
     .unwrap();
-    pub static ref DIST_INGEST_ROW_COUNT: IntCounter = register_int_counter!(
+    pub static ref DIST_INGEST_ROW_COUNT: IntCounterVec = register_int_counter_vec!(
         "greptime_table_operator_ingest_rows",
-        "table operator ingest rows"
+        "table operator ingest rows",
+        &["db"]
     )
     .unwrap();
     pub static ref DIST_MIRROR_ROW_COUNT: IntCounter = register_int_counter!(
@@ -46,9 +47,10 @@ lazy_static! {
         "table operator mirror pending rows"
     )
     .unwrap();
-    pub static ref DIST_DELETE_ROW_COUNT: IntCounter = register_int_counter!(
+    pub static ref DIST_DELETE_ROW_COUNT: IntCounterVec = register_int_counter_vec!(
         "greptime_table_operator_delete_rows",
-        "table operator delete rows"
+        "table operator delete rows",
+        &["db"]
     )
     .unwrap();
     pub static ref DIST_CREATE_VIEW: Histogram = register_histogram!(
@@ -60,6 +62,45 @@ lazy_static! {
         "greptime_table_operator_create_alter_on_demand",
         "table operator duration to create or alter tables on demand",
         &["table_type"]
+    )
+    .unwrap();
+    pub static ref HANDLE_BULK_INSERT_ELAPSED: HistogramVec = register_histogram_vec!(
+        "greptime_table_operator_handle_bulk_insert",
+        "table operator duration to handle bulk inserts",
+        &["stage"],
+        vec![
+            0.001, 0.005, 0.01, 0.02, 0.03, 0.04, 0.05, 0.10, 0.15, 0.2, 0.3, 0.4, 0.5, 1.0, 1.5,
+            2.0, 2.5, 3.0, 4.0, 5.0
+        ]
+    )
+    .unwrap();
+    pub static ref BULK_REQUEST_MESSAGE_SIZE: Histogram = register_histogram!(
+        "greptime_table_operator_bulk_insert_message_size",
+        "table operator bulk inserts message encoded size",
+        vec![
+            32768.0,
+            65536.0,
+            131072.0,
+            262144.0,
+            524288.0,
+            1048576.0,
+            2097152.0,
+            4194304.0,
+            8388608.0,
+            16777216.0,
+            33554432.0,
+            67108864.0,
+            134217728.0,
+            268435456.0
+        ]
+    )
+    .unwrap();
+    pub static ref BULK_REQUEST_ROWS: HistogramVec = register_histogram_vec!(
+        "greptime_table_operator_bulk_insert_message_rows",
+        "table operator bulk inserts message rows",
+        &["type"],
+        // 10 ~ 100_000
+        exponential_buckets(10.0, 10.0, 5).unwrap()
     )
     .unwrap();
 }

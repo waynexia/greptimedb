@@ -12,6 +12,7 @@ with cte1(xxx) as (Select i as j from a) select x from cte1 t1(x);
 
 with cte1 as (Select i as j from a), cte2 as (select ref.j as k from cte1 as ref), cte3 as (select ref2.j+1 as i from cte1 as ref2) select * from cte2 , cte3;
 
+-- SQLNESS SORT_RESULT 3 1
 with cte1 as (select i as j from a), cte2 as (select ref.j as k from cte1 as ref), cte3 as (select ref2.j+1 as i from cte1 as ref2) select * from cte2 union all select * FROM cte3 order by 1;
 
 with cte1 as (select 42), cte1 as (select 42) select * FROM cte1;
@@ -49,3 +50,30 @@ from cte
 where alias2 > 0;
 
 drop table a;
+
+
+CREATE TABLE grpc_latencies
+(
+    ts      TIMESTAMP TIME INDEX,
+    host    VARCHAR(255),
+    latency FLOAT,
+    PRIMARY KEY (host),
+);
+
+INSERT INTO grpc_latencies
+VALUES ('2023-10-01 10:00:00', 'host1', 120),
+       ('2023-10-01 10:00:00', 'host2', 150),
+       ('2023-10-01 10:00:05', 'host1', 130);
+
+
+WITH latencies AS (SELECT ts,
+                          host,
+                          AVG(latency) RANGE '2s' AS avg_latency
+                   FROM grpc_latencies ALIGN '2s' BY (host) FILL PREV
+    )
+SELECT latencies.ts,
+       AVG(latencies.avg_latency)
+FROM latencies
+GROUP BY latencies.ts ORDER BY latencies.ts;
+
+DROP TABLE grpc_latencies;

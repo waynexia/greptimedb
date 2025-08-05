@@ -106,34 +106,19 @@ mod tests {
     use common_telemetry::logging::LoggingOptions;
     use common_test_util::temp_dir::create_named_temp_file;
     use common_wal::config::DatanodeWalConfig;
-    use datanode::config::{ObjectStoreConfig, StorageConfig};
+    use datanode::config::StorageConfig;
     use meta_client::MetaClientOptions;
     use serde::{Deserialize, Serialize};
 
     use super::*;
-    use crate::Mode;
 
-    #[derive(Debug, Serialize, Deserialize)]
+    #[derive(Debug, Serialize, Deserialize, Default)]
     struct TestDatanodeConfig {
-        mode: Mode,
         node_id: Option<u64>,
         logging: LoggingOptions,
         meta_client: Option<MetaClientOptions>,
         wal: DatanodeWalConfig,
         storage: StorageConfig,
-    }
-
-    impl Default for TestDatanodeConfig {
-        fn default() -> Self {
-            Self {
-                mode: Mode::Distributed,
-                node_id: None,
-                logging: LoggingOptions::default(),
-                meta_client: None,
-                wal: DatanodeWalConfig::default(),
-                storage: StorageConfig::default(),
-            }
-        }
     }
 
     impl Configurable for TestDatanodeConfig {
@@ -146,7 +131,6 @@ mod tests {
     fn test_load_layered_options() {
         let mut file = create_named_temp_file();
         let toml_str = r#"
-            mode = "distributed"
             enable_memory_catalog = false
             rpc_addr = "127.0.0.1:3001"
             rpc_hostname = "127.0.0.1"
@@ -161,7 +145,7 @@ mod tests {
 
             [wal]
             provider = "raft_engine"
-            dir = "/tmp/greptimedb/wal"
+            dir = "./greptimedb_data/wal"
             file_size = "1GB"
             purge_threshold = "50GB"
             purge_interval = "10m"
@@ -170,7 +154,7 @@ mod tests {
 
             [logging]
             level = "debug"
-            dir = "/tmp/greptimedb/test/logs"
+            dir = "./greptimedb_data/test/logs"
         "#;
         write!(file, "{}", toml_str).unwrap();
 
@@ -228,7 +212,7 @@ mod tests {
 
                 // Check the configs from environment variables.
                 match &opts.storage.store {
-                    ObjectStoreConfig::S3(s3_config) => {
+                    object_store::config::ObjectStoreConfig::S3(s3_config) => {
                         assert_eq!(s3_config.bucket, "mybucket".to_string());
                     }
                     _ => panic!("unexpected store type"),
@@ -246,7 +230,7 @@ mod tests {
                 let DatanodeWalConfig::RaftEngine(raft_engine_config) = opts.wal else {
                     unreachable!()
                 };
-                assert_eq!(raft_engine_config.dir.unwrap(), "/tmp/greptimedb/wal");
+                assert_eq!(raft_engine_config.dir.unwrap(), "./greptimedb_data/wal");
 
                 // Should be default values.
                 assert_eq!(opts.node_id, None);

@@ -35,7 +35,7 @@ use common_runtime::RepeatedTask;
 use raft_engine::{Config, Engine, LogBatch, ReadableSize, RecoveryMode};
 use snafu::{IntoError, ResultExt};
 
-use crate::error::{self, Error, IoSnafu, RaftEngineSnafu, StartGcTaskSnafu};
+use crate::error::{self, Error, IoSnafu, RaftEngineSnafu, StartWalTaskSnafu};
 use crate::raft_engine::log_store::PurgeExpiredFilesFunction;
 
 pub(crate) const SYSTEM_NAMESPACE: u64 = 0;
@@ -93,7 +93,8 @@ impl RaftEngineBackend {
         );
         gc_task
             .start(common_runtime::global_runtime())
-            .context(StartGcTaskSnafu)?;
+            .context(StartWalTaskSnafu { name: "gc_task" })?;
+
         Ok(Self {
             engine: RwLock::new(engine),
             _gc_task: gc_task,
@@ -113,7 +114,13 @@ impl TxnService for RaftEngineBackend {
         } = txn.into();
 
         let mut succeeded = true;
+
+        // Here we are using the write lock to guard against parallel access inside "txn", and
+        // outside "get" or "put" etc. It doesn't serve the purpose of mutating some Rust data, so
+        // the variable is not "mut". Suppress the clippy warning because of this.
+        #[allow(clippy::readonly_write_lock)]
         let engine = self.engine.write().unwrap();
+
         for cmp in compare {
             let existing_value = engine_get(&engine, &cmp.key)?.map(|kv| kv.value);
             if !cmp.compare_value(existing_value.as_ref()) {

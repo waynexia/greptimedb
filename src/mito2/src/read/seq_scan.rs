@@ -20,26 +20,32 @@ use std::time::Instant;
 
 use async_stream::try_stream;
 use common_error::ext::BoxedError;
-use common_recordbatch::error::ExternalSnafu;
 use common_recordbatch::util::ChainedRecordBatchStream;
 use common_recordbatch::{RecordBatchStreamWrapper, SendableRecordBatchStream};
 use common_telemetry::tracing;
+use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType};
 use datatypes::schema::SchemaRef;
-use snafu::ResultExt;
+use futures::StreamExt;
+use snafu::ensure;
 use store_api::metadata::RegionMetadataRef;
-use store_api::region_engine::{PartitionRange, PrepareRequest, RegionScanner, ScannerProperties};
+use store_api::region_engine::{
+    PartitionRange, PrepareRequest, QueryScanContext, RegionScanner, ScannerProperties,
+};
 use store_api::storage::TimeSeriesRowSelector;
 use tokio::sync::Semaphore;
 
-use crate::error::{PartitionOutOfRangeSnafu, Result};
+use crate::error::{PartitionOutOfRangeSnafu, Result, TooManyFilesToReadSnafu};
 use crate::read::dedup::{DedupReader, LastNonNull, LastRow};
 use crate::read::last_row::LastRowReader;
 use crate::read::merge::MergeReaderBuilder;
-use crate::read::range::RangeBuilderList;
+use crate::read::range::{RangeBuilderList, RangeMeta};
 use crate::read::scan_region::{ScanInput, StreamContext};
-use crate::read::scan_util::{scan_file_ranges, scan_mem_ranges, PartitionMetrics};
-use crate::read::{BatchReader, BoxedBatchReader, ScannerMetrics, Source};
+use crate::read::scan_util::{
+    scan_file_ranges, scan_mem_ranges, PartitionMetrics, PartitionMetricsList,
+};
+use crate::read::stream::{ConvertBatchStream, ScanBatch, ScanBatchStream};
+use crate::read::{scan_util, Batch, BatchReader, BoxedBatchReader, ScannerMetrics, Source};
 use crate::region::options::MergeMode;
 
 /// Scans a region and returns rows in a sorted sequence.
@@ -53,6 +59,9 @@ pub struct SeqScan {
     stream_ctx: Arc<StreamContext>,
     /// The scanner is used for compaction.
     compaction: bool,
+    /// Metrics for each partition.
+    /// The scanner only sets in query and keeps it empty during compaction.
+    metrics_list: PartitionMetricsList,
 }
 
 impl SeqScan {
@@ -69,6 +78,7 @@ impl SeqScan {
             properties,
             stream_ctx,
             compaction,
+            metrics_list: PartitionMetricsList::default(),
         }
     }
 
@@ -77,12 +87,29 @@ impl SeqScan {
     /// The returned stream is not partitioned and will contains all the data. If want
     /// partitioned scan, use [`RegionScanner::scan_partition`].
     pub fn build_stream(&self) -> Result<SendableRecordBatchStream, BoxedError> {
+        let metrics_set = ExecutionPlanMetricsSet::new();
         let streams = (0..self.properties.partitions.len())
-            .map(|partition: usize| self.scan_partition(partition))
+            .map(|partition: usize| {
+                self.scan_partition(&QueryScanContext::default(), &metrics_set, partition)
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
         let aggr_stream = ChainedRecordBatchStream::new(streams).map_err(BoxedError::new)?;
         Ok(Box::pin(aggr_stream))
+    }
+
+    /// Scan [`Batch`] in all partitions one by one.
+    pub(crate) fn scan_all_partitions(&self) -> Result<ScanBatchStream> {
+        let metrics_set = ExecutionPlanMetricsSet::new();
+
+        let streams = (0..self.properties.partitions.len())
+            .map(|partition| {
+                let metrics = self.new_partition_metrics(false, &metrics_set, partition);
+                self.scan_batch_in_partition(partition, metrics)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Box::pin(futures::stream::iter(streams).flatten()))
     }
 
     /// Builds a [BoxedBatchReader] from sequential scan for compaction.
@@ -92,16 +119,8 @@ impl SeqScan {
     pub async fn build_reader_for_compaction(&self) -> Result<BoxedBatchReader> {
         assert!(self.compaction);
 
-        let part_metrics = PartitionMetrics::new(
-            self.stream_ctx.input.mapper.metadata().region_id,
-            0,
-            get_scanner_type(self.compaction),
-            self.stream_ctx.query_start,
-            ScannerMetrics {
-                prepare_scan_cost: self.stream_ctx.query_start.elapsed(),
-                ..Default::default()
-            },
-        );
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let part_metrics = self.new_partition_metrics(false, &metrics_set, 0);
         debug_assert_eq!(1, self.properties.partitions.len());
         let partition_ranges = &self.properties.partitions[0];
 
@@ -134,7 +153,8 @@ impl SeqScan {
                 part_metrics,
                 range_builder_list.clone(),
                 &mut sources,
-            );
+            )
+            .await?;
         }
 
         common_telemetry::debug!(
@@ -149,7 +169,7 @@ impl SeqScan {
     /// Builds a reader to read sources. If `semaphore` is provided, reads sources in parallel
     /// if possible.
     #[tracing::instrument(level = tracing::Level::DEBUG, skip_all)]
-    async fn build_reader_from_sources(
+    pub(crate) async fn build_reader_from_sources(
         stream_ctx: &StreamContext,
         mut sources: Vec<Source>,
         semaphore: Option<Arc<Semaphore>>,
@@ -194,44 +214,58 @@ impl SeqScan {
     /// Otherwise the returned stream might not contains any data.
     fn scan_partition_impl(
         &self,
+        ctx: &QueryScanContext,
+        metrics_set: &ExecutionPlanMetricsSet,
         partition: usize,
-    ) -> Result<SendableRecordBatchStream, BoxedError> {
-        if partition >= self.properties.partitions.len() {
-            return Err(BoxedError::new(
-                PartitionOutOfRangeSnafu {
-                    given: partition,
-                    all: self.properties.partitions.len(),
-                }
-                .build(),
-            ));
+    ) -> Result<SendableRecordBatchStream> {
+        if ctx.explain_verbose {
+            common_telemetry::info!(
+                "SeqScan partition {}, region_id: {}",
+                partition,
+                self.stream_ctx.input.region_metadata().region_id
+            );
+        }
+
+        let metrics = self.new_partition_metrics(ctx.explain_verbose, metrics_set, partition);
+
+        let batch_stream = self.scan_batch_in_partition(partition, metrics.clone())?;
+
+        let input = &self.stream_ctx.input;
+        let record_batch_stream = ConvertBatchStream::new(
+            batch_stream,
+            input.mapper.clone(),
+            input.cache_strategy.clone(),
+            metrics,
+        );
+
+        Ok(Box::pin(RecordBatchStreamWrapper::new(
+            input.mapper.output_schema(),
+            Box::pin(record_batch_stream),
+        )))
+    }
+
+    fn scan_batch_in_partition(
+        &self,
+        partition: usize,
+        part_metrics: PartitionMetrics,
+    ) -> Result<ScanBatchStream> {
+        ensure!(
+            partition < self.properties.partitions.len(),
+            PartitionOutOfRangeSnafu {
+                given: partition,
+                all: self.properties.partitions.len(),
+            }
+        );
+
+        if self.properties.partitions[partition].is_empty() {
+            return Ok(Box::pin(futures::stream::empty()));
         }
 
         let stream_ctx = self.stream_ctx.clone();
-        let semaphore = if self.properties.target_partitions() > self.properties.num_partitions() {
-            // We can use additional tasks to read the data if we have more target partitions than actual partitions.
-            // This semaphore is partition level.
-            // We don't use a global semaphore to avoid a partition waiting for others. The final concurrency
-            // of tasks usually won't exceed the target partitions a lot as compaction can reduce the number of
-            // files in a part range.
-            Some(Arc::new(Semaphore::new(
-                self.properties.target_partitions() - self.properties.num_partitions() + 1,
-            )))
-        } else {
-            None
-        };
+        let semaphore = self.new_semaphore();
         let partition_ranges = self.properties.partitions[partition].clone();
         let compaction = self.compaction;
         let distinguish_range = self.properties.distinguish_partition_range;
-        let part_metrics = PartitionMetrics::new(
-            self.stream_ctx.input.mapper.metadata().region_id,
-            partition,
-            get_scanner_type(self.compaction),
-            stream_ctx.query_start,
-            ScannerMetrics {
-                prepare_scan_cost: self.stream_ctx.query_start.elapsed(),
-                ..Default::default()
-            },
-        );
 
         let stream = try_stream! {
             part_metrics.on_first_poll();
@@ -250,27 +284,19 @@ impl SeqScan {
                     &part_metrics,
                     range_builder_list.clone(),
                     &mut sources,
-                );
+                ).await?;
 
-                let mut reader =
-                    Self::build_reader_from_sources(&stream_ctx, sources, semaphore.clone())
-                        .await
-                        .map_err(BoxedError::new)
-                        .context(ExternalSnafu)?;
-                let cache = &stream_ctx.input.cache_strategy;
                 let mut metrics = ScannerMetrics::default();
                 let mut fetch_start = Instant::now();
+                let mut reader =
+                    Self::build_reader_from_sources(&stream_ctx, sources, semaphore.clone())
+                        .await?;
                 #[cfg(debug_assertions)]
                 let mut checker = crate::read::BatchChecker::default()
                     .with_start(Some(part_range.start))
                     .with_end(Some(part_range.end));
 
-                while let Some(batch) = reader
-                    .next_batch()
-                    .await
-                    .map_err(BoxedError::new)
-                    .context(ExternalSnafu)?
-                {
+                while let Some(batch) = reader.next_batch().await? {
                     metrics.scan_cost += fetch_start.elapsed();
                     metrics.num_batches += 1;
                     metrics.num_rows += batch.num_rows();
@@ -289,11 +315,8 @@ impl SeqScan {
                         &batch,
                     );
 
-                    let convert_start = Instant::now();
-                    let record_batch = stream_ctx.input.mapper.convert(&batch, cache)?;
-                    metrics.convert_cost += convert_start.elapsed();
                     let yield_start = Instant::now();
-                    yield record_batch;
+                    yield ScanBatch::Normal(batch);
                     metrics.yield_cost += yield_start.elapsed();
 
                     fetch_start = Instant::now();
@@ -303,7 +326,7 @@ impl SeqScan {
                 // The query engine can use this to optimize some queries.
                 if distinguish_range {
                     let yield_start = Instant::now();
-                    yield stream_ctx.input.mapper.empty_record_batch();
+                    yield ScanBatch::Normal(Batch::empty());
                     metrics.yield_cost += yield_start.elapsed();
                 }
 
@@ -313,13 +336,80 @@ impl SeqScan {
 
             part_metrics.on_finish();
         };
+        Ok(Box::pin(stream))
+    }
 
-        let stream = Box::pin(RecordBatchStreamWrapper::new(
-            self.stream_ctx.input.mapper.output_schema(),
-            Box::pin(stream),
-        ));
+    fn new_semaphore(&self) -> Option<Arc<Semaphore>> {
+        if self.properties.target_partitions() > self.properties.num_partitions() {
+            // We can use additional tasks to read the data if we have more target partitions than actual partitions.
+            // This semaphore is partition level.
+            // We don't use a global semaphore to avoid a partition waiting for others. The final concurrency
+            // of tasks usually won't exceed the target partitions a lot as compaction can reduce the number of
+            // files in a part range.
+            Some(Arc::new(Semaphore::new(
+                self.properties.target_partitions() - self.properties.num_partitions() + 1,
+            )))
+        } else {
+            None
+        }
+    }
 
-        Ok(stream)
+    /// Creates a new partition metrics instance.
+    /// Sets the partition metrics for the given partition if it is not for compaction.
+    fn new_partition_metrics(
+        &self,
+        explain_verbose: bool,
+        metrics_set: &ExecutionPlanMetricsSet,
+        partition: usize,
+    ) -> PartitionMetrics {
+        let metrics = PartitionMetrics::new(
+            self.stream_ctx.input.mapper.metadata().region_id,
+            partition,
+            get_scanner_type(self.compaction),
+            self.stream_ctx.query_start,
+            explain_verbose,
+            metrics_set,
+        );
+
+        if !self.compaction {
+            self.metrics_list.set(partition, metrics.clone());
+        }
+
+        metrics
+    }
+
+    /// Finds the maximum number of files to read in a single partition range.
+    fn max_files_in_partition(ranges: &[RangeMeta], partition_ranges: &[PartitionRange]) -> usize {
+        partition_ranges
+            .iter()
+            .map(|part_range| {
+                let range_meta = &ranges[part_range.identifier];
+                range_meta.indices.len()
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Checks resource limit for the scanner.
+    pub(crate) fn check_scan_limit(&self) -> Result<()> {
+        // Check max file count limit for all partitions since we scan them in parallel.
+        let total_max_files: usize = self
+            .properties
+            .partitions
+            .iter()
+            .map(|partition| Self::max_files_in_partition(&self.stream_ctx.ranges, partition))
+            .sum();
+
+        let max_concurrent_files = self.stream_ctx.input.max_concurrent_scan_files;
+        if total_max_files > max_concurrent_files {
+            return TooManyFilesToReadSnafu {
+                actual: total_max_files,
+                max: max_concurrent_files,
+            }
+            .fail();
+        }
+
+        Ok(())
     }
 }
 
@@ -332,12 +422,25 @@ impl RegionScanner for SeqScan {
         self.stream_ctx.input.mapper.output_schema()
     }
 
-    fn scan_partition(&self, partition: usize) -> Result<SendableRecordBatchStream, BoxedError> {
-        self.scan_partition_impl(partition)
+    fn metadata(&self) -> RegionMetadataRef {
+        self.stream_ctx.input.mapper.metadata().clone()
+    }
+
+    fn scan_partition(
+        &self,
+        ctx: &QueryScanContext,
+        metrics_set: &ExecutionPlanMetricsSet,
+        partition: usize,
+    ) -> Result<SendableRecordBatchStream, BoxedError> {
+        self.scan_partition_impl(ctx, metrics_set, partition)
+            .map_err(BoxedError::new)
     }
 
     fn prepare(&mut self, request: PrepareRequest) -> Result<(), BoxedError> {
         self.properties.prepare(request);
+
+        self.check_scan_limit().map_err(BoxedError::new)?;
+
         Ok(())
     }
 
@@ -346,19 +449,25 @@ impl RegionScanner for SeqScan {
         predicate.map(|p| !p.exprs().is_empty()).unwrap_or(false)
     }
 
-    fn metadata(&self) -> RegionMetadataRef {
-        self.stream_ctx.input.mapper.metadata().clone()
+    fn set_logical_region(&mut self, logical_region: bool) {
+        self.properties.set_logical_region(logical_region);
     }
 }
 
 impl DisplayAs for SeqScan {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
             "SeqScan: region={}, ",
             self.stream_ctx.input.mapper.metadata().region_id
         )?;
-        self.stream_ctx.format_for_explain(f)
+        match t {
+            DisplayFormatType::Default => self.stream_ctx.format_for_explain(false, f),
+            DisplayFormatType::Verbose => {
+                self.stream_ctx.format_for_explain(true, f)?;
+                self.metrics_list.format_verbose_metrics(f)
+            }
+        }
     }
 }
 
@@ -370,15 +479,15 @@ impl fmt::Debug for SeqScan {
     }
 }
 
-/// Builds sources for the partition range.
-fn build_sources(
+/// Builds sources for the partition range and push them to the `sources` vector.
+pub(crate) async fn build_sources(
     stream_ctx: &Arc<StreamContext>,
     part_range: &PartitionRange,
     compaction: bool,
     part_metrics: &PartitionMetrics,
     range_builder_list: Arc<RangeBuilderList>,
     sources: &mut Vec<Source>,
-) {
+) -> Result<()> {
     // Gets range meta.
     let range_meta = &stream_ctx.ranges[part_range.identifier];
     #[cfg(debug_assertions)]
@@ -405,7 +514,7 @@ fn build_sources(
                 range_meta.time_range,
             );
             Box::pin(stream) as _
-        } else {
+        } else if stream_ctx.is_file_range_index(*index) {
             let read_type = if compaction {
                 "compaction"
             } else {
@@ -417,11 +526,15 @@ fn build_sources(
                 *index,
                 read_type,
                 range_builder_list.clone(),
-            );
+            )
+            .await?;
             Box::pin(stream) as _
+        } else {
+            scan_util::maybe_scan_other_ranges(stream_ctx, *index, part_metrics).await?
         };
         sources.push(Source::Stream(stream));
     }
+    Ok(())
 }
 
 #[cfg(test)]

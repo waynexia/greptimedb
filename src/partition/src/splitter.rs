@@ -139,7 +139,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use super::*;
-    use crate::partition::PartitionExpr;
+    use crate::partition::RegionMask;
     use crate::PartitionRule;
 
     fn mock_rows() -> Rows {
@@ -211,7 +211,10 @@ mod tests {
             Ok(val.parse::<u32>().unwrap() % 2)
         }
 
-        fn find_regions_by_exprs(&self, _: &[PartitionExpr]) -> Result<Vec<RegionNumber>> {
+        fn split_record_batch(
+            &self,
+            _record_batch: &datatypes::arrow::array::RecordBatch,
+        ) -> Result<HashMap<RegionNumber, RegionMask>> {
             unimplemented!()
         }
     }
@@ -238,7 +241,10 @@ mod tests {
             Ok(val)
         }
 
-        fn find_regions_by_exprs(&self, _: &[PartitionExpr]) -> Result<Vec<RegionNumber>> {
+        fn split_record_batch(
+            &self,
+            _record_batch: &datatypes::arrow::array::RecordBatch,
+        ) -> Result<HashMap<RegionNumber, RegionMask>> {
             unimplemented!()
         }
     }
@@ -259,11 +265,13 @@ mod tests {
             Ok(0)
         }
 
-        fn find_regions_by_exprs(&self, _: &[PartitionExpr]) -> Result<Vec<RegionNumber>> {
+        fn split_record_batch(
+            &self,
+            _record_batch: &datatypes::arrow::array::RecordBatch,
+        ) -> Result<HashMap<RegionNumber, RegionMask>> {
             unimplemented!()
         }
     }
-
     #[test]
     fn test_writer_splitter() {
         let rows = mock_rows();

@@ -12,6 +12,33 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod flight;
+
+use api::v1::greptime_request::Request;
+use api::v1::query_request::Query;
+use api::v1::QueryRequest;
+use common_query::OutputData;
+use common_recordbatch::RecordBatches;
+use frontend::instance::Instance;
+use servers::query_handler::grpc::GrpcQueryHandler;
+use session::context::QueryContext;
+
+#[allow(unused)]
+async fn query_and_expect(instance: &Instance, sql: &str, expected: &str) {
+    let request = Request::Query(QueryRequest {
+        query: Some(Query::Sql(sql.to_string())),
+    });
+    let output = GrpcQueryHandler::do_query(instance, request, QueryContext::arc())
+        .await
+        .unwrap();
+    let OutputData::Stream(stream) = output.data else {
+        unreachable!()
+    };
+    let recordbatches = RecordBatches::try_collect(stream).await.unwrap();
+    let actual = recordbatches.pretty_print().unwrap();
+    assert_eq!(actual, expected, "actual: {}", actual);
+}
+
 #[cfg(test)]
 mod test {
     use std::collections::HashMap;
@@ -41,6 +68,7 @@ mod test {
     use store_api::storage::RegionId;
     use substrait::{DFLogicalSubstraitConvertor, SubstraitPlan};
 
+    use super::*;
     use crate::standalone::GreptimeDbStandaloneBuilder;
     use crate::tests;
     use crate::tests::MockDistributedInstance;
@@ -61,7 +89,7 @@ mod test {
         let standalone = GreptimeDbStandaloneBuilder::new("test_standalone_handle_ddl_request")
             .build()
             .await;
-        let instance = &standalone.instance;
+        let instance = standalone.fe_instance();
 
         test_handle_ddl_request(instance.as_ref()).await;
     }
@@ -83,7 +111,7 @@ mod test {
             GreptimeDbStandaloneBuilder::new("test_standalone_handle_multi_ddl_request")
                 .build()
                 .await;
-        let instance = &standalone.instance;
+        let instance = standalone.fe_instance();
 
         test_handle_multi_ddl_request(instance.as_ref()).await;
     }
@@ -219,24 +247,14 @@ mod test {
         let output = query(instance, request).await;
         assert!(matches!(output.data, OutputData::AffectedRows(1)));
 
-        let request = Request::Query(QueryRequest {
-            query: Some(Query::Sql(
-                "SELECT ts, a, b FROM database_created_through_grpc.table_created_through_grpc"
-                    .to_string(),
-            )),
-        });
-        let output = query(instance, request).await;
-        let OutputData::Stream(stream) = output.data else {
-            unreachable!()
-        };
-        let recordbatches = RecordBatches::try_collect(stream).await.unwrap();
+        let sql = "SELECT ts, a, b FROM database_created_through_grpc.table_created_through_grpc";
         let expected = "\
 +---------------------+---+---+
 | ts                  | a | b |
 +---------------------+---+---+
 | 2023-01-04T07:14:26 | s | 1 |
 +---------------------+---+---+";
-        assert_eq!(recordbatches.pretty_print().unwrap(), expected);
+        query_and_expect(instance, sql, expected).await;
 
         let request = Request::Ddl(DdlRequest {
             expr: Some(DdlExpr::DropTable(DropTableExpr {
@@ -323,24 +341,14 @@ mod test {
         let output = query(instance, request).await;
         assert!(matches!(output.data, OutputData::AffectedRows(1)));
 
-        let request = Request::Query(QueryRequest {
-            query: Some(Query::Sql(
-                "SELECT ts, a, b FROM database_created_through_grpc.table_created_through_grpc"
-                    .to_string(),
-            )),
-        });
-        let output = query(instance, request).await;
-        let OutputData::Stream(stream) = output.data else {
-            unreachable!()
-        };
-        let recordbatches = RecordBatches::try_collect(stream).await.unwrap();
+        let sql = "SELECT ts, a, b FROM database_created_through_grpc.table_created_through_grpc";
         let expected = "\
 +---------------------+---+---+
 | ts                  | a | b |
 +---------------------+---+---+
 | 2023-01-04T07:14:26 | s | 1 |
 +---------------------+---+---+";
-        assert_eq!(recordbatches.pretty_print().unwrap(), expected);
+        query_and_expect(instance, sql, expected).await;
 
         let request = Request::Ddl(DdlRequest {
             expr: Some(DdlExpr::DropTable(DropTableExpr {
@@ -478,7 +486,7 @@ CREATE TABLE {table_name} (
         let standalone = GreptimeDbStandaloneBuilder::new("test_standalone_insert_and_query")
             .build()
             .await;
-        let instance = &standalone.instance;
+        let instance = standalone.fe_instance();
 
         let table_name = "my_table";
         let sql = format!("CREATE TABLE {table_name} (a INT, b STRING, c JSON, ts TIMESTAMP, TIME INDEX (ts), PRIMARY KEY (a, b, c))");
@@ -849,7 +857,7 @@ CREATE TABLE {table_name} (
                 .expect("physical table route"),
         )
         .iter()
-        .map(|(k, v)| (v[0], *k))
+        .map(|(k, v)| (v.leader_regions[0], *k))
         .collect::<HashMap<u32, u64>>();
         assert!(region_to_dn_map.len() <= instance.datanodes().len());
 
@@ -874,11 +882,14 @@ CREATE TABLE {table_name} (
             let region_id = RegionId::new(table_id, *region);
 
             let stream = region_server
-                .handle_remote_read(RegionQueryRequest {
-                    region_id: region_id.as_u64(),
-                    plan: plan.to_vec(),
-                    ..Default::default()
-                })
+                .handle_remote_read(
+                    RegionQueryRequest {
+                        region_id: region_id.as_u64(),
+                        plan: plan.to_vec(),
+                        ..Default::default()
+                    },
+                    QueryContext::arc(),
+                )
                 .await
                 .unwrap();
 
@@ -1053,7 +1064,7 @@ CREATE TABLE {table_name} (
         let standalone = GreptimeDbStandaloneBuilder::new("test_standalone_promql_query")
             .build()
             .await;
-        let instance = &standalone.instance;
+        let instance = standalone.fe_instance();
 
         let table_name = "my_table";
         let sql = format!("CREATE TABLE {table_name} (h string, a double, ts TIMESTAMP, TIME INDEX (ts), PRIMARY KEY(h))");

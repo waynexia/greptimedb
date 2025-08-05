@@ -22,11 +22,13 @@ use table::metadata::{RawTableInfo, TableId};
 use table::table_name::TableName;
 use table::table_reference::TableReference;
 
-use super::TABLE_INFO_KEY_PATTERN;
 use crate::ddl::utils::region_storage_path;
 use crate::error::{InvalidMetadataSnafu, Result};
 use crate::key::txn_helper::TxnOpGetResponseSet;
-use crate::key::{DeserializedValueWithBytes, MetadataKey, MetadataValue, TABLE_INFO_KEY_PREFIX};
+use crate::key::{
+    DeserializedValueWithBytes, MetadataKey, MetadataValue, TABLE_INFO_KEY_PATTERN,
+    TABLE_INFO_KEY_PREFIX,
+};
 use crate::kv_backend::txn::Txn;
 use crate::kv_backend::KvBackendRef;
 use crate::rpc::store::BatchGetRequest;
@@ -332,6 +334,7 @@ mod tests {
             options: Default::default(),
             region_numbers: vec![1],
             partition_key_indices: vec![],
+            column_ids: vec![],
         };
 
         RawTableInfo {

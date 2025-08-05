@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(feature = "enterprise")]
+pub mod trigger;
+
 use std::collections::HashMap;
 
 use common_query::AddColumnLocation;
@@ -20,7 +23,7 @@ use snafu::{ensure, ResultExt};
 use sqlparser::ast::Ident;
 use sqlparser::keywords::Keyword;
 use sqlparser::parser::{Parser, ParserError};
-use sqlparser::tokenizer::{Token, TokenWithLocation};
+use sqlparser::tokenizer::{Token, TokenWithSpan};
 
 use crate::error::{self, InvalidColumnOptionSnafu, Result, SetFulltextOptionSnafu};
 use crate::parser::ParserContext;
@@ -30,7 +33,8 @@ use crate::parsers::utils::{
 };
 use crate::statements::alter::{
     AddColumn, AlterDatabase, AlterDatabaseOperation, AlterTable, AlterTableOperation,
-    KeyValueOption, SetIndexOperation, UnsetIndexOperation,
+    DropDefaultsOperation, KeyValueOption, SetDefaultsOperation, SetIndexOperation,
+    UnsetIndexOperation,
 };
 use crate::statements::statement::Statement;
 use crate::util::parse_option_string;
@@ -42,6 +46,11 @@ impl ParserContext<'_> {
             Token::Word(w) => match w.keyword {
                 Keyword::DATABASE => self.parse_alter_database().map(Statement::AlterDatabase),
                 Keyword::TABLE => self.parse_alter_table().map(Statement::AlterTable),
+                #[cfg(feature = "enterprise")]
+                Keyword::TRIGGER => {
+                    self.parser.next_token();
+                    self.parse_alter_trigger()
+                }
                 _ => self.expected("DATABASE or TABLE after ALTER", self.parser.peek_token()),
             },
             unexpected => self.unsupported(unexpected.to_string()),
@@ -124,8 +133,7 @@ impl ParserContext<'_> {
                                 .expect_keyword(Keyword::COLUMN)
                                 .context(error::SyntaxSnafu)?;
                             let name = Self::canonicalize_identifier(
-                                Self::parse_identifier(&mut self.parser)
-                                    .context(error::SyntaxSnafu)?,
+                                self.parser.parse_identifier().context(error::SyntaxSnafu)?,
                             );
                             AlterTableOperation::DropColumn { name }
                         }
@@ -199,15 +207,52 @@ impl ParserContext<'_> {
         }
     }
 
+    fn parse_alter_table_drop_default(
+        &mut self,
+        column_name: Ident,
+    ) -> Result<AlterTableOperation> {
+        let drop_default = DropDefaultsOperation(column_name);
+        if self.parser.consume_token(&Token::Comma) {
+            let mut columns = self
+                .parser
+                .parse_comma_separated(parse_alter_column_drop_default)
+                .context(error::SyntaxSnafu)?;
+            columns.insert(0, drop_default);
+            Ok(AlterTableOperation::DropDefaults { columns })
+        } else {
+            Ok(AlterTableOperation::DropDefaults {
+                columns: vec![drop_default],
+            })
+        }
+    }
+
+    fn parse_alter_table_set_default(&mut self, column_name: Ident) -> Result<AlterTableOperation> {
+        let default_constraint = self.parser.parse_expr().context(error::SyntaxSnafu)?;
+        let set_default = SetDefaultsOperation {
+            column_name,
+            default_constraint,
+        };
+        if self.parser.consume_token(&Token::Comma) {
+            let mut defaults = self
+                .parser
+                .parse_comma_separated(parse_alter_column_set_default)
+                .context(error::SyntaxSnafu)?;
+            defaults.insert(0, set_default);
+            Ok(AlterTableOperation::SetDefaults { defaults })
+        } else {
+            Ok(AlterTableOperation::SetDefaults {
+                defaults: vec![set_default],
+            })
+        }
+    }
+
     fn parse_alter_table_modify(&mut self) -> Result<AlterTableOperation> {
         let _ = self.parser.next_token();
         self.parser
             .expect_keyword(Keyword::COLUMN)
             .context(error::SyntaxSnafu)?;
         let column_name = Self::canonicalize_identifier(
-            self.parser
-                .parse_identifier(false)
-                .context(error::SyntaxSnafu)?,
+            self.parser.parse_identifier().context(error::SyntaxSnafu)?,
         );
 
         match self.parser.peek_token().token {
@@ -219,7 +264,23 @@ impl ParserContext<'_> {
                 } else if w.keyword == Keyword::SET {
                     // consume the current token.
                     self.parser.next_token();
-                    self.parse_alter_column_set_index(column_name)
+                    if let Token::Word(w) = self.parser.peek_token().token
+                        && matches!(w.keyword, Keyword::DEFAULT)
+                    {
+                        self.parser
+                            .expect_keyword(Keyword::DEFAULT)
+                            .context(error::SyntaxSnafu)?;
+                        self.parse_alter_table_set_default(column_name)
+                    } else {
+                        self.parse_alter_column_set_index(column_name)
+                    }
+                } else if w.keyword == Keyword::DROP {
+                    // consume the current token.
+                    self.parser.next_token();
+                    self.parser
+                        .expect_keyword(Keyword::DEFAULT)
+                        .context(error::SyntaxSnafu)?;
+                    self.parse_alter_table_drop_default(column_name)
                 } else {
                     let data_type = self.parser.parse_data_type().context(error::SyntaxSnafu)?;
                     Ok(AlterTableOperation::ModifyColumnType {
@@ -240,7 +301,7 @@ impl ParserContext<'_> {
         column_name: Ident,
     ) -> Result<AlterTableOperation> {
         match self.parser.next_token() {
-            TokenWithLocation {
+            TokenWithSpan {
                 token: Token::Word(w),
                 ..
             } if w.keyword == Keyword::FULLTEXT => {
@@ -252,7 +313,7 @@ impl ParserContext<'_> {
                 })
             }
 
-            TokenWithLocation {
+            TokenWithSpan {
                 token: Token::Word(w),
                 ..
             } if w.value.eq_ignore_ascii_case(INVERTED) => {
@@ -264,7 +325,7 @@ impl ParserContext<'_> {
                 })
             }
 
-            TokenWithLocation {
+            TokenWithSpan {
                 token: Token::Word(w),
                 ..
             } if w.value.eq_ignore_ascii_case("SKIPPING") => {
@@ -288,7 +349,7 @@ impl ParserContext<'_> {
 
     fn parse_alter_column_set_index(&mut self, column_name: Ident) -> Result<AlterTableOperation> {
         match self.parser.next_token() {
-            TokenWithLocation {
+            TokenWithSpan {
                 token: Token::Word(w),
                 ..
             } if w.keyword == Keyword::FULLTEXT => {
@@ -298,7 +359,7 @@ impl ParserContext<'_> {
                 self.parse_alter_column_fulltext(column_name)
             }
 
-            TokenWithLocation {
+            TokenWithSpan {
                 token: Token::Word(w),
                 ..
             } if w.value.eq_ignore_ascii_case(INVERTED) => {
@@ -310,7 +371,7 @@ impl ParserContext<'_> {
                 })
             }
 
-            TokenWithLocation {
+            TokenWithSpan {
                 token: Token::Word(w),
                 ..
             } if w.value.eq_ignore_ascii_case("SKIPPING") => {
@@ -319,9 +380,9 @@ impl ParserContext<'_> {
                     .context(error::SyntaxSnafu)?;
                 self.parse_alter_column_skipping(column_name)
             }
-            _ => self.expected(
+            t => self.expected(
                 format!("{:?} OR INVERTED OR SKIPPING INDEX", Keyword::FULLTEXT).as_str(),
-                self.parser.peek_token(),
+                t,
             ),
         }
     }
@@ -388,19 +449,66 @@ impl ParserContext<'_> {
     }
 }
 
+fn parse_alter_column_drop_default(
+    parser: &mut Parser,
+) -> std::result::Result<DropDefaultsOperation, ParserError> {
+    parser.expect_keywords(&[Keyword::MODIFY, Keyword::COLUMN])?;
+    let column_name = ParserContext::canonicalize_identifier(parser.parse_identifier()?);
+    let t = parser.next_token();
+    match t.token {
+        Token::Word(w) if w.keyword == Keyword::DROP => {
+            parser.expect_keyword(Keyword::DEFAULT)?;
+            Ok(DropDefaultsOperation(column_name))
+        }
+        _ => Err(ParserError::ParserError(format!(
+            "Unexpected keyword, expect DROP, got: `{t}`"
+        ))),
+    }
+}
+
+fn parse_alter_column_set_default(
+    parser: &mut Parser,
+) -> std::result::Result<SetDefaultsOperation, ParserError> {
+    parser.expect_keywords(&[Keyword::MODIFY, Keyword::COLUMN])?;
+    let column_name = ParserContext::canonicalize_identifier(parser.parse_identifier()?);
+    let t = parser.next_token();
+    match t.token {
+        Token::Word(w) if w.keyword == Keyword::SET => {
+            parser.expect_keyword(Keyword::DEFAULT)?;
+            if let Ok(default_constraint) = parser.parse_expr() {
+                Ok(SetDefaultsOperation {
+                    column_name,
+                    default_constraint,
+                })
+            } else {
+                Err(ParserError::ParserError(format!(
+                    "Invalid default value after SET DEFAULT, got: `{}`",
+                    parser.peek_token()
+                )))
+            }
+        }
+        _ => Err(ParserError::ParserError(format!(
+            "Unexpected keyword, expect SET, got: `{t}`"
+        ))),
+    }
+}
+
 /// Parses a string literal and an optional string literal value.
 fn parse_string_options(parser: &mut Parser) -> std::result::Result<(String, String), ParserError> {
     let name = parser.parse_literal_string()?;
     parser.expect_token(&Token::Eq)?;
     let value = if parser.parse_keyword(Keyword::NULL) {
         "".to_string()
-    } else if let Ok(v) = parser.parse_literal_string() {
-        v
     } else {
-        return Err(ParserError::ParserError(format!(
-            "Unexpected option value for alter table statements, expect string literal or NULL, got: `{}`",
-            parser.next_token()
-        )));
+        let next_token = parser.peek_token();
+        if let Token::Number(number_as_string, _) = next_token.token {
+            parser.advance_token();
+            number_as_string
+        } else {
+            parser.parse_literal_string().map_err(|_|{
+                ParserError::ParserError(format!("Unexpected option value for alter table statements, expect string literal, numeric literal or NULL, got: `{}`", next_token))
+            })?
+        }
     };
     Ok((name, value))
 }
@@ -416,8 +524,7 @@ fn parse_add_columns(parser: &mut Parser) -> std::result::Result<AddColumn, Pars
     } else if let Token::Word(word) = parser.peek_token().token {
         if word.value.eq_ignore_ascii_case("AFTER") {
             let _ = parser.next_token();
-            let name =
-                ParserContext::canonicalize_identifier(ParserContext::parse_identifier(parser)?);
+            let name = ParserContext::canonicalize_identifier(parser.parse_identifier()?);
             Some(AddColumnLocation::After {
                 column_name: name.value,
             })
@@ -444,7 +551,7 @@ mod tests {
     use std::assert_matches::assert_matches;
 
     use common_error::ext::ErrorExt;
-    use datatypes::schema::{FulltextAnalyzer, FulltextOptions};
+    use datatypes::schema::{FulltextAnalyzer, FulltextBackend, FulltextOptions};
     use sqlparser::ast::{ColumnDef, ColumnOption, ColumnOptionDef, DataType};
 
     use super::*;
@@ -810,7 +917,7 @@ mod tests {
                         target_type,
                     } => {
                         assert_eq!("a", column_name.value);
-                        assert_eq!(DataType::Text, *target_type);
+                        assert_eq!(DataType::MediumText, *target_type);
                     }
                     _ => unreachable!(),
                 }
@@ -958,7 +1065,7 @@ mod tests {
 
     #[test]
     fn test_parse_alter_column_fulltext() {
-        let sql = "ALTER TABLE test_table MODIFY COLUMN a SET FULLTEXT INDEX WITH(analyzer='English',case_sensitive='false')";
+        let sql = "ALTER TABLE test_table MODIFY COLUMN a SET FULLTEXT INDEX WITH(analyzer='English',case_sensitive='false',backend='bloom',granularity=1000,false_positive_rate=0.01)";
         let mut result =
             ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
                 .unwrap();
@@ -981,11 +1088,14 @@ mod tests {
                     } => {
                         assert_eq!("a", column_name.value);
                         assert_eq!(
-                            FulltextOptions {
-                                enable: true,
-                                analyzer: FulltextAnalyzer::English,
-                                case_sensitive: false
-                            },
+                            FulltextOptions::new_unchecked(
+                                true,
+                                FulltextAnalyzer::English,
+                                false,
+                                FulltextBackend::Bloom,
+                                1000,
+                                0.01,
+                            ),
                             *options
                         );
                     }
@@ -1011,10 +1121,7 @@ mod tests {
                     alter_operation,
                     &AlterTableOperation::UnsetIndex {
                         options: UnsetIndexOperation::Fulltext {
-                            column_name: Ident {
-                                value: "a".to_string(),
-                                quote_style: None
-                            }
+                            column_name: Ident::new("a"),
                         }
                     }
                 );
@@ -1078,10 +1185,7 @@ mod tests {
                     alter_operation,
                     &AlterTableOperation::UnsetIndex {
                         options: UnsetIndexOperation::Inverted {
-                            column_name: Ident {
-                                value: "a".to_string(),
-                                quote_style: None
-                            }
+                            column_name: Ident::new("a"),
                         }
                     }
                 );
@@ -1096,5 +1200,146 @@ mod tests {
             ParseOptions::default(),
         )
         .unwrap_err();
+    }
+
+    #[test]
+    fn test_parse_alter_with_numeric_value() {
+        for sql in [
+            "ALTER TABLE test SET 'compaction.twcs.trigger_file_num'=8;",
+            "ALTER TABLE test SET 'compaction.twcs.trigger_file_num'='8';",
+        ] {
+            let mut result = ParserContext::create_with_dialect(
+                sql,
+                &GreptimeDbDialect {},
+                ParseOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(1, result.len());
+
+            let statement = result.remove(0);
+            assert_matches!(statement, Statement::AlterTable { .. });
+            match statement {
+                Statement::AlterTable(alter_table) => {
+                    let alter_operation = alter_table.alter_operation();
+                    assert_matches!(alter_operation, AlterTableOperation::SetTableOptions { .. });
+                    match alter_operation {
+                        AlterTableOperation::SetTableOptions { options } => {
+                            assert_eq!(options.len(), 1);
+                            assert_eq!(options[0].key, "compaction.twcs.trigger_file_num");
+                            assert_eq!(options[0].value, "8");
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_alter_drop_default() {
+        let columns = vec![vec!["a"], vec!["a", "b", "c"]];
+        for col in columns {
+            let sql = col
+                .iter()
+                .map(|x| format!("MODIFY COLUMN {x} DROP DEFAULT"))
+                .collect::<Vec<String>>()
+                .join(",");
+            let sql = format!("ALTER TABLE test_table {sql}");
+            let mut result = ParserContext::create_with_dialect(
+                &sql,
+                &GreptimeDbDialect {},
+                ParseOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(1, result.len());
+            let statement = result.remove(0);
+            assert_matches!(statement, Statement::AlterTable { .. });
+            match statement {
+                Statement::AlterTable(alter_table) => {
+                    assert_eq!("test_table", alter_table.table_name().0[0].value);
+                    let alter_operation = alter_table.alter_operation();
+                    match alter_operation {
+                        AlterTableOperation::DropDefaults { columns } => {
+                            assert_eq!(col.len(), columns.len());
+                            for i in 0..columns.len() {
+                                assert_eq!(col[i], columns[i].0.value);
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_alter_set_default() {
+        let columns = vec![vec!["a"], vec!["a", "b"], vec!["a", "b", "c"]];
+        for col in columns {
+            let sql = col
+                .iter()
+                .map(|x| format!("MODIFY COLUMN {x} SET DEFAULT 100"))
+                .collect::<Vec<String>>()
+                .join(",");
+            let sql = format!("ALTER TABLE test_table {sql}");
+            let mut result = ParserContext::create_with_dialect(
+                &sql,
+                &GreptimeDbDialect {},
+                ParseOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(1, result.len());
+            let statement = result.remove(0);
+            assert_matches!(statement, Statement::AlterTable { .. });
+            match statement {
+                Statement::AlterTable(alter_table) => {
+                    assert_eq!("test_table", alter_table.table_name().0[0].value);
+                    let alter_operation = alter_table.alter_operation();
+                    match alter_operation {
+                        AlterTableOperation::SetDefaults { defaults } => {
+                            assert_eq!(col.len(), defaults.len());
+                            for i in 0..defaults.len() {
+                                assert_eq!(col[i], defaults[i].column_name.to_string());
+                                assert_eq!(
+                                    "100".to_string(),
+                                    defaults[i].default_constraint.to_string()
+                                );
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_alter_set_default_invalid() {
+        let sql = "ALTER TABLE test_table MODIFY COLUMN a SET 100;";
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap_err();
+        let err = result.output_msg();
+        assert_eq!(err, "Invalid SQL syntax: sql parser error: Expected FULLTEXT OR INVERTED OR SKIPPING INDEX, found: 100");
+
+        let sql = "ALTER TABLE test_table MODIFY COLUMN a SET DEFAULT 100, b SET DEFAULT 200";
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap_err();
+        let err = result.output_msg();
+        assert_eq!(err, "Invalid SQL syntax: sql parser error: Expected: MODIFY, found: b at Line: 1, Column: 57");
+
+        let sql = "ALTER TABLE test_table MODIFY COLUMN a SET DEFAULT 100, MODIFY COLUMN b DROP DEFAULT 200";
+        let result =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap_err();
+        let err = result.output_msg();
+        assert_eq!(
+            err,
+            "Invalid SQL syntax: sql parser error: Unexpected keyword, expect SET, got: `DROP`"
+        );
     }
 }

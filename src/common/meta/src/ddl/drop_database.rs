@@ -21,7 +21,7 @@ use std::any::Any;
 use std::fmt::Debug;
 
 use common_error::ext::BoxedError;
-use common_procedure::error::{Error as ProcedureError, ExternalSnafu, FromJsonSnafu, ToJsonSnafu};
+use common_procedure::error::{ExternalSnafu, FromJsonSnafu, ToJsonSnafu};
 use common_procedure::{
     Context as ProcedureContext, LockKey, Procedure, Result as ProcedureResult, Status,
 };
@@ -31,11 +31,11 @@ use snafu::ResultExt;
 use tonic::async_trait;
 
 use self::start::DropDatabaseStart;
+use crate::ddl::utils::map_to_procedure_error;
 use crate::ddl::DdlContext;
 use crate::error::Result;
 use crate::key::table_name::TableNameValue;
 use crate::lock_key::{CatalogLock, SchemaLock};
-use crate::ClusterId;
 
 pub struct DropDatabaseProcedure {
     /// The context of procedure runtime.
@@ -54,7 +54,6 @@ pub(crate) enum DropTableTarget {
 
 /// Context of [DropDatabaseProcedure] execution.
 pub(crate) struct DropDatabaseContext {
-    cluster_id: ClusterId,
     catalog: String,
     schema: String,
     drop_if_exists: bool,
@@ -87,7 +86,6 @@ impl DropDatabaseProcedure {
         Self {
             runtime_context: context,
             context: DropDatabaseContext {
-                cluster_id: 0,
                 catalog,
                 schema,
                 drop_if_exists,
@@ -108,7 +106,6 @@ impl DropDatabaseProcedure {
         Ok(Self {
             runtime_context,
             context: DropDatabaseContext {
-                cluster_id: 0,
                 catalog,
                 schema,
                 drop_if_exists,
@@ -134,7 +131,9 @@ impl Procedure for DropDatabaseProcedure {
         self.state
             .recover(&self.runtime_context)
             .map_err(BoxedError::new)
-            .context(ExternalSnafu)
+            .context(ExternalSnafu {
+                clean_poisons: false,
+            })
     }
 
     async fn execute(&mut self, _ctx: &ProcedureContext) -> ProcedureResult<Status> {
@@ -143,13 +142,7 @@ impl Procedure for DropDatabaseProcedure {
         let (next, status) = state
             .next(&self.runtime_context, &mut self.context)
             .await
-            .map_err(|e| {
-                if e.is_retry_later() {
-                    ProcedureError::retry_later(e)
-                } else {
-                    ProcedureError::external(e)
-                }
-            })?;
+            .map_err(map_to_procedure_error)?;
 
         *state = next;
         Ok(status)

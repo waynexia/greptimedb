@@ -22,15 +22,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use catalog::CatalogManagerRef;
 use common_base::Plugins;
-use common_function::function::FunctionRef;
+use common_function::function_factory::ScalarFunctionFactory;
 use common_function::function_registry::FUNCTION_REGISTRY;
 use common_function::handlers::{
     FlowServiceHandlerRef, ProcedureServiceHandlerRef, TableMutationHandlerRef,
 };
-use common_function::scalars::aggregate::AggregateFunctionMetaRef;
-use common_query::prelude::ScalarUdf;
 use common_query::Output;
-use datafusion_expr::LogicalPlan;
+use datafusion_expr::{AggregateUDF, LogicalPlan};
 use datatypes::schema::Schema;
 pub use default_serializer::{DefaultPlanDecoder, DefaultSerializer};
 use session::context::QueryContextRef;
@@ -39,6 +37,7 @@ use table::TableRef;
 use crate::dataframe::DataFrame;
 use crate::datafusion::DatafusionQueryEngine;
 use crate::error::Result;
+use crate::options::QueryOptions;
 use crate::planner::LogicalPlanner;
 pub use crate::query_engine::context::QueryEngineContext;
 pub use crate::query_engine::state::QueryEngineState;
@@ -75,18 +74,15 @@ pub trait QueryEngine: Send + Sync {
     /// Execute the given [`LogicalPlan`].
     async fn execute(&self, plan: LogicalPlan, query_ctx: QueryContextRef) -> Result<Output>;
 
-    /// Register a [`ScalarUdf`].
-    fn register_udf(&self, udf: ScalarUdf);
-
     /// Register an aggregate function.
     ///
     /// # Panics
     /// Will panic if the function with same name is already registered.
-    fn register_aggregate_function(&self, func: AggregateFunctionMetaRef);
+    fn register_aggregate_function(&self, func: AggregateUDF);
 
-    /// Register a SQL function.
+    /// Register a scalar function.
     /// Will override if the function with same name is already registered.
-    fn register_function(&self, func: FunctionRef);
+    fn register_scalar_function(&self, func: ScalarFunctionFactory);
 
     /// Create a DataFrame from a table.
     fn read_table(&self, table: TableRef) -> Result<DataFrame>;
@@ -110,6 +106,7 @@ impl QueryEngineFactory {
         procedure_service_handler: Option<ProcedureServiceHandlerRef>,
         flow_service_handler: Option<FlowServiceHandlerRef>,
         with_dist_planner: bool,
+        options: QueryOptions,
     ) -> Self {
         Self::new_with_plugins(
             catalog_manager,
@@ -119,9 +116,11 @@ impl QueryEngineFactory {
             flow_service_handler,
             with_dist_planner,
             Default::default(),
+            options,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_plugins(
         catalog_manager: CatalogManagerRef,
         region_query_handler: Option<RegionQueryHandlerRef>,
@@ -130,6 +129,7 @@ impl QueryEngineFactory {
         flow_service_handler: Option<FlowServiceHandlerRef>,
         with_dist_planner: bool,
         plugins: Plugins,
+        options: QueryOptions,
     ) -> Self {
         let state = Arc::new(QueryEngineState::new(
             catalog_manager,
@@ -139,6 +139,7 @@ impl QueryEngineFactory {
             flow_service_handler,
             with_dist_planner,
             plugins.clone(),
+            options,
         ));
         let query_engine = Arc::new(DatafusionQueryEngine::new(state, plugins));
         register_functions(&query_engine);
@@ -152,8 +153,8 @@ impl QueryEngineFactory {
 
 /// Register all functions implemented by GreptimeDB
 fn register_functions(query_engine: &Arc<DatafusionQueryEngine>) {
-    for func in FUNCTION_REGISTRY.functions() {
-        query_engine.register_function(func);
+    for func in FUNCTION_REGISTRY.scalar_functions() {
+        query_engine.register_scalar_function(func);
     }
 
     for accumulator in FUNCTION_REGISTRY.aggregate_functions() {
@@ -170,7 +171,15 @@ mod tests {
     #[test]
     fn test_query_engine_factory() {
         let catalog_list = catalog::memory::new_memory_catalog_manager().unwrap();
-        let factory = QueryEngineFactory::new(catalog_list, None, None, None, None, false);
+        let factory = QueryEngineFactory::new(
+            catalog_list,
+            None,
+            None,
+            None,
+            None,
+            false,
+            QueryOptions::default(),
+        );
 
         let engine = factory.query_engine();
 

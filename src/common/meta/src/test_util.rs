@@ -15,11 +15,13 @@
 use std::sync::Arc;
 
 use api::region::RegionResponse;
-use api::v1::flow::{FlowRequest, FlowResponse};
+use api::v1::flow::{DirtyWindowRequest, FlowRequest, FlowResponse};
 use api::v1::region::{InsertRequests, RegionRequest};
 pub use common_base::AffectedRows;
 use common_query::request::QueryRequest;
 use common_recordbatch::SendableRecordBatchStream;
+use common_wal::config::kafka::common::{KafkaConnectionConfig, KafkaTopicConfig};
+use common_wal::config::kafka::MetasrvKafkaConfig;
 
 use crate::cache_invalidator::DummyCacheInvalidator;
 use crate::ddl::flow_meta::FlowMetadataAllocator;
@@ -35,9 +37,11 @@ use crate::node_manager::{
 };
 use crate::peer::{Peer, PeerLookupService};
 use crate::region_keeper::MemoryRegionKeeper;
+use crate::region_registry::LeaderRegionRegistry;
 use crate::sequence::SequenceBuilder;
-use crate::wal_options_allocator::WalOptionsAllocator;
-use crate::{ClusterId, DatanodeId, FlownodeId};
+use crate::wal_options_allocator::topic_pool::KafkaTopicPool;
+use crate::wal_options_allocator::{build_kafka_topic_creator, WalOptionsAllocator};
+use crate::{DatanodeId, FlownodeId};
 
 #[async_trait::async_trait]
 pub trait MockDatanodeHandler: Sync + Send + Clone {
@@ -60,6 +64,14 @@ pub trait MockFlownodeHandler: Sync + Send + Clone {
         &self,
         _peer: &Peer,
         _requests: InsertRequests,
+    ) -> Result<FlowResponse> {
+        unimplemented!()
+    }
+
+    async fn handle_mark_window_dirty(
+        &self,
+        _peer: &Peer,
+        _req: DirtyWindowRequest,
     ) -> Result<FlowResponse> {
         unimplemented!()
     }
@@ -130,6 +142,10 @@ impl<T: MockFlownodeHandler> Flownode for MockNode<T> {
     async fn handle_inserts(&self, requests: InsertRequests) -> Result<FlowResponse> {
         self.handler.handle_inserts(&self.peer, requests).await
     }
+
+    async fn handle_mark_window_dirty(&self, req: DirtyWindowRequest) -> Result<FlowResponse> {
+        self.handler.handle_mark_window_dirty(&self.peer, req).await
+    }
 }
 
 #[async_trait::async_trait]
@@ -177,6 +193,7 @@ pub fn new_ddl_context_with_kv_backend(
         node_manager,
         cache_invalidator: Arc::new(DummyCacheInvalidator),
         memory_region_keeper: Arc::new(MemoryRegionKeeper::new()),
+        leader_region_registry: Arc::new(LeaderRegionRegistry::default()),
         table_metadata_allocator,
         table_metadata_manager,
         flow_metadata_allocator,
@@ -189,11 +206,78 @@ pub struct NoopPeerLookupService;
 
 #[async_trait::async_trait]
 impl PeerLookupService for NoopPeerLookupService {
-    async fn datanode(&self, _cluster_id: ClusterId, id: DatanodeId) -> Result<Option<Peer>> {
+    async fn datanode(&self, id: DatanodeId) -> Result<Option<Peer>> {
         Ok(Some(Peer::empty(id)))
     }
 
-    async fn flownode(&self, _cluster_id: ClusterId, id: FlownodeId) -> Result<Option<Peer>> {
+    async fn flownode(&self, id: FlownodeId) -> Result<Option<Peer>> {
         Ok(Some(Peer::empty(id)))
     }
+
+    async fn active_frontends(&self) -> Result<Vec<Peer>> {
+        Ok(vec![])
+    }
+}
+
+/// Create a kafka topic pool for testing.
+pub async fn test_kafka_topic_pool(
+    broker_endpoints: Vec<String>,
+    num_topics: usize,
+    auto_create_topics: bool,
+    topic_name_prefix: Option<&str>,
+) -> KafkaTopicPool {
+    let mut config = MetasrvKafkaConfig {
+        connection: KafkaConnectionConfig {
+            broker_endpoints,
+            ..Default::default()
+        },
+        kafka_topic: KafkaTopicConfig {
+            num_topics,
+
+            ..Default::default()
+        },
+        auto_create_topics,
+        ..Default::default()
+    };
+    if let Some(prefix) = topic_name_prefix {
+        config.kafka_topic.topic_name_prefix = prefix.to_string();
+    }
+    let kv_backend = Arc::new(MemoryKvBackend::new()) as KvBackendRef;
+    let topic_creator = build_kafka_topic_creator(&config.connection, &config.kafka_topic)
+        .await
+        .unwrap();
+
+    KafkaTopicPool::new(&config, kv_backend, topic_creator)
+}
+
+#[macro_export]
+/// Skip the test if the environment variable `GT_KAFKA_ENDPOINTS` is not set.
+///
+/// The format of the environment variable is:
+/// ```
+/// GT_KAFKA_ENDPOINTS=localhost:9092,localhost:9093
+/// ```
+macro_rules! maybe_skip_postgres_integration_test {
+    () => {
+        if std::env::var("GT_POSTGRES_ENDPOINTS").is_err() {
+            common_telemetry::warn!("The endpoints is empty, skipping the test");
+            return;
+        }
+    };
+}
+
+#[macro_export]
+/// Skip the test if the environment variable `GT_KAFKA_ENDPOINTS` is not set.
+///
+/// The format of the environment variable is:
+/// ```
+/// GT_KAFKA_ENDPOINTS=localhost:9092,localhost:9093
+/// ```
+macro_rules! maybe_skip_mysql_integration_test {
+    () => {
+        if std::env::var("GT_MYSQL_ENDPOINTS").is_err() {
+            common_telemetry::warn!("The endpoints is empty, skipping the test");
+            return;
+        }
+    };
 }

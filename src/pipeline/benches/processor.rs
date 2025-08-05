@@ -12,29 +12,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
+
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use pipeline::{json_to_intermediate_state, parse, Content, GreptimeTransformer, Pipeline, Result};
-use serde_json::{Deserializer, Value};
+use pipeline::error::Result;
+use pipeline::{parse, setup_pipeline, Content, Pipeline, PipelineContext, SchemaInfo};
+use serde_json::Deserializer;
+use vrl::value::Value as VrlValue;
 
 fn processor_mut(
-    pipeline: &Pipeline<GreptimeTransformer>,
-    input_values: Vec<Value>,
+    pipeline: Arc<Pipeline>,
+    pipeline_ctx: &PipelineContext<'_>,
+    schema_info: &mut SchemaInfo,
+    input_values: Vec<VrlValue>,
 ) -> Result<Vec<greptime_proto::v1::Row>> {
     let mut result = Vec::with_capacity(input_values.len());
 
     for v in input_values {
-        let mut payload = json_to_intermediate_state(v).unwrap();
         let r = pipeline
-            .exec_mut(&mut payload)?
+            .exec_mut(v, pipeline_ctx, schema_info)?
             .into_transformed()
             .expect("expect transformed result ");
-        result.push(r);
+        result.push(r.0);
     }
 
     Ok(result)
 }
 
-fn prepare_pipeline() -> Pipeline<GreptimeTransformer> {
+fn prepare_pipeline() -> Pipeline {
     let pipeline_yaml = r#"
 ---
 description: Pipeline for Akamai DataStream2 Log
@@ -230,15 +235,29 @@ transform:
 fn criterion_benchmark(c: &mut Criterion) {
     let input_value_str = include_str!("./data.log");
     let input_value = Deserializer::from_str(input_value_str)
-        .into_iter::<serde_json::Value>()
+        .into_iter::<VrlValue>()
         .collect::<std::result::Result<Vec<_>, _>>()
         .unwrap();
     let pipeline = prepare_pipeline();
+
+    let (pipeline, mut schema_info, pipeline_def, pipeline_param) = setup_pipeline!(pipeline);
+    let pipeline_ctx = PipelineContext::new(
+        &pipeline_def,
+        &pipeline_param,
+        session::context::Channel::Unknown,
+    );
+
     let mut group = c.benchmark_group("pipeline");
     group.sample_size(50);
     group.bench_function("processor mut", |b| {
         b.iter(|| {
-            processor_mut(black_box(&pipeline), black_box(input_value.clone())).unwrap();
+            processor_mut(
+                black_box(pipeline.clone()),
+                black_box(&pipeline_ctx),
+                black_box(&mut schema_info),
+                black_box(input_value.clone()),
+            )
+            .unwrap();
         })
     });
     group.finish();

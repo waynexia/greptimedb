@@ -27,6 +27,7 @@ use tokio::time::Instant;
 
 use crate::error::{self, Result};
 use crate::region::opener::{replay_memtable, RegionOpener};
+use crate::region::MitoRegion;
 use crate::worker::RegionWorkerLoop;
 
 impl<S: LogStore> RegionWorkerLoop<S> {
@@ -45,34 +46,19 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         }
         // Note: Currently, We protect the split brain by ensuring the mutable table is empty.
         // It's expensive to execute catch-up requests without `set_writable=true` multiple times.
-        let is_mutable_empty = region.version().memtables.mutable.is_empty();
+        let version = region.version();
+        let is_empty_memtable = version.memtables.is_empty();
 
         // Utilizes the short circuit evaluation.
-        let region = if !is_mutable_empty || region.manifest_ctx.has_update().await? {
-            let manifest_version = region.manifest_ctx.manifest_version().await;
-            let flushed_entry_id = region.version_control.current().last_entry_id;
-            info!("Reopening the region: {region_id}, empty mutable: {is_mutable_empty}, manifest version: {manifest_version}, flushed entry id: {flushed_entry_id}");
-            let reopened_region = Arc::new(
-                RegionOpener::new(
-                    region_id,
-                    region.region_dir(),
-                    self.memtable_builder_provider.clone(),
-                    self.object_store_manager.clone(),
-                    self.purge_scheduler.clone(),
-                    self.puffin_manager_factory.clone(),
-                    self.intermediate_manager.clone(),
-                    self.time_provider.clone(),
-                )
-                .cache(Some(self.cache_manager.clone()))
-                .options(region.version().options.clone())?
-                .skip_wal_replay(true)
-                .open(&self.config, &self.wal)
-                .await?,
-            );
-            debug_assert!(!reopened_region.is_writable());
-            self.regions.insert_region(reopened_region.clone());
-
-            reopened_region
+        let region = if !is_empty_memtable || region.manifest_ctx.has_update().await? {
+            if !is_empty_memtable {
+                warn!("Region {} memtables is not empty, which should not happen, manifest version: {}, last entry id: {}",
+                    region.region_id,
+                    region.manifest_ctx.manifest_version().await,
+                    region.version_control.current().last_entry_id
+                );
+            }
+            self.reopen_region(&region).await?
         } else {
             region
         };
@@ -104,16 +90,36 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                 ensure!(
                     // The replayed last entry id may be greater than the `expected_last_entry_id`.
                     last_entry_id >= expected_last_entry_id,
-                    error::UnexpectedReplaySnafu {
-                        region_id,
-                        expected_last_entry_id,
-                        replayed_last_entry_id: last_entry_id,
+                    error::UnexpectedSnafu {
+                        reason: format!(
+                            "failed to set region {} to writable, it was expected to replayed to {}, but actually replayed to {}", 
+                            region_id, expected_last_entry_id, last_entry_id,
+                        ),
                     }
                 )
             }
         } else {
-            warn!("Skips to replay memtable for region: {}", region.region_id);
-            let flushed_entry_id = region.version_control.current().last_entry_id;
+            let version = region.version_control.current();
+            let mut flushed_entry_id = version.last_entry_id;
+
+            let high_watermark = self
+                .wal
+                .store()
+                .high_watermark(&region.provider)
+                .unwrap_or_default();
+            warn!(
+                "Skips to replay memtable for region: {}, flushed entry id: {}, high watermark: {}",
+                region.region_id, flushed_entry_id, high_watermark
+            );
+
+            if high_watermark > flushed_entry_id {
+                warn!(
+                    "Found high watermark is greater than flushed entry id, using high watermark as flushed entry id, region: {}, high watermark: {}, flushed entry id: {}",
+                    region_id, high_watermark, flushed_entry_id
+                );
+                flushed_entry_id = high_watermark;
+                region.version_control.set_entry_id(flushed_entry_id);
+            }
             let on_region_opened = self.wal.on_region_opened();
             on_region_opened(region_id, flushed_entry_id, &region.provider).await?;
         }
@@ -123,5 +129,38 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         }
 
         Ok(0)
+    }
+
+    /// Reopens a region.
+    pub(crate) async fn reopen_region(
+        &mut self,
+        region: &Arc<MitoRegion>,
+    ) -> Result<Arc<MitoRegion>> {
+        let region_id = region.region_id;
+        let manifest_version = region.manifest_ctx.manifest_version().await;
+        let flushed_entry_id = region.version_control.current().last_entry_id;
+        info!("Reopening the region: {region_id}, manifest version: {manifest_version}, flushed entry id: {flushed_entry_id}");
+        let reopened_region = Arc::new(
+            RegionOpener::new(
+                region_id,
+                region.table_dir(),
+                region.access_layer.path_type(),
+                self.memtable_builder_provider.clone(),
+                self.object_store_manager.clone(),
+                self.purge_scheduler.clone(),
+                self.puffin_manager_factory.clone(),
+                self.intermediate_manager.clone(),
+                self.time_provider.clone(),
+            )
+            .cache(Some(self.cache_manager.clone()))
+            .options(region.version().options.clone())?
+            .skip_wal_replay(true)
+            .open(&self.config, &self.wal)
+            .await?,
+        );
+        debug_assert!(!reopened_region.is_writable());
+        self.regions.insert_region(reopened_region.clone());
+
+        Ok(reopened_region)
     }
 }

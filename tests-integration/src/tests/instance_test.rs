@@ -128,9 +128,9 @@ PARTITION ON COLUMNS (n) (
 |       | )                                   |
 |       | PARTITION ON COLUMNS ("n") (        |
 |       |   n < 1,                            |
-|       |   n >= 100,                         |
 |       |   n >= 1 AND n < 10,                |
-|       |   n >= 10 AND n < 100               |
+|       |   n >= 10 AND n < 100,              |
+|       |   n >= 100                          |
 |       | )                                   |
 |       | ENGINE=mito                         |
 |       |                                     |
@@ -1458,9 +1458,12 @@ async fn test_insert_with_default_value_for_type(instance: Arc<Instance>, type_n
     .data;
     assert!(matches!(output, OutputData::AffectedRows(1)));
 
-    let output = execute_sql(&instance, &format!("select host, cpu from {table_name}"))
-        .await
-        .data;
+    let output = execute_sql(
+        &instance,
+        &format!("select host, cpu from {table_name} order by host"),
+    )
+    .await
+    .data;
     let expected = "\
 +-------+-----+
 | host  | cpu |
@@ -1757,7 +1760,12 @@ async fn test_execute_copy_from_orc_with_cast(instance: Arc<dyn MockInstance>) {
 
     assert!(matches!(output, OutputData::AffectedRows(5)));
 
-    let output = execute_sql(&instance, "select * from demo;").await.data;
+    let output = execute_sql(
+        &instance,
+        "select * from demo order by timestamp_simple asc;",
+    )
+    .await
+    .data;
     let expected = r#"+-------------------------------+----------------------------+-------------------------+----------------------------+
 | bigint_direct                 | bigint_neg_direct          | bigint_other            | timestamp_simple           |
 +-------------------------------+----------------------------+-------------------------+----------------------------+
@@ -1967,10 +1975,10 @@ async fn test_information_schema_dot_columns(instance: Arc<dyn MockInstance>) {
 | greptime      | public             | numbers    | number                   | int unsigned    | TAG           |
 | greptime      | information_schema | tables     | auto_increment           | bigint unsigned | FIELD         |
 | greptime      | information_schema | tables     | avg_row_length           | bigint unsigned | FIELD         |
-| greptime      | information_schema | tables     | check_time               | datetime        | FIELD         |
+| greptime      | information_schema | tables     | check_time               | timestamp(6)    | FIELD         |
 | greptime      | information_schema | tables     | checksum                 | bigint unsigned | FIELD         |
 | greptime      | information_schema | tables     | create_options           | string          | FIELD         |
-| greptime      | information_schema | tables     | create_time              | datetime        | FIELD         |
+| greptime      | information_schema | tables     | create_time              | timestamp(6)    | FIELD         |
 | greptime      | information_schema | tables     | data_free                | bigint unsigned | FIELD         |
 | greptime      | information_schema | tables     | data_length              | bigint unsigned | FIELD         |
 | greptime      | information_schema | tables     | engine                   | string          | FIELD         |
@@ -1987,7 +1995,7 @@ async fn test_information_schema_dot_columns(instance: Arc<dyn MockInstance>) {
 | greptime      | information_schema | tables     | table_schema             | string          | FIELD         |
 | greptime      | information_schema | tables     | table_type               | string          | FIELD         |
 | greptime      | information_schema | tables     | temporary                | string          | FIELD         |
-| greptime      | information_schema | tables     | update_time              | datetime        | FIELD         |
+| greptime      | information_schema | tables     | update_time              | timestamp(6)    | FIELD         |
 | greptime      | information_schema | tables     | version                  | bigint unsigned | FIELD         |
 +---------------+--------------------+------------+--------------------------+-----------------+---------------+";
 
@@ -2025,10 +2033,10 @@ async fn test_information_schema_dot_columns(instance: Arc<dyn MockInstance>) {
 | another_catalog | information_schema | columns       | table_schema             | string          | FIELD         |
 | another_catalog | information_schema | tables        | auto_increment           | bigint unsigned | FIELD         |
 | another_catalog | information_schema | tables        | avg_row_length           | bigint unsigned | FIELD         |
-| another_catalog | information_schema | tables        | check_time               | datetime        | FIELD         |
+| another_catalog | information_schema | tables        | check_time               | timestamp(6)    | FIELD         |
 | another_catalog | information_schema | tables        | checksum                 | bigint unsigned | FIELD         |
 | another_catalog | information_schema | tables        | create_options           | string          | FIELD         |
-| another_catalog | information_schema | tables        | create_time              | datetime        | FIELD         |
+| another_catalog | information_schema | tables        | create_time              | timestamp(6)    | FIELD         |
 | another_catalog | information_schema | tables        | data_free                | bigint unsigned | FIELD         |
 | another_catalog | information_schema | tables        | data_length              | bigint unsigned | FIELD         |
 | another_catalog | information_schema | tables        | engine                   | string          | FIELD         |
@@ -2045,7 +2053,7 @@ async fn test_information_schema_dot_columns(instance: Arc<dyn MockInstance>) {
 | another_catalog | information_schema | tables        | table_schema             | string          | FIELD         |
 | another_catalog | information_schema | tables        | table_type               | string          | FIELD         |
 | another_catalog | information_schema | tables        | temporary                | string          | FIELD         |
-| another_catalog | information_schema | tables        | update_time              | datetime        | FIELD         |
+| another_catalog | information_schema | tables        | update_time              | timestamp(6)    | FIELD         |
 | another_catalog | information_schema | tables        | version                  | bigint unsigned | FIELD         |
 +-----------------+--------------------+---------------+--------------------------+-----------------+---------------+";
 
@@ -2190,4 +2198,118 @@ WITH(
             assert!(matches!(output, OutputData::AffectedRows(0)));
         }
     }
+}
+
+#[apply(both_instances_cases)]
+async fn test_copy_parquet_map_to_json(instance: Arc<dyn MockInstance>) {
+    let instance = instance.frontend();
+
+    let output = execute_sql(
+        &instance,
+        r#"CREATE TABLE map_json_test (
+            "id" INT,
+            map_data JSON,
+            ts TIMESTAMP TIME INDEX
+        );"#,
+    )
+    .await
+    .data;
+    assert!(matches!(output, OutputData::AffectedRows(0)));
+
+    let parquet_path = find_testing_resource("/tests/data/parquet/map_to_json.parquet");
+    let output = execute_sql(
+        &instance,
+        &format!(
+            "COPY map_json_test FROM '{}' WITH (FORMAT='parquet');",
+            parquet_path
+        ),
+    )
+    .await
+    .data;
+    assert!(matches!(output, OutputData::AffectedRows(5)));
+
+    let output = execute_sql(
+        &instance,
+        "SELECT \"id\", json_to_string(map_data), map_data FROM map_json_test ORDER BY \"id\";",
+    )
+    .await
+    .data;
+
+    let expected_jsons = [
+        r#"{"a":"1","b":"2","c":"hello"}"#,
+        r#"{"x":"42","y":"test"}"#,
+        r#"{}"#,
+        r#"{"single":"value"}"#,
+        r#"{"complex":"structure","nested":"data"}"#,
+    ];
+
+    let binary: Vec<String> = expected_jsons
+        .iter()
+        .map(|json_str| {
+            let jsonb_value = jsonb::parse_value(json_str.as_bytes()).unwrap();
+            hex::encode(jsonb_value.to_vec())
+        })
+        .collect();
+
+    let expected = format!(
+        r#"+----+-----------------------------------------+----------------------------------------------------------------------------------------------+
+| id | json_to_string(map_json_test.map_data)  | map_data                                                                                     |
++----+-----------------------------------------+----------------------------------------------------------------------------------------------+
+| 1  | {{"a":"1","b":"2","c":"hello"}}           | {:<92} |
+| 2  | {{"x":"42","y":"test"}}                   | {:<92} |
+| 3  | {{}}                                      | {:<92} |
+| 4  | {{"single":"value"}}                      | {:<92} |
+| 5  | {{"complex":"structure","nested":"data"}} | {:<92} |
++----+-----------------------------------------+----------------------------------------------------------------------------------------------+"#,
+        binary[0], binary[1], binary[2], binary[3], binary[4],
+    );
+
+    check_output_stream(output, &expected).await;
+}
+
+#[apply(both_instances_cases)]
+async fn test_copy_parquet_map_to_binary(instance: Arc<dyn MockInstance>) {
+    let instance = instance.frontend();
+
+    let output = execute_sql(
+        &instance,
+        r#"CREATE TABLE map_bin_test (
+            "id" INT,
+            map_data BINARY,
+            ts TIMESTAMP TIME INDEX
+        );"#,
+    )
+    .await
+    .data;
+    assert!(matches!(output, OutputData::AffectedRows(0)));
+
+    let parquet_path = find_testing_resource("/tests/data/parquet/map_to_json.parquet");
+    let output = execute_sql(
+        &instance,
+        &format!(
+            "COPY map_bin_test FROM '{}' WITH (FORMAT='parquet');",
+            parquet_path
+        ),
+    )
+    .await
+    .data;
+    assert!(matches!(output, OutputData::AffectedRows(5)));
+
+    let output = execute_sql(
+        &instance,
+        "SELECT \"id\", CAST(map_data AS STRING) FROM map_bin_test ORDER BY \"id\";",
+    )
+    .await
+    .data;
+
+    let expected = r#"+----+-----------------------------------------+
+| id | map_bin_test.map_data                   |
++----+-----------------------------------------+
+| 1  | {"a":"1","b":"2","c":"hello"}           |
+| 2  | {"x":"42","y":"test"}                   |
+| 3  | {}                                      |
+| 4  | {"single":"value"}                      |
+| 5  | {"complex":"structure","nested":"data"} |
++----+-----------------------------------------+"#;
+    check_output_stream(output, expected).await;
 }

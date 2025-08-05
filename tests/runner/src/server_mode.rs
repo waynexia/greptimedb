@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashSet;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 
 use serde::Serialize;
 use tinytemplate::TinyTemplate;
@@ -21,6 +23,31 @@ use crate::env::{Env, GreptimeDBContext};
 use crate::{util, ServerAddr};
 
 const DEFAULT_LOG_LEVEL: &str = "--log-level=debug,hyper=warn,tower=warn,datafusion=warn,reqwest=warn,sqlparser=warn,h2=info,opendal=info";
+
+static USED_PORTS: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+
+fn get_used_ports() -> &'static Mutex<HashSet<u16>> {
+    USED_PORTS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn get_unique_random_port() -> u16 {
+    // Tricky loop 100 times to find an unused port instead of infinite loop.
+    const MAX_ATTEMPTS: usize = 100;
+
+    for _ in 0..MAX_ATTEMPTS {
+        let p = util::get_random_port();
+        let mut used = get_used_ports().lock().unwrap();
+        if !used.contains(&p) {
+            used.insert(p);
+            return p;
+        }
+    }
+
+    panic!(
+        "Failed to find an unused port after {} attempts",
+        MAX_ATTEMPTS
+    );
+}
 
 #[derive(Clone)]
 pub enum ServerMode {
@@ -81,10 +108,10 @@ struct ConfigContext {
 
 impl ServerMode {
     pub fn random_standalone() -> Self {
-        let http_port = util::get_random_port();
-        let rpc_port = util::get_random_port();
-        let mysql_port = util::get_random_port();
-        let postgres_port = util::get_random_port();
+        let http_port = get_unique_random_port();
+        let rpc_port = get_unique_random_port();
+        let mysql_port = get_unique_random_port();
+        let postgres_port = get_unique_random_port();
 
         ServerMode::Standalone {
             http_addr: format!("127.0.0.1:{http_port}"),
@@ -95,10 +122,10 @@ impl ServerMode {
     }
 
     pub fn random_frontend(metasrv_port: u16) -> Self {
-        let http_port = util::get_random_port();
-        let rpc_port = util::get_random_port();
-        let mysql_port = util::get_random_port();
-        let postgres_port = util::get_random_port();
+        let http_port = get_unique_random_port();
+        let rpc_port = get_unique_random_port();
+        let mysql_port = get_unique_random_port();
+        let postgres_port = get_unique_random_port();
 
         ServerMode::Frontend {
             http_addr: format!("127.0.0.1:{http_port}"),
@@ -110,8 +137,8 @@ impl ServerMode {
     }
 
     pub fn random_metasrv() -> Self {
-        let bind_port = util::get_random_port();
-        let http_port = util::get_random_port();
+        let bind_port = get_unique_random_port();
+        let http_port = get_unique_random_port();
 
         ServerMode::Metasrv {
             rpc_bind_addr: format!("127.0.0.1:{bind_port}"),
@@ -121,8 +148,8 @@ impl ServerMode {
     }
 
     pub fn random_datanode(metasrv_port: u16, node_id: u32) -> Self {
-        let rpc_port = util::get_random_port();
-        let http_port = util::get_random_port();
+        let rpc_port = get_unique_random_port();
+        let http_port = get_unique_random_port();
 
         ServerMode::Datanode {
             rpc_bind_addr: format!("127.0.0.1:{rpc_port}"),
@@ -134,8 +161,8 @@ impl ServerMode {
     }
 
     pub fn random_flownode(metasrv_port: u16, node_id: u32) -> Self {
-        let rpc_port = util::get_random_port();
-        let http_port = util::get_random_port();
+        let rpc_port = get_unique_random_port();
+        let http_port = get_unique_random_port();
 
         ServerMode::Flownode {
             rpc_bind_addr: format!("127.0.0.1:{rpc_port}"),
@@ -308,7 +335,7 @@ impl ServerMode {
             .display()
             .to_string();
         println!(
-            "Generating id {}, {} config file in {conf_file}, full content:\n{rendered}",
+            "Generating id {}, {} config file in {conf_file}",
             id,
             self.name()
         );
@@ -362,6 +389,9 @@ impl ServerMode {
                     format!("--metasrv-addrs={metasrv_addr}"),
                     format!("--http-addr={http_addr}"),
                     format!("--rpc-addr={rpc_bind_addr}"),
+                    // since sqlness run on local, bind addr is the same as server addr
+                    // this is needed so that `cluster_info`'s server addr column can be correct
+                    format!("--rpc-server-addr={rpc_bind_addr}"),
                     format!("--mysql-addr={mysql_addr}"),
                     format!("--postgres-addr={postgres_addr}"),
                     format!(
@@ -409,6 +439,18 @@ impl ServerMode {
                     );
                     args.extend(vec!["--backend".to_string(), "postgres-store".to_string()]);
                     args.extend(vec!["--store-addrs".to_string(), pg_server_addr]);
+                } else if db_ctx.store_config().setup_mysql {
+                    let client_ports = db_ctx
+                        .store_config()
+                        .store_addrs
+                        .iter()
+                        .map(|s| s.split(':').nth(1).unwrap().parse::<u16>().unwrap())
+                        .collect::<Vec<_>>();
+                    let client_port = client_ports.first().unwrap_or(&3306);
+                    let mysql_server_addr =
+                        format!("mysql://greptimedb:admin@127.0.0.1:{}/mysql", client_port);
+                    args.extend(vec!["--backend".to_string(), "mysql-store".to_string()]);
+                    args.extend(vec!["--store-addrs".to_string(), mysql_server_addr]);
                 } else if db_ctx.store_config().store_addrs.is_empty() {
                     args.extend(vec!["--backend".to_string(), "memory-store".to_string()])
                 }

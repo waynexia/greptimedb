@@ -33,9 +33,21 @@ use crate::rpc::store::{
 };
 use crate::rpc::KeyValue;
 
-mod postgres;
+const RDS_STORE_OP_BATCH_GET: &str = "batch_get";
+const RDS_STORE_OP_BATCH_PUT: &str = "batch_put";
+const RDS_STORE_OP_RANGE_QUERY: &str = "range_query";
+const RDS_STORE_OP_RANGE_DELETE: &str = "range_delete";
+const RDS_STORE_OP_BATCH_DELETE: &str = "batch_delete";
 
+#[cfg(feature = "pg_kvbackend")]
+pub mod postgres;
+#[cfg(feature = "pg_kvbackend")]
 pub use postgres::PgStore;
+
+#[cfg(feature = "mysql_kvbackend")]
+mod mysql;
+#[cfg(feature = "mysql_kvbackend")]
+pub use mysql::MySqlStore;
 
 const RDS_STORE_TXN_RETRY_COUNT: usize = 3;
 
@@ -103,6 +115,14 @@ impl<T: Executor> ExecutorImpl<'_, T> {
         match self {
             Self::Default(executor) => executor.query(query, params).await,
             Self::Txn(executor) => executor.query(query, params).await,
+        }
+    }
+
+    #[allow(dead_code)] // Used in #[cfg(feature = "mysql_kvbackend")]
+    async fn execute(&mut self, query: &str, params: &Vec<&Vec<u8>>) -> Result<()> {
+        match self {
+            Self::Default(executor) => executor.execute(query, params).await,
+            Self::Txn(executor) => executor.execute(query, params).await,
         }
     }
 
@@ -545,4 +565,22 @@ fn check_txn_ops(txn_ops: &[TxnOp]) -> Result<bool> {
         )
     });
     Ok(same)
+}
+
+#[macro_export]
+macro_rules! record_rds_sql_execute_elapsed {
+    ($result:expr, $label_store:expr,$label_op:expr,$label_type:expr) => {{
+        let timer = std::time::Instant::now();
+        $result
+            .inspect(|_| {
+                $crate::metrics::RDS_SQL_EXECUTE_ELAPSED
+                    .with_label_values(&[$label_store, "success", $label_op, $label_type])
+                    .observe(timer.elapsed().as_millis_f64())
+            })
+            .inspect_err(|_| {
+                $crate::metrics::RDS_SQL_EXECUTE_ELAPSED
+                    .with_label_values(&[$label_store, "error", $label_op, $label_type])
+                    .observe(timer.elapsed().as_millis_f64());
+            })
+    }};
 }

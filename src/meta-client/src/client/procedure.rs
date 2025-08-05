@@ -20,11 +20,11 @@ use api::v1::meta::procedure_service_client::ProcedureServiceClient;
 use api::v1::meta::{
     DdlTaskRequest, DdlTaskResponse, MigrateRegionRequest, MigrateRegionResponse,
     ProcedureDetailRequest, ProcedureDetailResponse, ProcedureId, ProcedureStateResponse,
-    QueryProcedureRequest, ResponseHeader, Role,
+    QueryProcedureRequest, ReconcileRequest, ReconcileResponse, ResponseHeader, Role,
 };
 use common_grpc::channel_manager::ChannelManager;
 use common_telemetry::tracing_context::TracingContext;
-use common_telemetry::{info, warn};
+use common_telemetry::{error, info, warn};
 use snafu::{ensure, ResultExt};
 use tokio::sync::RwLock;
 use tonic::codec::CompressionEncoding;
@@ -32,7 +32,7 @@ use tonic::transport::Channel;
 use tonic::Status;
 
 use crate::client::ask_leader::AskLeader;
-use crate::client::{util, Id};
+use crate::client::{util, Id, LeaderProviderRef};
 use crate::error;
 use crate::error::Result;
 
@@ -47,7 +47,7 @@ impl Client {
             id,
             role,
             channel_manager,
-            ask_leader: None,
+            leader_provider: None,
             max_retry,
         }));
 
@@ -60,7 +60,13 @@ impl Client {
         A: AsRef<[U]>,
     {
         let mut inner = self.inner.write().await;
-        inner.start(urls).await
+        inner.start(urls)
+    }
+
+    /// Start the client with a [LeaderProvider].
+    pub(crate) async fn start_with(&self, leader_provider: LeaderProviderRef) -> Result<()> {
+        let mut inner = self.inner.write().await;
+        inner.start_with(leader_provider)
     }
 
     pub async fn submit_ddl_task(&self, req: DdlTaskRequest) -> Result<DdlTaskResponse> {
@@ -92,6 +98,12 @@ impl Client {
             .await
     }
 
+    /// Reconcile the procedure state.
+    pub async fn reconcile(&self, request: ReconcileRequest) -> Result<ReconcileResponse> {
+        let inner = self.inner.read().await;
+        inner.reconcile(request).await
+    }
+
     pub async fn list_procedures(&self) -> Result<ProcedureDetailResponse> {
         let inner = self.inner.read().await;
         inner.list_procedures().await
@@ -103,37 +115,40 @@ struct Inner {
     id: Id,
     role: Role,
     channel_manager: ChannelManager,
-    ask_leader: Option<AskLeader>,
+    leader_provider: Option<LeaderProviderRef>,
     max_retry: usize,
 }
 
 impl Inner {
-    async fn start<U, A>(&mut self, urls: A) -> Result<()>
-    where
-        U: AsRef<str>,
-        A: AsRef<[U]>,
-    {
+    fn start_with(&mut self, leader_provider: LeaderProviderRef) -> Result<()> {
         ensure!(
             !self.is_started(),
             error::IllegalGrpcClientStateSnafu {
                 err_msg: "DDL client already started",
             }
         );
+        self.leader_provider = Some(leader_provider);
+        Ok(())
+    }
 
+    fn start<U, A>(&mut self, urls: A) -> Result<()>
+    where
+        U: AsRef<str>,
+        A: AsRef<[U]>,
+    {
         let peers = urls
             .as_ref()
             .iter()
             .map(|url| url.as_ref().to_string())
             .collect::<Vec<_>>();
-        self.ask_leader = Some(AskLeader::new(
+        let ask_leader = AskLeader::new(
             self.id,
             self.role,
             peers,
             self.channel_manager.clone(),
             self.max_retry,
-        ));
-
-        Ok(())
+        );
+        self.start_with(Arc::new(ask_leader))
     }
 
     fn make_client(&self, addr: impl AsRef<str>) -> Result<ProcedureServiceClient<Channel>> {
@@ -150,18 +165,7 @@ impl Inner {
 
     #[inline]
     fn is_started(&self) -> bool {
-        self.ask_leader.is_some()
-    }
-
-    fn ask_leader(&self) -> Result<&AskLeader> {
-        ensure!(
-            self.is_started(),
-            error::IllegalGrpcClientStateSnafu {
-                err_msg: "DDL client not start"
-            }
-        );
-
-        Ok(self.ask_leader.as_ref().unwrap())
+        self.leader_provider.is_some()
     }
 
     async fn with_retry<T, F, R, H>(&self, task: &str, body_fn: F, get_header: H) -> Result<T>
@@ -170,19 +174,25 @@ impl Inner {
         F: Fn(ProcedureServiceClient<Channel>) -> R,
         H: Fn(&T) -> &Option<ResponseHeader>,
     {
-        let ask_leader = self.ask_leader()?;
+        let Some(leader_provider) = self.leader_provider.as_ref() else {
+            return error::IllegalGrpcClientStateSnafu {
+                err_msg: "not started",
+            }
+            .fail();
+        };
+
         let mut times = 0;
         let mut last_error = None;
 
         while times < self.max_retry {
-            if let Some(leader) = &ask_leader.get_leader() {
+            if let Some(leader) = &leader_provider.leader() {
                 let client = self.make_client(leader)?;
                 match body_fn(client).await {
                     Ok(res) => {
                         if util::is_not_leader(get_header(&res)) {
                             last_error = Some(format!("{leader} is not a leader"));
                             warn!("Failed to {task} to {leader}, not a leader");
-                            let leader = ask_leader.ask_leader().await?;
+                            let leader = leader_provider.ask_leader().await?;
                             info!("DDL client updated to new leader addr: {leader}");
                             times += 1;
                             continue;
@@ -194,16 +204,17 @@ impl Inner {
                         if util::is_unreachable(&status) {
                             last_error = Some(status.to_string());
                             warn!("Failed to {task} to {leader}, source: {status}");
-                            let leader = ask_leader.ask_leader().await?;
+                            let leader = leader_provider.ask_leader().await?;
                             info!("Procedure client updated to new leader addr: {leader}");
                             times += 1;
                             continue;
                         } else {
+                            error!("An error occurred in gRPC, status: {status}");
                             return Err(error::Error::from(status));
                         }
                     }
                 }
-            } else if let Err(err) = ask_leader.ask_leader().await {
+            } else if let Err(err) = leader_provider.ask_leader().await {
                 return Err(err);
             }
         }
@@ -244,6 +255,26 @@ impl Inner {
                 async move { client.migrate(req).await.map(|res| res.into_inner()) }
             },
             |resp: &MigrateRegionResponse| &resp.header,
+        )
+        .await
+    }
+
+    async fn reconcile(&self, request: ReconcileRequest) -> Result<ReconcileResponse> {
+        let mut req = request;
+        req.set_header(
+            self.id,
+            self.role,
+            TracingContext::from_current_span().to_w3c(),
+        );
+
+        self.with_retry(
+            "reconcile",
+            move |mut client| {
+                let req = req.clone();
+
+                async move { client.reconcile(req).await.map(|res| res.into_inner()) }
+            },
+            |resp: &ReconcileResponse| &resp.header,
         )
         .await
     }

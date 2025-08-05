@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 
 use datafusion_expr::expr::InList;
 use index::inverted_index::search::predicate::{InListPredicate, Predicate};
@@ -34,7 +34,7 @@ impl InvertedIndexApplierBuilder<'_> {
         };
 
         let mut predicate = InListPredicate {
-            list: HashSet::with_capacity(inlist.list.len()),
+            list: BTreeSet::new(),
         };
         for lit in &inlist.list {
             let Some(lit) = Self::nonnull_lit(lit) else {
@@ -53,6 +53,10 @@ impl InvertedIndexApplierBuilder<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
+    use store_api::region_request::PathType;
+
     use super::*;
     use crate::error::Error;
     use crate::sst::index::inverted_index::applier::builder::tests::{
@@ -67,6 +71,7 @@ mod tests {
         let metadata = test_region_metadata();
         let mut builder = InvertedIndexApplierBuilder::new(
             "test".to_string(),
+            PathType::Bare,
             test_object_store(),
             &metadata,
             HashSet::from_iter([1, 2, 3]),
@@ -86,7 +91,7 @@ mod tests {
         assert_eq!(
             predicates[0],
             Predicate::InList(InListPredicate {
-                list: HashSet::from_iter([encoded_string("foo"), encoded_string("bar")])
+                list: BTreeSet::from_iter([encoded_string("foo"), encoded_string("bar")])
             })
         );
     }
@@ -98,6 +103,7 @@ mod tests {
         let metadata = test_region_metadata();
         let mut builder = InvertedIndexApplierBuilder::new(
             "test".to_string(),
+            PathType::Bare,
             test_object_store(),
             &metadata,
             HashSet::from_iter([1, 2, 3]),
@@ -121,6 +127,7 @@ mod tests {
         let metadata = test_region_metadata();
         let mut builder = InvertedIndexApplierBuilder::new(
             "test".to_string(),
+            PathType::Bare,
             test_object_store(),
             &metadata,
             HashSet::from_iter([1, 2, 3]),
@@ -140,7 +147,7 @@ mod tests {
         assert_eq!(
             predicates[0],
             Predicate::InList(InListPredicate {
-                list: HashSet::from_iter([encoded_string("foo"), encoded_string("bar")])
+                list: BTreeSet::from_iter([encoded_string("foo"), encoded_string("bar")])
             })
         );
     }
@@ -152,6 +159,7 @@ mod tests {
         let metadata = test_region_metadata();
         let mut builder = InvertedIndexApplierBuilder::new(
             "test".to_string(),
+            PathType::Bare,
             test_object_store(),
             &metadata,
             HashSet::from_iter([1, 2, 3]),
@@ -165,7 +173,7 @@ mod tests {
         };
 
         let res = builder.collect_inlist(&in_list);
-        assert!(matches!(res, Err(Error::FieldTypeMismatch { .. })));
+        assert!(matches!(res, Err(Error::Encode { .. })));
         assert!(builder.output.is_empty());
     }
 
@@ -177,6 +185,7 @@ mod tests {
         let metadata = test_region_metadata();
         let mut builder = InvertedIndexApplierBuilder::new(
             "test".to_string(),
+            PathType::Bare,
             test_object_store(),
             &metadata,
             HashSet::from_iter([1, 2, 3]),

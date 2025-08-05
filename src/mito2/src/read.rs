@@ -18,12 +18,15 @@ pub mod compat;
 pub mod dedup;
 pub mod last_row;
 pub mod merge;
+pub mod plain_batch;
 pub mod projection;
 pub(crate) mod prune;
-pub(crate) mod range;
-pub(crate) mod scan_region;
-pub(crate) mod scan_util;
+pub mod range;
+pub mod scan_region;
+pub mod scan_util;
 pub(crate) mod seq_scan;
+pub mod series_scan;
+pub mod stream;
 pub(crate) mod unordered_scan;
 
 use std::collections::{HashMap, HashSet};
@@ -39,26 +42,28 @@ use datatypes::arrow::array::{Array, ArrayRef, UInt64Array};
 use datatypes::arrow::compute::SortOptions;
 use datatypes::arrow::row::{RowConverter, SortField};
 use datatypes::prelude::{ConcreteDataType, DataType, ScalarVector};
+use datatypes::scalars::ScalarVectorBuilder;
 use datatypes::types::TimestampType;
 use datatypes::value::{Value, ValueRef};
 use datatypes::vectors::{
     BooleanVector, Helper, TimestampMicrosecondVector, TimestampMillisecondVector,
-    TimestampNanosecondVector, TimestampSecondVector, UInt32Vector, UInt64Vector, UInt8Vector,
-    Vector, VectorRef,
+    TimestampMillisecondVectorBuilder, TimestampNanosecondVector, TimestampSecondVector,
+    UInt32Vector, UInt64Vector, UInt64VectorBuilder, UInt8Vector, UInt8VectorBuilder, Vector,
+    VectorRef,
 };
 use futures::stream::BoxStream;
 use futures::TryStreamExt;
+use mito_codec::row_converter::{CompositeValues, PrimaryKeyCodec};
 use snafu::{ensure, OptionExt, ResultExt};
 use store_api::metadata::RegionMetadata;
 use store_api::storage::{ColumnId, SequenceNumber};
 
 use crate::error::{
-    ComputeArrowSnafu, ComputeVectorSnafu, ConvertVectorSnafu, InvalidBatchSnafu, Result,
+    ComputeArrowSnafu, ComputeVectorSnafu, ConvertVectorSnafu, DecodeSnafu, InvalidBatchSnafu,
+    Result,
 };
 use crate::memtable::BoxedBatchIterator;
-use crate::metrics::{READ_BATCHES_RETURN, READ_ROWS_RETURN, READ_STAGE_ELAPSED};
 use crate::read::prune::PruneReader;
-use crate::row_converter::{CompositeValues, PrimaryKeyCodec};
 
 /// Storage internal representation of a batch of rows for a primary key (time series).
 ///
@@ -157,6 +162,19 @@ impl Batch {
         // All vectors have the same length. We use the length of sequences vector
         // since it has static type.
         self.sequences.len()
+    }
+
+    /// Create an empty [`Batch`].
+    pub(crate) fn empty() -> Self {
+        Self {
+            primary_key: vec![],
+            pk_values: None,
+            timestamps: Arc::new(TimestampMillisecondVectorBuilder::with_capacity(0).finish()),
+            sequences: Arc::new(UInt64VectorBuilder::with_capacity(0).finish()),
+            op_types: Arc::new(UInt8VectorBuilder::with_capacity(0).finish()),
+            fields: vec![],
+            fields_idx: None,
+        }
     }
 
     /// Returns true if the number of rows in the batch is 0.
@@ -383,8 +401,13 @@ impl Batch {
         ];
         let rows = converter.convert_columns(&columns).unwrap();
         let mut to_sort: Vec<_> = rows.iter().enumerate().collect();
-        to_sort.sort_unstable_by(|left, right| left.1.cmp(&right.1));
 
+        let was_sorted = to_sort.is_sorted_by_key(|x| x.1);
+        if !was_sorted {
+            to_sort.sort_unstable_by_key(|x| x.1);
+        }
+
+        let num_rows = to_sort.len();
         if dedup {
             // Dedup by timestamps.
             to_sort.dedup_by(|left, right| {
@@ -395,7 +418,11 @@ impl Batch {
                 left_key[..TIMESTAMP_KEY_LEN] == right_key[..TIMESTAMP_KEY_LEN]
             });
         }
+        let no_dedup = to_sort.len() == num_rows;
 
+        if was_sorted && no_dedup {
+            return Ok(());
+        }
         let indices = UInt32Vector::from_iter_values(to_sort.iter().map(|v| v.0 as u32));
         self.take_in_place(&indices)
     }
@@ -602,7 +629,7 @@ impl Batch {
         column_id: ColumnId,
     ) -> Result<Option<&Value>> {
         if self.pk_values.is_none() {
-            self.pk_values = Some(codec.decode(&self.primary_key)?);
+            self.pk_values = Some(codec.decode(&self.primary_key).context(DecodeSnafu)?);
         }
 
         let pk_values = self.pk_values.as_ref().unwrap();
@@ -953,7 +980,7 @@ pub enum Source {
 
 impl Source {
     /// Returns next [Batch] from this data source.
-    pub(crate) async fn next_batch(&mut self) -> Result<Option<Batch>> {
+    pub async fn next_batch(&mut self) -> Result<Option<Batch>> {
         match self {
             Source::Reader(reader) => reader.next_batch().await,
             Source::Iter(iter) => iter.next().transpose(),
@@ -991,23 +1018,17 @@ impl<T: BatchReader + ?Sized> BatchReader for Box<T> {
     }
 }
 
-/// Metrics for scanners.
+/// Local metrics for scanners.
 #[derive(Debug, Default)]
 pub(crate) struct ScannerMetrics {
     /// Duration to prepare the scan task.
     prepare_scan_cost: Duration,
-    /// Duration to build file ranges.
-    build_parts_cost: Duration,
     /// Duration to build the (merge) reader.
     build_reader_cost: Duration,
     /// Duration to scan data.
     scan_cost: Duration,
-    /// Duration to convert batches.
-    convert_cost: Duration,
     /// Duration while waiting for `yield`.
     yield_cost: Duration,
-    /// Duration of the scan.
-    total_cost: Duration,
     /// Number of batches returned.
     num_batches: usize,
     /// Number of rows returned.
@@ -1018,58 +1039,14 @@ pub(crate) struct ScannerMetrics {
     num_file_ranges: usize,
 }
 
-impl ScannerMetrics {
-    /// Observes metrics.
-    fn observe_metrics(&self) {
-        READ_STAGE_ELAPSED
-            .with_label_values(&["prepare_scan"])
-            .observe(self.prepare_scan_cost.as_secs_f64());
-        READ_STAGE_ELAPSED
-            .with_label_values(&["build_parts"])
-            .observe(self.build_parts_cost.as_secs_f64());
-        READ_STAGE_ELAPSED
-            .with_label_values(&["build_reader"])
-            .observe(self.build_reader_cost.as_secs_f64());
-        READ_STAGE_ELAPSED
-            .with_label_values(&["convert_rb"])
-            .observe(self.convert_cost.as_secs_f64());
-        READ_STAGE_ELAPSED
-            .with_label_values(&["scan"])
-            .observe(self.scan_cost.as_secs_f64());
-        READ_STAGE_ELAPSED
-            .with_label_values(&["yield"])
-            .observe(self.yield_cost.as_secs_f64());
-        READ_STAGE_ELAPSED
-            .with_label_values(&["total"])
-            .observe(self.total_cost.as_secs_f64());
-        READ_ROWS_RETURN.observe(self.num_rows as f64);
-        READ_BATCHES_RETURN.observe(self.num_batches as f64);
-    }
-
-    /// Merges metrics from another [ScannerMetrics].
-    fn merge_from(&mut self, other: &ScannerMetrics) {
-        self.prepare_scan_cost += other.prepare_scan_cost;
-        self.build_parts_cost += other.build_parts_cost;
-        self.build_reader_cost += other.build_reader_cost;
-        self.scan_cost += other.scan_cost;
-        self.convert_cost += other.convert_cost;
-        self.yield_cost += other.yield_cost;
-        self.total_cost += other.total_cost;
-        self.num_batches += other.num_batches;
-        self.num_rows += other.num_rows;
-        self.num_mem_ranges += other.num_mem_ranges;
-        self.num_file_ranges += other.num_file_ranges;
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use mito_codec::row_converter::{self, build_primary_key_codec_with_fields};
     use store_api::codec::PrimaryKeyEncoding;
     use store_api::storage::consts::ReservedColumnId;
 
     use super::*;
     use crate::error::Error;
-    use crate::row_converter::{self, build_primary_key_codec_with_fields};
     use crate::test_util::new_batch_builder;
 
     fn new_batch(
@@ -1085,7 +1062,8 @@ mod tests {
 
     #[test]
     fn test_empty_batch() {
-        let batch = new_batch(&[], &[], &[], &[]);
+        let batch = Batch::empty();
+        assert!(batch.is_empty());
         assert_eq!(None, batch.first_timestamp());
         assert_eq!(None, batch.last_timestamp());
         assert_eq!(None, batch.first_sequence());

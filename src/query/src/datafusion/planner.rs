@@ -18,11 +18,7 @@ use std::sync::Arc;
 
 use arrow_schema::DataType;
 use catalog::table_source::DfTableSourceProvider;
-use common_function::aggr::{
-    HllState, UddSketchState, HLL_MERGE_NAME, HLL_NAME, UDDSKETCH_STATE_NAME,
-};
-use common_function::scalars::udf::create_udf;
-use common_query::logical_plan::create_aggregate_function;
+use common_function::function::FunctionContext;
 use datafusion::common::TableReference;
 use datafusion::datasource::cte_worktable::CteWorkTable;
 use datafusion::datasource::file_format::{format_as_file_type, FileFormatFactory};
@@ -42,7 +38,7 @@ use datafusion_sql::parser::Statement as DfStatement;
 use session::context::QueryContextRef;
 use snafu::{Location, ResultExt};
 
-use crate::error::{CatalogSnafu, DataFusionSnafu, Result};
+use crate::error::{CatalogSnafu, Result};
 use crate::query_engine::{DefaultPlanDecoder, QueryEngineState};
 
 pub struct DfContextProviderAdapter {
@@ -69,9 +65,7 @@ impl DfContextProviderAdapter {
         query_ctx: QueryContextRef,
     ) -> Result<Self> {
         let table_names = if let Some(df_stmt) = df_stmt {
-            session_state
-                .resolve_table_references(df_stmt)
-                .context(DataFusionSnafu)?
+            session_state.resolve_table_references(df_stmt)?
         } else {
             vec![]
         };
@@ -152,39 +146,21 @@ impl ContextProvider for DfContextProviderAdapter {
     }
 
     fn get_function_meta(&self, name: &str) -> Option<Arc<ScalarUDF>> {
-        self.engine_state.udf_function(name).map_or_else(
+        self.engine_state.scalar_function(name).map_or_else(
             || self.session_state.scalar_functions().get(name).cloned(),
             |func| {
-                Some(Arc::new(
-                    create_udf(
-                        func,
-                        self.query_ctx.clone(),
-                        self.engine_state.function_state(),
-                    )
-                    .into(),
-                ))
+                Some(Arc::new(func.provide(FunctionContext {
+                    query_ctx: self.query_ctx.clone(),
+                    state: self.engine_state.function_state(),
+                })))
             },
         )
     }
 
     fn get_aggregate_meta(&self, name: &str) -> Option<Arc<AggregateUDF>> {
-        if name == UDDSKETCH_STATE_NAME {
-            return Some(Arc::new(UddSketchState::udf_impl()));
-        }
-        if name == HLL_NAME {
-            return Some(Arc::new(HllState::state_udf_impl()));
-        }
-        if name == HLL_MERGE_NAME {
-            return Some(Arc::new(HllState::merge_udf_impl()));
-        }
-
-        self.engine_state.aggregate_function(name).map_or_else(
+        self.engine_state.aggr_function(name).map_or_else(
             || self.session_state.aggregate_functions().get(name).cloned(),
-            |func| {
-                Some(Arc::new(
-                    create_aggregate_function(func.name(), func.args_count(), func.create()).into(),
-                ))
-            },
+            |func| Some(Arc::new(func)),
         )
     }
 
@@ -215,13 +191,13 @@ impl ContextProvider for DfContextProviderAdapter {
     }
 
     fn udf_names(&self) -> Vec<String> {
-        let mut names = self.engine_state.udf_names();
+        let mut names = self.engine_state.scalar_names();
         names.extend(self.session_state.scalar_functions().keys().cloned());
         names
     }
 
     fn udaf_names(&self) -> Vec<String> {
-        let mut names = self.engine_state.udaf_names();
+        let mut names = self.engine_state.aggr_names();
         names.extend(self.session_state.aggregate_functions().keys().cloned());
         names
     }

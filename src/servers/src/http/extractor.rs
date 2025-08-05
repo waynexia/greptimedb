@@ -14,16 +14,22 @@
 
 use core::str;
 
+use ahash::HashSet;
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use axum::http::StatusCode;
 use http::HeaderMap;
-use pipeline::{GreptimePipelineParams, SelectInfo};
+use pipeline::{truthy, GreptimePipelineParams, SelectInfo};
 
 use crate::http::header::constants::{
     GREPTIME_LOG_EXTRACT_KEYS_HEADER_NAME, GREPTIME_LOG_PIPELINE_NAME_HEADER_NAME,
     GREPTIME_LOG_PIPELINE_VERSION_HEADER_NAME, GREPTIME_LOG_TABLE_NAME_HEADER_NAME,
-    GREPTIME_PIPELINE_PARAMS_HEADER, GREPTIME_TRACE_TABLE_NAME_HEADER_NAME,
+    GREPTIME_OTLP_METRIC_IGNORE_RESOURCE_ATTRS_HEADER_NAME,
+    GREPTIME_OTLP_METRIC_PROMOTE_ALL_RESOURCE_ATTRS_HEADER_NAME,
+    GREPTIME_OTLP_METRIC_PROMOTE_RESOURCE_ATTRS_HEADER_NAME,
+    GREPTIME_OTLP_METRIC_PROMOTE_SCOPE_ATTRS_HEADER_NAME, GREPTIME_PIPELINE_NAME_HEADER_NAME,
+    GREPTIME_PIPELINE_PARAMS_HEADER, GREPTIME_PIPELINE_VERSION_HEADER_NAME,
+    GREPTIME_TRACE_TABLE_NAME_HEADER_NAME,
 };
 
 /// Axum extractor for optional target log table name from HTTP header
@@ -38,7 +44,7 @@ where
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         let headers = &parts.headers;
-        string_value_from_header(headers, GREPTIME_LOG_TABLE_NAME_HEADER_NAME).map(LogTableName)
+        string_value_from_header(headers, &[GREPTIME_LOG_TABLE_NAME_HEADER_NAME]).map(LogTableName)
     }
 }
 
@@ -54,7 +60,8 @@ where
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         let headers = &parts.headers;
-        string_value_from_header(headers, GREPTIME_TRACE_TABLE_NAME_HEADER_NAME).map(TraceTableName)
+        string_value_from_header(headers, &[GREPTIME_TRACE_TABLE_NAME_HEADER_NAME])
+            .map(TraceTableName)
     }
 }
 
@@ -71,7 +78,7 @@ where
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         let select =
-            string_value_from_header(&parts.headers, GREPTIME_LOG_EXTRACT_KEYS_HEADER_NAME)?;
+            string_value_from_header(&parts.headers, &[GREPTIME_LOG_EXTRACT_KEYS_HEADER_NAME])?;
 
         match select {
             Some(name) => {
@@ -102,12 +109,22 @@ where
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         let headers = &parts.headers;
-        let pipeline_name =
-            string_value_from_header(headers, GREPTIME_LOG_PIPELINE_NAME_HEADER_NAME)?;
-        let pipeline_version =
-            string_value_from_header(headers, GREPTIME_LOG_PIPELINE_VERSION_HEADER_NAME)?;
+        let pipeline_name = string_value_from_header(
+            headers,
+            &[
+                GREPTIME_LOG_PIPELINE_NAME_HEADER_NAME,
+                GREPTIME_PIPELINE_NAME_HEADER_NAME,
+            ],
+        )?;
+        let pipeline_version = string_value_from_header(
+            headers,
+            &[
+                GREPTIME_LOG_PIPELINE_VERSION_HEADER_NAME,
+                GREPTIME_PIPELINE_VERSION_HEADER_NAME,
+            ],
+        )?;
         let pipeline_parameters =
-            string_value_from_header(headers, GREPTIME_PIPELINE_PARAMS_HEADER)?;
+            string_value_from_header(headers, &[GREPTIME_PIPELINE_PARAMS_HEADER])?;
 
         Ok(PipelineInfo {
             pipeline_name,
@@ -117,20 +134,77 @@ where
     }
 }
 
+/// Axum extractor for OTLP metric options from HTTP headers.
+pub struct OtlpMetricOptions {
+    /// Persist all resource attributes to the table
+    /// If false, persist selected attributes. See [`promote_resource_attrs`].
+    pub promote_all_resource_attrs: bool,
+
+    /// If `promote_all_resource_attrs` is true, then the list is an exclude list from `ignore_resource_attrs`.
+    /// If `promote_all_resource_attrs` is false, then this list is a include list from `promote_resource_attrs`.
+    pub resource_attrs: HashSet<String>,
+
+    /// Persist scope attributes to the table
+    /// If false, persist none
+    pub promote_scope_attrs: bool,
+}
+
+impl<S> FromRequestParts<S> for OtlpMetricOptions
+where
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, String);
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let headers = &parts.headers;
+        let promote_all_resource_attrs = string_value_from_header(
+            headers,
+            &[GREPTIME_OTLP_METRIC_PROMOTE_ALL_RESOURCE_ATTRS_HEADER_NAME],
+        )?
+        .map(truthy)
+        .unwrap_or(false);
+
+        let attr_header = if promote_all_resource_attrs {
+            [GREPTIME_OTLP_METRIC_IGNORE_RESOURCE_ATTRS_HEADER_NAME]
+        } else {
+            [GREPTIME_OTLP_METRIC_PROMOTE_RESOURCE_ATTRS_HEADER_NAME]
+        };
+
+        let resource_attrs = string_value_from_header(headers, &attr_header)?
+            .map(|s| s.split(';').map(|s| s.trim().to_string()).collect())
+            .unwrap_or_default();
+
+        let promote_scope_attrs = string_value_from_header(
+            headers,
+            &[GREPTIME_OTLP_METRIC_PROMOTE_SCOPE_ATTRS_HEADER_NAME],
+        )?
+        .map(truthy)
+        .unwrap_or(false);
+
+        Ok(OtlpMetricOptions {
+            promote_all_resource_attrs,
+            resource_attrs,
+            promote_scope_attrs,
+        })
+    }
+}
+
 #[inline]
 fn string_value_from_header(
     headers: &HeaderMap,
-    header_key: &str,
+    header_keys: &[&str],
 ) -> Result<Option<String>, (StatusCode, String)> {
-    headers
-        .get(header_key)
-        .map(|value| {
-            String::from_utf8(value.as_bytes().to_vec()).map_err(|_| {
+    for header_key in header_keys {
+        if let Some(value) = headers.get(*header_key) {
+            return Some(String::from_utf8(value.as_bytes().to_vec()).map_err(|_| {
                 (
                     StatusCode::BAD_REQUEST,
                     format!("`{}` header is not valid UTF-8 string type.", header_key),
                 )
-            })
-        })
-        .transpose()
+            }))
+            .transpose();
+        }
+    }
+
+    Ok(None)
 }

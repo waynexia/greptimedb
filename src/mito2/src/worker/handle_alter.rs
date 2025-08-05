@@ -18,7 +18,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use common_base::readable_size::ReadableSize;
-use common_telemetry::{debug, info};
+use common_telemetry::info;
+use common_telemetry::tracing::warn;
 use humantime_serde::re::humantime;
 use snafu::ResultExt;
 use store_api::metadata::{
@@ -29,9 +30,7 @@ use store_api::mito_engine_options;
 use store_api::region_request::{AlterKind, RegionAlterRequest, SetRegionOption};
 use store_api::storage::RegionId;
 
-use crate::error::{
-    InvalidMetadataSnafu, InvalidRegionRequestSchemaVersionSnafu, InvalidRegionRequestSnafu, Result,
-};
+use crate::error::{InvalidMetadataSnafu, InvalidRegionRequestSnafu, Result};
 use crate::flush::FlushReason;
 use crate::manifest::action::RegionChange;
 use crate::region::options::CompactionOptions::Twcs;
@@ -83,22 +82,6 @@ impl<S> RegionWorkerLoop<S> {
             _ => {}
         }
 
-        if version.metadata.schema_version != request.schema_version {
-            // This is possible if we retry the request.
-            debug!(
-                "Ignores alter request, region id:{}, region schema version {} is not equal to request schema version {}",
-                region_id, version.metadata.schema_version, request.schema_version
-            );
-            // Returns an error.
-            sender.send(
-                InvalidRegionRequestSchemaVersionSnafu {
-                    expect: version.metadata.schema_version,
-                    actual: request.schema_version,
-                }
-                .fail(),
-            );
-            return;
-        }
         // Validate request.
         if let Err(e) = request.validate(&version.metadata) {
             // Invalid request.
@@ -108,7 +91,7 @@ impl<S> RegionWorkerLoop<S> {
 
         // Checks whether we need to alter the region.
         if !request.need_alter(&version.metadata) {
-            debug!(
+            warn!(
                 "Ignores alter request as it alters nothing, region_id: {}, request: {:?}",
                 region_id, request
             );
@@ -219,7 +202,6 @@ fn metadata_after_alteration(
         .context(InvalidRegionRequestSnafu)?
         .bump_version();
     let new_meta = builder.build().context(InvalidMetadataSnafu)?;
-    assert_eq!(request.schema_version + 1, new_meta.schema_version);
 
     Ok(Arc::new(new_meta))
 }
@@ -232,28 +214,10 @@ fn set_twcs_options(
     region_id: RegionId,
 ) -> std::result::Result<(), MetadataError> {
     match key {
-        mito_engine_options::TWCS_MAX_ACTIVE_WINDOW_RUNS => {
-            let runs = parse_usize_with_default(key, value, default_option.max_active_window_runs)?;
-            log_option_update(region_id, key, options.max_active_window_runs, runs);
-            options.max_active_window_runs = runs;
-        }
-        mito_engine_options::TWCS_MAX_ACTIVE_WINDOW_FILES => {
-            let files =
-                parse_usize_with_default(key, value, default_option.max_active_window_files)?;
-            log_option_update(region_id, key, options.max_active_window_files, files);
-            options.max_active_window_files = files;
-        }
-        mito_engine_options::TWCS_MAX_INACTIVE_WINDOW_RUNS => {
-            let runs =
-                parse_usize_with_default(key, value, default_option.max_inactive_window_runs)?;
-            log_option_update(region_id, key, options.max_inactive_window_runs, runs);
-            options.max_inactive_window_runs = runs;
-        }
-        mito_engine_options::TWCS_MAX_INACTIVE_WINDOW_FILES => {
-            let files =
-                parse_usize_with_default(key, value, default_option.max_inactive_window_files)?;
-            log_option_update(region_id, key, options.max_inactive_window_files, files);
-            options.max_inactive_window_files = files;
+        mito_engine_options::TWCS_TRIGGER_FILE_NUM => {
+            let files = parse_usize_with_default(key, value, default_option.trigger_file_num)?;
+            log_option_update(region_id, key, options.trigger_file_num, files);
+            options.trigger_file_num = files;
         }
         mito_engine_options::TWCS_MAX_OUTPUT_FILE_SIZE => {
             let size = if value.is_empty() {

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::str::FromStr;
 use std::time::Duration;
 
 use common_time::Timezone;
@@ -20,6 +21,7 @@ use regex::Regex;
 use session::context::Channel::Postgres;
 use session::context::QueryContextRef;
 use session::session_config::{PGByteaOutputValue, PGDateOrder, PGDateTimeStyle};
+use session::ReadPreference;
 use snafu::{ensure, OptionExt, ResultExt};
 use sql::ast::{Expr, Ident, Value};
 use sql::statements::set_variables::SetVariables;
@@ -33,6 +35,38 @@ lazy_static! {
     // The string must end immediately after the unit, meaning there can be no extra
     // characters or spaces after the valid time specification.
     static ref PG_TIME_INPUT_REGEX: Regex = Regex::new(r"^(\d+)(ms|s|min|h|d)$").unwrap();
+}
+
+pub fn set_read_preference(exprs: Vec<Expr>, ctx: QueryContextRef) -> Result<()> {
+    let read_preference_expr = exprs.first().context(NotSupportedSnafu {
+        feat: "No read preference find in set variable statement",
+    })?;
+
+    match read_preference_expr {
+        Expr::Value(Value::SingleQuotedString(expr))
+        | Expr::Value(Value::DoubleQuotedString(expr)) => {
+            match ReadPreference::from_str(expr.as_str().to_lowercase().as_str()) {
+                Ok(read_preference) => ctx.set_read_preference(read_preference),
+                Err(_) => {
+                    return NotSupportedSnafu {
+                        feat: format!(
+                            "Invalid read preference expr {} in set variable statement",
+                            expr,
+                        ),
+                    }
+                    .fail()
+                }
+            }
+            Ok(())
+        }
+        expr => NotSupportedSnafu {
+            feat: format!(
+                "Unsupported read preference expr {} in set variable statement",
+                expr
+            ),
+        }
+        .fail(),
+    }
 }
 
 pub fn set_timezone(exprs: Vec<Expr>, ctx: QueryContextRef) -> Result<()> {
@@ -88,7 +122,11 @@ pub fn set_search_path(exprs: Vec<Expr>, ctx: QueryContextRef) -> Result<()> {
     match search_expr {
         Expr::Value(Value::SingleQuotedString(search_path))
         | Expr::Value(Value::DoubleQuotedString(search_path)) => {
-            ctx.set_current_schema(&search_path.clone());
+            ctx.set_current_schema(search_path);
+            Ok(())
+        }
+        Expr::Identifier(Ident { value, .. }) => {
+            ctx.set_current_schema(value);
             Ok(())
         }
         expr => NotSupportedSnafu {
@@ -113,6 +151,7 @@ pub fn validate_client_encoding(set: SetVariables) -> Result<()> {
         | Expr::Identifier(Ident {
             value: x,
             quote_style: _,
+            span: _,
         }) => x.to_uppercase(),
         _ => {
             return InvalidSqlSnafu {
@@ -169,6 +208,7 @@ fn try_parse_datestyle(expr: &Expr) -> Result<(Option<PGDateTimeStyle>, Option<P
         Expr::Identifier(Ident {
             value: s,
             quote_style: _,
+            span: _,
         })
         | Expr::Value(Value::SingleQuotedString(s))
         | Expr::Value(Value::DoubleQuotedString(s)) => {
@@ -185,6 +225,28 @@ fn try_parse_datestyle(expr: &Expr) -> Result<(Option<PGDateTimeStyle>, Option<P
         }
         _ => NotSupportedSnafu {
             feat: "Not supported expression for datestyle",
+        }
+        .fail(),
+    }
+}
+
+/// Set the allow query fallback configuration parameter to true or false based on the provided expressions.
+///
+pub fn set_allow_query_fallback(exprs: Vec<Expr>, ctx: QueryContextRef) -> Result<()> {
+    let allow_fallback_expr = exprs.first().context(NotSupportedSnafu {
+        feat: "No allow query fallback value find in set variable statement",
+    })?;
+    match allow_fallback_expr {
+        Expr::Value(Value::Boolean(allow)) => {
+            ctx.configuration_parameter()
+                .set_allow_query_fallback(*allow);
+            Ok(())
+        }
+        expr => NotSupportedSnafu {
+            feat: format!(
+                "Unsupported allow query fallback expr {} in set variable statement",
+                expr
+            ),
         }
         .fail(),
     }

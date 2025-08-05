@@ -19,29 +19,28 @@ use std::time::Duration;
 use api::region::RegionResponse;
 use async_trait::async_trait;
 use common_error::ext::BoxedError;
-use common_function::function::FunctionRef;
-use common_function::scalars::aggregate::AggregateFunctionMetaRef;
-use common_query::prelude::ScalarUdf;
+use common_function::function_factory::ScalarFunctionFactory;
 use common_query::Output;
 use common_runtime::runtime::{BuilderBuild, RuntimeTrait};
 use common_runtime::Runtime;
-use datafusion_expr::LogicalPlan;
+use datafusion_expr::{AggregateUDF, LogicalPlan};
 use query::dataframe::DataFrame;
 use query::planner::LogicalPlanner;
 use query::query_engine::{DescribeResult, QueryEngineState};
 use query::{QueryEngine, QueryEngineContext};
+use servers::grpc::FlightCompression;
 use session::context::QueryContextRef;
 use store_api::metadata::RegionMetadataRef;
 use store_api::region_engine::{
-    RegionEngine, RegionRole, RegionScannerRef, RegionStatistic, SetRegionRoleStateResponse,
-    SettableRegionRoleState,
+    RegionEngine, RegionManifestInfo, RegionRole, RegionScannerRef, RegionStatistic,
+    SetRegionRoleStateResponse, SettableRegionRoleState, SyncManifestResponse,
 };
 use store_api::region_request::{AffectedRows, RegionRequest};
 use store_api::storage::{RegionId, ScanRequest, SequenceNumber};
 use table::TableRef;
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use crate::error::Error;
+use crate::error::{Error, NotYetImplementedSnafu};
 use crate::event_listener::NoopRegionServerEventListener;
 use crate::region_server::RegionServer;
 
@@ -77,11 +76,9 @@ impl QueryEngine for MockQueryEngine {
         unimplemented!()
     }
 
-    fn register_udf(&self, _udf: ScalarUdf) {}
+    fn register_aggregate_function(&self, _func: AggregateUDF) {}
 
-    fn register_aggregate_function(&self, _func: AggregateFunctionMetaRef) {}
-
-    fn register_function(&self, _func: FunctionRef) {}
+    fn register_scalar_function(&self, _func: ScalarFunctionFactory) {}
 
     fn read_table(&self, _table: TableRef) -> query::error::Result<DataFrame> {
         unimplemented!()
@@ -101,6 +98,7 @@ pub fn mock_region_server() -> RegionServer {
         Arc::new(MockQueryEngine),
         Runtime::builder().build().unwrap(),
         Box::new(NoopRegionServerEventListener),
+        FlightCompression::default(),
     )
 }
 
@@ -110,11 +108,15 @@ pub type MockRequestHandler =
 pub type MockSetReadonlyGracefullyHandler =
     Box<dyn Fn(RegionId) -> Result<SetRegionRoleStateResponse, Error> + Send + Sync>;
 
+pub type MockGetMetadataHandler =
+    Box<dyn Fn(RegionId) -> Result<RegionMetadataRef, Error> + Send + Sync>;
+
 pub struct MockRegionEngine {
     sender: Sender<(RegionId, RegionRequest)>,
     pub(crate) handle_request_delay: Option<Duration>,
     pub(crate) handle_request_mock_fn: Option<MockRequestHandler>,
     pub(crate) handle_set_readonly_gracefully_mock_fn: Option<MockSetReadonlyGracefullyHandler>,
+    pub(crate) handle_get_metadata_mock_fn: Option<MockGetMetadataHandler>,
     pub(crate) mock_role: Option<Option<RegionRole>>,
     engine: String,
 }
@@ -129,6 +131,7 @@ impl MockRegionEngine {
                 sender: tx,
                 handle_request_mock_fn: None,
                 handle_set_readonly_gracefully_mock_fn: None,
+                handle_get_metadata_mock_fn: None,
                 mock_role: None,
                 engine: engine.to_string(),
             }),
@@ -148,6 +151,27 @@ impl MockRegionEngine {
                 sender: tx,
                 handle_request_mock_fn: Some(mock_fn),
                 handle_set_readonly_gracefully_mock_fn: None,
+                handle_get_metadata_mock_fn: None,
+                mock_role: None,
+                engine: engine.to_string(),
+            }),
+            rx,
+        )
+    }
+
+    pub fn with_metadata_mock_fn(
+        engine: &str,
+        mock_fn: MockGetMetadataHandler,
+    ) -> (Arc<Self>, Receiver<(RegionId, RegionRequest)>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+
+        (
+            Arc::new(Self {
+                handle_request_delay: None,
+                sender: tx,
+                handle_request_mock_fn: None,
+                handle_set_readonly_gracefully_mock_fn: None,
+                handle_get_metadata_mock_fn: Some(mock_fn),
                 mock_role: None,
                 engine: engine.to_string(),
             }),
@@ -168,6 +192,7 @@ impl MockRegionEngine {
             sender: tx,
             handle_request_mock_fn: None,
             handle_set_readonly_gracefully_mock_fn: None,
+            handle_get_metadata_mock_fn: None,
             mock_role: None,
             engine: engine.to_string(),
         };
@@ -207,10 +232,16 @@ impl RegionEngine for MockRegionEngine {
         _region_id: RegionId,
         _request: ScanRequest,
     ) -> Result<RegionScannerRef, BoxedError> {
-        unimplemented!()
+        Err(BoxedError::new(
+            NotYetImplementedSnafu { what: "blah" }.build(),
+        ))
     }
 
-    async fn get_metadata(&self, _region_id: RegionId) -> Result<RegionMetadataRef, BoxedError> {
+    async fn get_metadata(&self, region_id: RegionId) -> Result<RegionMetadataRef, BoxedError> {
+        if let Some(mock_fn) = &self.handle_get_metadata_mock_fn {
+            return mock_fn(region_id).map_err(BoxedError::new);
+        };
+
         unimplemented!()
     }
 
@@ -247,6 +278,14 @@ impl RegionEngine for MockRegionEngine {
             return role;
         }
         Some(RegionRole::Leader)
+    }
+
+    async fn sync_region(
+        &self,
+        _region_id: RegionId,
+        _manifest_info: RegionManifestInfo,
+    ) -> Result<SyncManifestResponse, BoxedError> {
+        unimplemented!()
     }
 
     fn as_any(&self) -> &dyn Any {

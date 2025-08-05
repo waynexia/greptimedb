@@ -18,45 +18,42 @@ mod copy_query_to;
 mod copy_table_from;
 mod copy_table_to;
 mod cursor;
-mod ddl;
+pub mod ddl;
 mod describe;
 mod dml;
+mod kill;
 mod set;
 mod show;
 mod tql;
 
 use std::collections::HashMap;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
 
-use async_stream::stream;
 use catalog::kvbackend::KvBackendCatalogManager;
+use catalog::process_manager::ProcessManagerRef;
 use catalog::CatalogManagerRef;
-use client::{OutputData, RecordBatches};
+use client::RecordBatches;
 use common_error::ext::BoxedError;
 use common_meta::cache::TableRouteCacheRef;
 use common_meta::cache_invalidator::CacheInvalidatorRef;
-use common_meta::ddl::ProcedureExecutorRef;
 use common_meta::key::flow::{FlowMetadataManager, FlowMetadataManagerRef};
 use common_meta::key::schema_name::SchemaNameKey;
 use common_meta::key::view_info::{ViewInfoManager, ViewInfoManagerRef};
 use common_meta::key::{TableMetadataManager, TableMetadataManagerRef};
 use common_meta::kv_backend::KvBackendRef;
+use common_meta::procedure_executor::ProcedureExecutorRef;
 use common_query::Output;
-use common_recordbatch::error::StreamTimeoutSnafu;
-use common_recordbatch::RecordBatchStreamWrapper;
 use common_telemetry::tracing;
 use common_time::range::TimestampRange;
 use common_time::Timestamp;
 use datafusion_expr::LogicalPlan;
-use futures::stream::{Stream, StreamExt};
+use datatypes::prelude::ConcreteDataType;
 use partition::manager::{PartitionRuleManager, PartitionRuleManagerRef};
 use query::parser::QueryStatement;
 use query::QueryEngineRef;
 use session::context::{Channel, QueryContextRef};
 use session::table_name::table_idents_to_full_name;
-use set::set_query_timeout;
+use set::{set_query_timeout, set_read_preference};
 use snafu::{ensure, OptionExt, ResultExt};
 use sql::statements::copy::{
     CopyDatabase, CopyDatabaseArgument, CopyQueryToArgument, CopyTable, CopyTableArgument,
@@ -77,11 +74,12 @@ use self::set::{
 };
 use crate::error::{
     self, CatalogSnafu, ExecLogicalPlanSnafu, ExternalSnafu, InvalidSqlSnafu, NotSupportedSnafu,
-    PlanStatementSnafu, Result, SchemaNotFoundSnafu, StatementTimeoutSnafu,
-    TableMetadataManagerSnafu, TableNotFoundSnafu, UpgradeCatalogManagerRefSnafu,
+    PlanStatementSnafu, Result, SchemaNotFoundSnafu, SqlCommonSnafu, TableMetadataManagerSnafu,
+    TableNotFoundSnafu, UnexpectedSnafu, UpgradeCatalogManagerRefSnafu,
 };
 use crate::insert::InserterRef;
 use crate::statement::copy_database::{COPY_DATABASE_TIME_END_KEY, COPY_DATABASE_TIME_START_KEY};
+use crate::statement::set::set_allow_query_fallback;
 
 #[derive(Clone)]
 pub struct StatementExecutor {
@@ -94,11 +92,13 @@ pub struct StatementExecutor {
     partition_manager: PartitionRuleManagerRef,
     cache_invalidator: CacheInvalidatorRef,
     inserter: InserterRef,
+    process_manager: Option<ProcessManagerRef>,
 }
 
 pub type StatementExecutorRef = Arc<StatementExecutor>;
 
 impl StatementExecutor {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         catalog_manager: CatalogManagerRef,
         query_engine: QueryEngineRef,
@@ -107,6 +107,7 @@ impl StatementExecutor {
         cache_invalidator: CacheInvalidatorRef,
         inserter: InserterRef,
         table_route_cache: TableRouteCacheRef,
+        process_manager: Option<ProcessManagerRef>,
     ) -> Self {
         Self {
             catalog_manager,
@@ -118,6 +119,7 @@ impl StatementExecutor {
             partition_manager: Arc::new(PartitionRuleManager::new(kv_backend, table_route_cache)),
             cache_invalidator,
             inserter,
+            process_manager,
         }
     }
 
@@ -169,6 +171,9 @@ impl StatementExecutor {
             Statement::ShowViews(stmt) => self.show_views(stmt, query_ctx).await,
 
             Statement::ShowFlows(stmt) => self.show_flows(stmt, query_ctx).await,
+
+            #[cfg(feature = "enterprise")]
+            Statement::ShowTriggers(stmt) => self.show_triggers(stmt, query_ctx).await,
 
             Statement::Copy(sql::statements::copy::Copy::CopyQueryTo(stmt)) => {
                 let query_output = self
@@ -224,10 +229,22 @@ impl StatementExecutor {
                 Ok(Output::new_with_affected_rows(0))
             }
             Statement::CreateFlow(stmt) => self.create_flow(stmt, query_ctx).await,
+            #[cfg(feature = "enterprise")]
+            Statement::CreateTrigger(stmt) => self.create_trigger(stmt, query_ctx).await,
             Statement::DropFlow(stmt) => {
                 self.drop_flow(
                     query_ctx.current_catalog().to_string(),
                     format_raw_object_name(stmt.flow_name()),
+                    stmt.drop_if_exists(),
+                    query_ctx,
+                )
+                .await
+            }
+            #[cfg(feature = "enterprise")]
+            Statement::DropTrigger(stmt) => {
+                self.drop_trigger(
+                    query_ctx.current_catalog().to_string(),
+                    format_raw_object_name(stmt.trigger_name()),
                     stmt.drop_if_exists(),
                     query_ctx,
                 )
@@ -258,6 +275,11 @@ impl StatementExecutor {
                 self.alter_database(alter_database, query_ctx).await
             }
 
+            #[cfg(feature = "enterprise")]
+            Statement::AlterTrigger(alter_trigger) => {
+                self.alter_trigger(alter_trigger, query_ctx).await
+            }
+
             Statement::DropTable(stmt) => {
                 let mut table_names = Vec::with_capacity(stmt.table_names().len());
                 for table_name_stmt in stmt.table_names() {
@@ -285,7 +307,11 @@ impl StatementExecutor {
                         .map_err(BoxedError::new)
                         .context(ExternalSnafu)?;
                 let table_name = TableName::new(catalog, schema, table);
-                self.truncate_table(table_name, query_ctx).await
+                let time_ranges = self
+                    .convert_truncate_time_ranges(&table_name, stmt.time_ranges(), &query_ctx)
+                    .await?;
+                self.truncate_table(table_name, time_ranges, query_ctx)
+                    .await
             }
             Statement::CreateDatabase(stmt) => {
                 self.create_database(
@@ -353,10 +379,13 @@ impl StatementExecutor {
                 self.show_columns(show_columns, query_ctx).await
             }
             Statement::ShowIndex(show_index) => self.show_index(show_index, query_ctx).await,
+            Statement::ShowRegion(show_region) => self.show_region(show_region, query_ctx).await,
             Statement::ShowStatus(_) => self.show_status(query_ctx).await,
             Statement::ShowSearchPath(_) => self.show_search_path(query_ctx).await,
             Statement::Use(db) => self.use_database(db, query_ctx).await,
             Statement::Admin(admin) => self.execute_admin_command(admin, query_ctx).await,
+            Statement::Kill(kill) => self.execute_kill(query_ctx, kill).await,
+            Statement::ShowProcesslist(show) => self.show_processlist(show, query_ctx).await,
         }
     }
 
@@ -377,8 +406,13 @@ impl StatementExecutor {
 
     fn set_variables(&self, set_var: SetVariables, query_ctx: QueryContextRef) -> Result<Output> {
         let var_name = set_var.variable.to_string().to_uppercase();
+
         match var_name.as_str() {
-            "TIMEZONE" | "TIME_ZONE" => set_timezone(set_var.value, query_ctx)?,
+            "READ_PREFERENCE" => set_read_preference(set_var.value, query_ctx)?,
+
+            "@@TIME_ZONE" | "@@SESSION.TIME_ZONE" | "TIMEZONE" | "TIME_ZONE" => {
+                set_timezone(set_var.value, query_ctx)?
+            }
 
             "BYTEA_OUTPUT" => set_bytea_output(set_var.value, query_ctx)?,
 
@@ -387,8 +421,11 @@ impl StatementExecutor {
             // The tracked issue is https://github.com/GreptimeTeam/greptimedb/issues/3442.
             "DATESTYLE" => set_datestyle(set_var.value, query_ctx)?,
 
+            // Allow query to fallback when failed to push down.
+            "ALLOW_QUERY_FALLBACK" => set_allow_query_fallback(set_var.value, query_ctx)?,
+
             "CLIENT_ENCODING" => validate_client_encoding(set_var)?,
-            "MAX_EXECUTION_TIME" => match query_ctx.channel() {
+            "@@SESSION.MAX_EXECUTION_TIME" | "MAX_EXECUTION_TIME" => match query_ctx.channel() {
                 Channel::Mysql => set_query_timeout(set_var.value, query_ctx)?,
                 Channel::Postgres => {
                     query_ctx.set_warning(format!("Unsupported set variable {}", var_name))
@@ -426,6 +463,9 @@ impl StatementExecutor {
                 //  of connection establishment
                 //
                 if query_ctx.channel() == Channel::Postgres {
+                    query_ctx.set_warning(format!("Unsupported set variable {}", var_name));
+                } else if query_ctx.channel() == Channel::Mysql && var_name.starts_with("@@") {
+                    // Just ignore `SET @@` commands for MySQL
                     query_ctx.set_warning(format!("Unsupported set variable {}", var_name));
                 } else {
                     return NotSupportedSnafu {
@@ -469,19 +509,8 @@ impl StatementExecutor {
 
     #[tracing::instrument(skip_all)]
     async fn plan_exec(&self, stmt: QueryStatement, query_ctx: QueryContextRef) -> Result<Output> {
-        let timeout = derive_timeout(&stmt, &query_ctx);
-        match timeout {
-            Some(timeout) => {
-                let start = tokio::time::Instant::now();
-                let output = tokio::time::timeout(timeout, self.plan_exec_inner(stmt, query_ctx))
-                    .await
-                    .context(StatementTimeoutSnafu)?;
-                // compute remaining timeout
-                let remaining_timeout = timeout.checked_sub(start.elapsed()).unwrap_or_default();
-                Ok(attach_timeout(output?, remaining_timeout))
-            }
-            None => self.plan_exec_inner(stmt, query_ctx).await,
-        }
+        let plan = self.plan(&stmt, query_ctx.clone()).await?;
+        self.exec_plan(plan, query_ctx).await
     }
 
     async fn get_table(&self, table_ref: &TableReference<'_>) -> Result<TableRef> {
@@ -499,47 +528,90 @@ impl StatementExecutor {
             })
     }
 
-    async fn plan_exec_inner(
+    pub fn procedure_executor(&self) -> &ProcedureExecutorRef {
+        &self.procedure_executor
+    }
+
+    pub fn cache_invalidator(&self) -> &CacheInvalidatorRef {
+        &self.cache_invalidator
+    }
+
+    /// Convert truncate time ranges for the given table from sql values to timestamps
+    ///
+    pub async fn convert_truncate_time_ranges(
         &self,
-        stmt: QueryStatement,
-        query_ctx: QueryContextRef,
-    ) -> Result<Output> {
-        let plan = self.plan(&stmt, query_ctx.clone()).await?;
-        self.exec_plan(plan, query_ctx).await
-    }
-}
-
-fn attach_timeout(output: Output, mut timeout: Duration) -> Output {
-    match output.data {
-        OutputData::AffectedRows(_) | OutputData::RecordBatches(_) => output,
-        OutputData::Stream(mut stream) => {
-            let schema = stream.schema();
-            let s = Box::pin(stream! {
-                let start = tokio::time::Instant::now();
-                while let Some(item) = tokio::time::timeout(timeout, stream.next()).await.context(StreamTimeoutSnafu)? {
-                    yield item;
-                    timeout = timeout.checked_sub(tokio::time::Instant::now() - start).unwrap_or(Duration::ZERO);
-                }
-            }) as Pin<Box<dyn Stream<Item = _> + Send>>;
-            let stream = RecordBatchStreamWrapper {
-                schema,
-                stream: s,
-                output_ordering: None,
-                metrics: Default::default(),
-            };
-            Output::new(OutputData::Stream(Box::pin(stream)), output.meta)
+        table_name: &TableName,
+        sql_values_time_range: &[(sqlparser::ast::Value, sqlparser::ast::Value)],
+        query_ctx: &QueryContextRef,
+    ) -> Result<Vec<(Timestamp, Timestamp)>> {
+        if sql_values_time_range.is_empty() {
+            return Ok(vec![]);
         }
-    }
-}
+        let table = self.get_table(&table_name.table_ref()).await?;
+        let info = table.table_info();
+        let time_index_dt = info
+            .meta
+            .schema
+            .timestamp_column()
+            .context(UnexpectedSnafu {
+                violated: "Table must have a timestamp column",
+            })?;
 
-/// If the relevant variables are set, the timeout is enforced for all PostgreSQL statements.
-/// For MySQL, it applies only to read-only statements.
-fn derive_timeout(stmt: &QueryStatement, query_ctx: &QueryContextRef) -> Option<Duration> {
-    let query_timeout = query_ctx.query_timeout()?;
-    match (query_ctx.channel(), stmt) {
-        (Channel::Mysql, QueryStatement::Sql(Statement::Query(_)))
-        | (Channel::Postgres, QueryStatement::Sql(_)) => Some(query_timeout),
-        (_, _) => None,
+        let time_unit = time_index_dt
+            .data_type
+            .as_timestamp()
+            .with_context(|| UnexpectedSnafu {
+                violated: format!(
+                    "Table {}'s time index column must be a timestamp type, found: {:?}",
+                    table_name, time_index_dt
+                ),
+            })?
+            .unit();
+
+        let mut time_ranges = Vec::with_capacity(sql_values_time_range.len());
+        for (start, end) in sql_values_time_range {
+            let start = common_sql::convert::sql_value_to_value(
+                "range_start",
+                &ConcreteDataType::timestamp_datatype(time_unit),
+                start,
+                Some(&query_ctx.timezone()),
+                None,
+                false,
+            )
+            .context(SqlCommonSnafu)
+            .and_then(|v| {
+                if let datatypes::value::Value::Timestamp(t) = v {
+                    Ok(t)
+                } else {
+                    error::InvalidSqlSnafu {
+                        err_msg: format!("Expected a timestamp value, found {v:?}"),
+                    }
+                    .fail()
+                }
+            })?;
+
+            let end = common_sql::convert::sql_value_to_value(
+                "range_end",
+                &ConcreteDataType::timestamp_datatype(time_unit),
+                end,
+                Some(&query_ctx.timezone()),
+                None,
+                false,
+            )
+            .context(SqlCommonSnafu)
+            .and_then(|v| {
+                if let datatypes::value::Value::Timestamp(t) = v {
+                    Ok(t)
+                } else {
+                    error::InvalidSqlSnafu {
+                        err_msg: format!("Expected a timestamp value, found {v:?}"),
+                    }
+                    .fail()
+                }
+            })?;
+            time_ranges.push((start, end));
+        }
+        Ok(time_ranges)
     }
 }
 

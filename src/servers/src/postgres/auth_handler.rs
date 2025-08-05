@@ -29,10 +29,11 @@ use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use session::Session;
 use snafu::IntoError;
 
-use super::PostgresServerHandlerInner;
 use crate::error::{AuthSnafu, Result};
 use crate::metrics::METRIC_AUTH_FAILURE;
 use crate::postgres::types::PgErrorCode;
+use crate::postgres::utils::convert_err;
+use crate::postgres::PostgresServerHandlerInner;
 use crate::query_handler::sql::ServerSqlQueryHandlerRef;
 
 pub(crate) struct PgLoginVerifier {
@@ -113,7 +114,7 @@ impl PgLoginVerifier {
     }
 }
 
-fn set_client_info<C>(client: &C, session: &Session)
+fn set_client_info<C>(client: &mut C, session: &Session)
 where
     C: ClientInfo,
 {
@@ -123,6 +124,10 @@ where
     if let Some(current_schema) = client.metadata().get(super::METADATA_SCHEMA) {
         session.set_schema(current_schema.clone());
     }
+
+    // pass generated process id and secret key to client, this information will
+    // be sent to postgres client for query cancellation.
+    client.set_pid_and_secret_key(session.process_id() as i32, rand::random::<i32>());
     // set userinfo outside
 }
 
@@ -243,7 +248,7 @@ where
         if query_handler
             .is_valid_schema(&catalog, &schema)
             .await
-            .map_err(|e| PgWireError::ApiError(Box::new(e)))?
+            .map_err(convert_err)?
         {
             Ok(DbResolution::Resolved(catalog, schema))
         } else {

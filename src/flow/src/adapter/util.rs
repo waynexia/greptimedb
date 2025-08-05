@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Util functions for adapter
+
 use std::sync::Arc;
 
 use api::helper::ColumnDataTypeWrapper;
@@ -20,7 +22,7 @@ use api::v1::{ColumnDataType, ColumnDataTypeExtension, CreateTableExpr, Semantic
 use common_error::ext::BoxedError;
 use common_meta::key::table_info::TableInfoValue;
 use datatypes::prelude::ConcreteDataType;
-use datatypes::schema::ColumnSchema;
+use datatypes::schema::{ColumnDefaultConstraint, ColumnSchema};
 use itertools::Itertools;
 use operator::expr_helper;
 use session::context::QueryContextBuilder;
@@ -31,8 +33,8 @@ use crate::adapter::table_source::TableDesc;
 use crate::adapter::{TableName, WorkerHandle, AUTO_CREATED_PLACEHOLDER_TS_COL};
 use crate::error::{Error, ExternalSnafu, UnexpectedSnafu};
 use crate::repr::{ColumnType, RelationDesc, RelationType};
-use crate::FlowWorkerManager;
-impl FlowWorkerManager {
+use crate::StreamingEngine;
+impl StreamingEngine {
     /// Get a worker handle for creating flow, using round robin to select a worker
     pub(crate) async fn get_worker_handle_for_create_flow(&self) -> &WorkerHandle {
         let use_idx = {
@@ -174,7 +176,15 @@ pub fn table_info_value_to_relation_desc(
     let default_values = raw_schema
         .column_schemas
         .iter()
-        .map(|c| c.default_constraint().cloned())
+        .map(|c| {
+            c.default_constraint().cloned().or_else(|| {
+                if c.is_nullable() {
+                    Some(ColumnDefaultConstraint::null_value())
+                } else {
+                    None
+                }
+            })
+        })
         .collect_vec();
 
     Ok(TableDesc::new(relation_desc, default_values))

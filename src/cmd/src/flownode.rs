@@ -12,16 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use cache::{build_fundamental_cache_registry, with_default_composite_cache_registry};
 use catalog::information_extension::DistributedInformationExtension;
-use catalog::kvbackend::{CachedKvBackendBuilder, KvBackendCatalogManager, MetaKvBackend};
+use catalog::kvbackend::{CachedKvBackendBuilder, KvBackendCatalogManagerBuilder, MetaKvBackend};
 use clap::Parser;
 use client::client_manager::NodeClients;
 use common_base::Plugins;
-use common_config::Configurable;
+use common_config::{Configurable, DEFAULT_DATA_HOME};
 use common_grpc::channel_manager::ChannelConfig;
 use common_meta::cache::{CacheRegistryBuilder, LayeredCacheRegistryBuilder};
 use common_meta::heartbeat::handler::invalidate_table_cache::InvalidateCacheHandler;
@@ -30,12 +31,14 @@ use common_meta::heartbeat::handler::HandlerGroupExecutor;
 use common_meta::key::flow::FlowMetadataManager;
 use common_meta::key::TableMetadataManager;
 use common_telemetry::info;
-use common_telemetry::logging::TracingOptions;
-use common_version::{short_version, version};
-use flow::{FlownodeBuilder, FlownodeInstance, FrontendInvoker};
+use common_telemetry::logging::{TracingOptions, DEFAULT_LOGGING_DIR};
+use common_version::{short_version, verbose_version};
+use flow::{
+    get_flow_auth_options, FlownodeBuilder, FlownodeInstance, FlownodeServiceBuilder,
+    FrontendClient, FrontendInvoker,
+};
 use meta_client::{MetaClientOptions, MetaClientType};
-use servers::Mode;
-use snafu::{OptionExt, ResultExt};
+use snafu::{ensure, OptionExt, ResultExt};
 use tracing_appender::non_blocking::WorkerGuard;
 
 use crate::error::{
@@ -43,7 +46,7 @@ use crate::error::{
     MissingConfigSnafu, Result, ShutdownFlownodeSnafu, StartFlownodeSnafu,
 };
 use crate::options::{GlobalOptions, GreptimeOptions};
-use crate::{log_versions, App};
+use crate::{create_resource_limit_metrics, log_versions, maybe_activate_heap_profile, App};
 
 pub const APP_NAME: &str = "greptime-flownode";
 
@@ -52,14 +55,32 @@ type FlownodeOptions = GreptimeOptions<flow::FlownodeOptions>;
 pub struct Instance {
     flownode: FlownodeInstance,
 
+    // The components of flownode, which make it easier to expand based
+    // on the components.
+    #[cfg(feature = "enterprise")]
+    components: Components,
+
     // Keep the logging guard to prevent the worker from being dropped.
     _guard: Vec<WorkerGuard>,
 }
 
+#[cfg(feature = "enterprise")]
+pub struct Components {
+    pub catalog_manager: catalog::CatalogManagerRef,
+    pub fe_client: Arc<FrontendClient>,
+    pub kv_backend: common_meta::kv_backend::KvBackendRef,
+}
+
 impl Instance {
-    pub fn new(flownode: FlownodeInstance, guard: Vec<WorkerGuard>) -> Self {
+    pub fn new(
+        flownode: FlownodeInstance,
+        #[cfg(feature = "enterprise")] components: Components,
+        guard: Vec<WorkerGuard>,
+    ) -> Self {
         Self {
             flownode,
+            #[cfg(feature = "enterprise")]
+            components,
             _guard: guard,
         }
     }
@@ -72,6 +93,11 @@ impl Instance {
     pub fn flownode_mut(&mut self) -> &mut FlownodeInstance {
         &mut self.flownode
     }
+
+    #[cfg(feature = "enterprise")]
+    pub fn components(&self) -> &Components {
+        &self.components
+    }
 }
 
 #[async_trait::async_trait]
@@ -81,10 +107,14 @@ impl App for Instance {
     }
 
     async fn start(&mut self) -> Result<()> {
+        plugins::start_flownode_plugins(self.flownode.flow_engine().plugins().clone())
+            .await
+            .context(StartFlownodeSnafu)?;
+
         self.flownode.start().await.context(StartFlownodeSnafu)
     }
 
-    async fn stop(&self) -> Result<()> {
+    async fn stop(&mut self) -> Result<()> {
         self.flownode
             .shutdown()
             .await
@@ -150,6 +180,9 @@ struct StartCommand {
     /// HTTP request timeout in seconds.
     #[clap(long)]
     http_timeout: Option<u64>,
+    /// User Provider cfg, for auth, currently only support static user provider
+    #[clap(long)]
+    user_provider: Option<String>,
 }
 
 impl StartCommand {
@@ -175,6 +208,14 @@ impl StartCommand {
 
         if let Some(dir) = &global_options.log_dir {
             opts.logging.dir.clone_from(dir);
+        }
+
+        // If the logging dir is not set, use the default logs dir in the data home.
+        if opts.logging.dir.is_empty() {
+            opts.logging.dir = Path::new(DEFAULT_DATA_HOME)
+                .join(DEFAULT_LOGGING_DIR)
+                .to_string_lossy()
+                .to_string();
         }
 
         if global_options.log_level.is_some() {
@@ -203,7 +244,6 @@ impl StartCommand {
                 .get_or_insert_with(MetaClientOptions::default)
                 .metasrv_addrs
                 .clone_from(metasrv_addrs);
-            opts.mode = Mode::Distributed;
         }
 
         if let Some(http_addr) = &self.http_addr {
@@ -214,12 +254,16 @@ impl StartCommand {
             opts.http.timeout = Duration::from_secs(http_timeout);
         }
 
-        if let (Mode::Distributed, None) = (&opts.mode, &opts.node_id) {
-            return MissingConfigSnafu {
-                msg: "Missing node id option",
-            }
-            .fail();
+        if let Some(user_provider) = &self.user_provider {
+            opts.user_provider = Some(user_provider.clone());
         }
+
+        ensure!(
+            opts.node_id.is_some(),
+            MissingConfigSnafu {
+                msg: "Missing node id option"
+            }
+        );
 
         Ok(())
     }
@@ -232,17 +276,24 @@ impl StartCommand {
             &opts.component.logging,
             &opts.component.tracing,
             opts.component.node_id.map(|x| x.to_string()),
+            None,
         );
-        log_versions(version(), short_version(), APP_NAME);
+
+        log_versions(verbose_version(), short_version(), APP_NAME);
+        maybe_activate_heap_profile(&opts.component.memory);
+        create_resource_limit_metrics(APP_NAME);
 
         info!("Flownode start command: {:#?}", self);
         info!("Flownode options: {:#?}", opts);
 
+        let plugin_opts = opts.plugins;
         let mut opts = opts.component;
         opts.grpc.detect_server_addr();
 
-        // TODO(discord9): make it not optionale after cluster id is required
-        let cluster_id = opts.cluster_id.unwrap_or(0);
+        let mut plugins = Plugins::new();
+        plugins::setup_flownode_plugins(&mut plugins, &plugin_opts, &opts)
+            .await
+            .context(StartFlownodeSnafu)?;
 
         let member_id = opts
             .node_id
@@ -253,9 +304,10 @@ impl StartCommand {
         })?;
 
         let meta_client = meta_client::create_meta_client(
-            cluster_id,
             MetaClientType::Flownode { member_id },
             meta_config,
+            None,
+            None,
         )
         .await
         .context(MetaClientInitSnafu)?;
@@ -291,12 +343,12 @@ impl StartCommand {
 
         let information_extension =
             Arc::new(DistributedInformationExtension::new(meta_client.clone()));
-        let catalog_manager = KvBackendCatalogManager::new(
+        let catalog_manager = KvBackendCatalogManagerBuilder::new(
             information_extension,
             cached_meta_backend.clone(),
             layered_cache_registry.clone(),
-            None,
-        );
+        )
+        .build();
 
         let table_metadata_manager =
             Arc::new(TableMetadataManager::new(cached_meta_backend.clone()));
@@ -318,16 +370,32 @@ impl StartCommand {
         );
 
         let flow_metadata_manager = Arc::new(FlowMetadataManager::new(cached_meta_backend.clone()));
+        let flow_auth_header = get_flow_auth_options(&opts).context(StartFlownodeSnafu)?;
+        let frontend_client = FrontendClient::from_meta_client(
+            meta_client.clone(),
+            flow_auth_header,
+            opts.query.clone(),
+            opts.flow.batching_mode.clone(),
+        );
+        let frontend_client = Arc::new(frontend_client);
         let flownode_builder = FlownodeBuilder::new(
-            opts,
-            Plugins::new(),
+            opts.clone(),
+            plugins,
             table_metadata_manager,
             catalog_manager.clone(),
             flow_metadata_manager,
+            frontend_client.clone(),
         )
         .with_heartbeat_task(heartbeat_task);
 
-        let flownode = flownode_builder.build().await.context(StartFlownodeSnafu)?;
+        let mut flownode = flownode_builder.build().await.context(StartFlownodeSnafu)?;
+        let services = FlownodeServiceBuilder::new(&opts)
+            .with_default_grpc_server(flownode.flownode_server())
+            .enable_http_service()
+            .build()
+            .context(StartFlownodeSnafu)?;
+        flownode.setup_services(services);
+        let flownode = flownode;
 
         // flownode's frontend to datanode need not timeout.
         // Some queries are expected to take long time.
@@ -338,7 +406,7 @@ impl StartCommand {
         let client = Arc::new(NodeClients::new(channel_config));
 
         let invoker = FrontendInvoker::build_from(
-            flownode.flow_worker_manager().clone(),
+            flownode.flow_engine().streaming_engine(),
             catalog_manager.clone(),
             cached_meta_backend.clone(),
             layered_cache_registry.clone(),
@@ -348,10 +416,22 @@ impl StartCommand {
         .await
         .context(StartFlownodeSnafu)?;
         flownode
-            .flow_worker_manager()
+            .flow_engine()
+            .streaming_engine()
+            // TODO(discord9): refactor and avoid circular reference
             .set_frontend_invoker(invoker)
             .await;
 
-        Ok(Instance::new(flownode, guard))
+        #[cfg(feature = "enterprise")]
+        let components = Components {
+            catalog_manager: catalog_manager.clone(),
+            fe_client: frontend_client,
+            kv_backend: cached_meta_backend,
+        };
+
+        #[cfg(not(feature = "enterprise"))]
+        return Ok(Instance::new(flownode, guard));
+        #[cfg(feature = "enterprise")]
+        Ok(Instance::new(flownode, components, guard))
     }
 }

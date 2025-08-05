@@ -52,7 +52,7 @@ tql eval (3000, 3000, '1s') histogram_quantile(0.5, histogram_bucket);
 tql eval (3000, 3000, '1s') histogram_quantile(0.8, histogram_bucket);
 
 -- SQLNESS SORT_RESULT 3 1
-tql eval (3000, 3000, '1s') label_replace(histogram_quantile(0.8, histogram_bucket), "s", "$1", "s", "(.*)tive");
+tql eval (3000, 3000, '1s') label_replace(histogram_quantile(0.8, histogram_bucket), "s2", "$1", "s", "(.*)tive");
 
 -- More realistic with rates.
 -- This case doesn't contains value because other point are not inserted.
@@ -163,3 +163,44 @@ insert into histogram3_bucket values
 tql eval (3000, 3005, '3s') histogram_quantile(0.5, sum by(le, s) (rate(histogram3_bucket[5m])));
 
 drop table histogram3_bucket;
+
+-- test with invalid data (unaligned buckets)
+create table histogram4_bucket (
+    ts timestamp time index,
+    le string,
+    s string,
+    val double,
+    primary key (s, le),
+);
+
+insert into histogram4_bucket values
+    (2900000, "0.1", "a", 0),
+    (2900000, "1", "a", 10),
+    (2900000, "5", "a", 20),
+    (2900000, "+Inf", "a", 150),
+    (3000000, "0.1", "a", 50),
+    (3000000, "1", "a", 70),
+    (3000000, "5", "a", 120),
+    -- INF here is missing
+;
+
+tql eval (2900, 3000, '100s') histogram_quantile(0.9, histogram4_bucket);
+
+drop table histogram4_bucket;
+
+tql eval(0, 10, '10s') histogram_quantile(0.99, sum by(pod,instance, fff) (rate(greptime_servers_postgres_query_elapsed_bucket{instance=~"xxx"}[1m])));
+
+-- test case where table exists but doesn't have 'le' column should raise error
+CREATE TABLE greptime_servers_postgres_query_elapsed_no_le (
+    pod STRING,
+    instance STRING,
+    t TIMESTAMP TIME INDEX,
+    v DOUBLE,
+    PRIMARY KEY (pod, instance)
+);
+
+-- should return empty result instead of error when 'le' column is missing
+tql eval(0, 10, '10s') histogram_quantile(0.99, sum by(pod,instance, le) (rate(greptime_servers_postgres_query_elapsed_no_le{instance=~"xxx"}[1m])));
+tql eval(0, 10, '10s') histogram_quantile(0.99, sum by(pod,instance, fbf) (rate(greptime_servers_postgres_query_elapsed_no_le{instance=~"xxx"}[1m])));
+
+drop table greptime_servers_postgres_query_elapsed_no_le;

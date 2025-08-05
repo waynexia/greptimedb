@@ -85,11 +85,9 @@ impl ImpureDefaultFiller {
             .schema
             .iter()
             .filter_map(|schema| {
-                if self.impure_columns.contains_key(&schema.column_name) {
-                    Some(&schema.column_name)
-                } else {
-                    None
-                }
+                self.impure_columns
+                    .contains_key(&schema.column_name)
+                    .then_some(&schema.column_name)
             })
             .collect();
 
@@ -183,7 +181,7 @@ mod tests {
 
     pub fn new_table_info() -> TableInfo {
         let schema = Arc::new(new_test_schema());
-        let meta = TableMetaBuilder::default()
+        let meta = TableMetaBuilder::empty()
             .schema(schema)
             .primary_key_indices(vec![0])
             .engine("engine")

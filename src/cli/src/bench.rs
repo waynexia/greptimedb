@@ -23,6 +23,8 @@ use common_error::ext::BoxedError;
 use common_meta::key::{TableMetadataManager, TableMetadataManagerRef};
 use common_meta::kv_backend::etcd::EtcdStore;
 use common_meta::kv_backend::memory::MemoryKvBackend;
+#[cfg(feature = "mysql_kvbackend")]
+use common_meta::kv_backend::rds::MySqlStore;
 #[cfg(feature = "pg_kvbackend")]
 use common_meta::kv_backend::rds::PgStore;
 use common_meta::peer::Peer;
@@ -56,6 +58,7 @@ where
     info!("{desc}, average operation cost: {cost:.2} ms");
 }
 
+/// Command to benchmark table metadata operations.
 #[derive(Debug, Default, Parser)]
 pub struct BenchTableMetadataCommand {
     #[clap(long)]
@@ -63,6 +66,9 @@ pub struct BenchTableMetadataCommand {
     #[cfg(feature = "pg_kvbackend")]
     #[clap(long)]
     postgres_addr: Option<String>,
+    #[cfg(feature = "mysql_kvbackend")]
+    #[clap(long)]
+    mysql_addr: Option<String>,
     #[clap(long)]
     count: u32,
 }
@@ -80,6 +86,16 @@ impl BenchTableMetadataCommand {
         let kv_backend = if let Some(postgres_addr) = &self.postgres_addr {
             info!("Using postgres as kv backend");
             PgStore::with_url(postgres_addr, "greptime_metakv", 128)
+                .await
+                .unwrap()
+        } else {
+            kv_backend
+        };
+
+        #[cfg(feature = "mysql_kvbackend")]
+        let kv_backend = if let Some(mysql_addr) = &self.mysql_addr {
+            info!("Using mysql as kv backend");
+            MySqlStore::with_url(mysql_addr, "greptime_metakv", 128)
                 .await
                 .unwrap()
         } else {
@@ -144,6 +160,7 @@ fn create_table_info(table_id: TableId, table_name: TableName) -> RawTableInfo {
         options: Default::default(),
         region_numbers: (1..=100).collect(),
         partition_key_indices: vec![],
+        column_ids: vec![],
     };
 
     RawTableInfo {
@@ -162,7 +179,7 @@ fn create_table_info(table_id: TableId, table_name: TableName) -> RawTableInfo {
 
 fn create_region_routes(regions: Vec<RegionNumber>) -> Vec<RegionRoute> {
     let mut region_routes = Vec::with_capacity(100);
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
 
     for region_id in regions.into_iter().map(u64::from) {
         region_routes.push(RegionRoute {
@@ -171,9 +188,10 @@ fn create_region_routes(regions: Vec<RegionNumber>) -> Vec<RegionRoute> {
                 name: String::new(),
                 partition: None,
                 attrs: BTreeMap::new(),
+                partition_expr: Default::default(),
             },
             leader_peer: Some(Peer {
-                id: rng.gen_range(0..10),
+                id: rng.random_range(0..10),
                 addr: String::new(),
             }),
             follower_peers: vec![],

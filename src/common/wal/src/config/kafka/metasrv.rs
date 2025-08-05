@@ -12,10 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
-use super::common::KafkaConnectionConfig;
-use crate::config::kafka::common::{backoff_prefix, BackoffConfig, KafkaTopicConfig};
+use crate::config::kafka::common::{
+    KafkaConnectionConfig, KafkaTopicConfig, DEFAULT_AUTO_PRUNE_INTERVAL,
+    DEFAULT_AUTO_PRUNE_PARALLELISM, DEFAULT_TRIGGER_FLUSH_THRESHOLD,
+};
 
 /// Kafka wal configurations for metasrv.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -24,23 +28,30 @@ pub struct MetasrvKafkaConfig {
     /// The kafka connection config.
     #[serde(flatten)]
     pub connection: KafkaConnectionConfig,
-    /// The backoff config.
-    #[serde(flatten, with = "backoff_prefix")]
-    pub backoff: BackoffConfig,
     /// The kafka config.
     #[serde(flatten)]
     pub kafka_topic: KafkaTopicConfig,
     // Automatically create topics for WAL.
     pub auto_create_topics: bool,
+    // Interval of WAL pruning.
+    #[serde(with = "humantime_serde")]
+    pub auto_prune_interval: Duration,
+    // Threshold for sending flush request when pruning remote WAL.
+    // `None` stands for never sending flush request.
+    pub trigger_flush_threshold: u64,
+    // Limit of concurrent active pruning procedures.
+    pub auto_prune_parallelism: usize,
 }
 
 impl Default for MetasrvKafkaConfig {
     fn default() -> Self {
         Self {
             connection: Default::default(),
-            backoff: Default::default(),
             kafka_topic: Default::default(),
             auto_create_topics: true,
+            auto_prune_interval: DEFAULT_AUTO_PRUNE_INTERVAL,
+            trigger_flush_threshold: DEFAULT_TRIGGER_FLUSH_THRESHOLD,
+            auto_prune_parallelism: DEFAULT_AUTO_PRUNE_PARALLELISM,
         }
     }
 }

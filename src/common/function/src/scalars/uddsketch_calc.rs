@@ -16,7 +16,6 @@
 
 use std::fmt;
 use std::fmt::Display;
-use std::sync::Arc;
 
 use common_query::error::{DowncastVectorSnafu, InvalidFuncArgsSnafu, Result};
 use common_query::prelude::{Signature, Volatility};
@@ -44,7 +43,7 @@ pub struct UddSketchCalcFunction;
 
 impl UddSketchCalcFunction {
     pub fn register(registry: &FunctionRegistry) {
-        registry.register(Arc::new(UddSketchCalcFunction));
+        registry.register_scalar(UddSketchCalcFunction);
     }
 }
 
@@ -75,7 +74,7 @@ impl Function for UddSketchCalcFunction {
         )
     }
 
-    fn eval(&self, _func_ctx: FunctionContext, columns: &[VectorRef]) -> Result<VectorRef> {
+    fn eval(&self, _func_ctx: &FunctionContext, columns: &[VectorRef]) -> Result<VectorRef> {
         if columns.len() != 2 {
             return InvalidFuncArgsSnafu {
                 err_msg: format!("uddsketch_calc expects 2 arguments, got {}", columns.len()),
@@ -115,6 +114,13 @@ impl Function for UddSketchCalcFunction {
                 }
             };
 
+            // Check if the sketch is empty, if so, return null
+            // This is important to avoid panics when calling estimate_quantile on an empty sketch
+            // In practice, this will happen if input is all null
+            if sketch.bucket_iter().count() == 0 {
+                builder.push_null();
+                continue;
+            }
             // Compute the estimated quantile from the sketch
             let result = sketch.estimate_quantile(perc);
             builder.push(Some(result));
@@ -169,7 +175,7 @@ mod tests {
             Arc::new(BinaryVector::from(vec![Some(serialized.clone()); 3])),
         ];
 
-        let result = function.eval(FunctionContext::default(), &args).unwrap();
+        let result = function.eval(&FunctionContext::default(), &args).unwrap();
         assert_eq!(result.len(), 3);
 
         // Test median (p50)
@@ -192,7 +198,7 @@ mod tests {
 
         // Test with invalid number of arguments
         let args: Vec<VectorRef> = vec![Arc::new(Float64Vector::from_vec(vec![0.95]))];
-        let result = function.eval(FunctionContext::default(), &args);
+        let result = function.eval(&FunctionContext::default(), &args);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -204,7 +210,7 @@ mod tests {
             Arc::new(Float64Vector::from_vec(vec![0.95])),
             Arc::new(BinaryVector::from(vec![Some(vec![1, 2, 3])])), // Invalid binary data
         ];
-        let result = function.eval(FunctionContext::default(), &args).unwrap();
+        let result = function.eval(&FunctionContext::default(), &args).unwrap();
         assert_eq!(result.len(), 1);
         assert!(matches!(result.get(0), datatypes::value::Value::Null));
     }

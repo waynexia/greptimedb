@@ -14,33 +14,34 @@
 
 mod builder;
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
 
 use common_base::range_read::RangeReader;
 use common_telemetry::warn;
-use index::bloom_filter::applier::BloomFilterApplier;
+use index::bloom_filter::applier::{BloomFilterApplier, InListPredicate};
 use index::bloom_filter::reader::{BloomFilterReader, BloomFilterReaderImpl};
 use object_store::ObjectStore;
 use puffin::puffin_manager::cache::PuffinMetadataCacheRef;
-use puffin::puffin_manager::{BlobGuard, PuffinManager, PuffinReader};
+use puffin::puffin_manager::{PuffinManager, PuffinReader};
 use snafu::ResultExt;
-use store_api::storage::{ColumnId, RegionId};
+use store_api::region_request::PathType;
+use store_api::storage::ColumnId;
 
 use crate::access_layer::{RegionFilePathFactory, WriteCachePathProvider};
 use crate::cache::file_cache::{FileCacheRef, FileType, IndexKey};
 use crate::cache::index::bloom_filter_index::{
-    BloomFilterIndexCacheRef, CachedBloomFilterIndexBlobReader,
+    BloomFilterIndexCacheRef, CachedBloomFilterIndexBlobReader, Tag,
 };
+use crate::cache::index::result_cache::PredicateKey;
 use crate::error::{
     ApplyBloomFilterIndexSnafu, Error, MetadataSnafu, PuffinBuildReaderSnafu, PuffinReadBlobSnafu,
     Result,
 };
 use crate::metrics::INDEX_APPLY_ELAPSED;
-use crate::sst::file::FileId;
+use crate::sst::file::RegionFileId;
 pub use crate::sst::index::bloom_filter::applier::builder::BloomFilterIndexApplierBuilder;
-use crate::sst::index::bloom_filter::applier::builder::Predicate;
 use crate::sst::index::bloom_filter::INDEX_BLOB_TYPE;
 use crate::sst::index::puffin_manager::{BlobReader, PuffinManagerFactory};
 use crate::sst::index::TYPE_BLOOM_FILTER_INDEX;
@@ -49,11 +50,11 @@ pub(crate) type BloomFilterIndexApplierRef = Arc<BloomFilterIndexApplier>;
 
 /// `BloomFilterIndexApplier` applies bloom filter predicates to the SST file.
 pub struct BloomFilterIndexApplier {
-    /// Directory of the region.
-    region_dir: String,
+    /// Directory of the table.
+    table_dir: String,
 
-    /// ID of the region.
-    region_id: RegionId,
+    /// Path type for generating file paths.
+    path_type: PathType,
 
     /// Object store to read the index file.
     object_store: ObjectStore,
@@ -71,27 +72,35 @@ pub struct BloomFilterIndexApplier {
     bloom_filter_index_cache: Option<BloomFilterIndexCacheRef>,
 
     /// Bloom filter predicates.
-    filters: HashMap<ColumnId, Vec<Predicate>>,
+    /// For each column, the value will be retained only if it contains __all__ predicates.
+    predicates: Arc<BTreeMap<ColumnId, Vec<InListPredicate>>>,
+
+    /// Predicate key. Used to identify the predicate and fetch result from cache.
+    predicate_key: PredicateKey,
 }
 
 impl BloomFilterIndexApplier {
     /// Creates a new `BloomFilterIndexApplier`.
+    ///
+    /// For each column, the value will be retained only if it contains __all__ predicates.
     pub fn new(
-        region_dir: String,
-        region_id: RegionId,
+        table_dir: String,
+        path_type: PathType,
         object_store: ObjectStore,
         puffin_manager_factory: PuffinManagerFactory,
-        filters: HashMap<ColumnId, Vec<Predicate>>,
+        predicates: BTreeMap<ColumnId, Vec<InListPredicate>>,
     ) -> Self {
+        let predicates = Arc::new(predicates);
         Self {
-            region_dir,
-            region_id,
+            table_dir,
+            path_type,
             object_store,
             file_cache: None,
             puffin_manager_factory,
             puffin_metadata_cache: None,
             bloom_filter_index_cache: None,
-            filters,
+            predicate_key: PredicateKey::new_bloom(predicates.clone()),
+            predicates,
         }
     }
 
@@ -120,9 +129,12 @@ impl BloomFilterIndexApplier {
     /// list of row group ranges that match the predicates.
     ///
     /// The `row_groups` iterator provides the row group lengths and whether to search in the row group.
+    ///
+    /// Row group id existing in the returned result means that the row group is searched.
+    /// Empty ranges means that the row group is searched but no rows are found.
     pub async fn apply(
         &self,
-        file_id: FileId,
+        file_id: RegionFileId,
         file_size_hint: Option<u64>,
         row_groups: impl Iterator<Item = (usize, bool)>,
     ) -> Result<Vec<(usize, Vec<Range<usize>>)>> {
@@ -148,7 +160,7 @@ impl BloomFilterIndexApplier {
             .map(|(i, range)| (*i, vec![range.clone()]))
             .collect::<Vec<_>>();
 
-        for (column_id, predicates) in &self.filters {
+        for (column_id, predicates) in self.predicates.iter() {
             let blob = match self
                 .blob_reader(file_id, *column_id, file_size_hint)
                 .await?
@@ -161,18 +173,19 @@ impl BloomFilterIndexApplier {
             if let Some(bloom_filter_cache) = &self.bloom_filter_index_cache {
                 let blob_size = blob.metadata().await.context(MetadataSnafu)?.content_length;
                 let reader = CachedBloomFilterIndexBlobReader::new(
-                    file_id,
+                    file_id.file_id(),
                     *column_id,
+                    Tag::Skipping,
                     blob_size,
                     BloomFilterReaderImpl::new(blob),
                     bloom_filter_cache.clone(),
                 );
-                self.apply_filters(reader, predicates, &input, &mut output)
+                self.apply_predicates(reader, predicates, &mut output)
                     .await
                     .context(ApplyBloomFilterIndexSnafu)?;
             } else {
                 let reader = BloomFilterReaderImpl::new(blob);
-                self.apply_filters(reader, predicates, &input, &mut output)
+                self.apply_predicates(reader, predicates, &mut output)
                     .await
                     .context(ApplyBloomFilterIndexSnafu)?;
             }
@@ -186,7 +199,6 @@ impl BloomFilterIndexApplier {
                 range.end -= start;
             }
         }
-        output.retain(|(_, ranges)| !ranges.is_empty());
 
         Ok(output)
     }
@@ -196,7 +208,7 @@ impl BloomFilterIndexApplier {
     /// Returus `None` if the column does not have an index.
     async fn blob_reader(
         &self,
-        file_id: FileId,
+        file_id: RegionFileId,
         column_id: ColumnId,
         file_size_hint: Option<u64>,
     ) -> Result<Option<BlobReader>> {
@@ -234,7 +246,7 @@ impl BloomFilterIndexApplier {
     /// Creates a blob reader from the cached index file
     async fn cached_blob_reader(
         &self,
-        file_id: FileId,
+        file_id: RegionFileId,
         column_id: ColumnId,
         file_size_hint: Option<u64>,
     ) -> Result<Option<BlobReader>> {
@@ -242,14 +254,14 @@ impl BloomFilterIndexApplier {
             return Ok(None);
         };
 
-        let index_key = IndexKey::new(self.region_id, file_id, FileType::Puffin);
+        let index_key = IndexKey::new(file_id.region_id(), file_id.file_id(), FileType::Puffin);
         if file_cache.get(index_key).await.is_none() {
             return Ok(None);
         };
 
         let puffin_manager = self.puffin_manager_factory.build(
             file_cache.local_store(),
-            WriteCachePathProvider::new(self.region_id, file_cache.clone()),
+            WriteCachePathProvider::new(file_cache.clone()),
         );
         let reader = puffin_manager
             .reader(&file_id)
@@ -273,7 +285,7 @@ impl BloomFilterIndexApplier {
     /// Creates a blob reader from the remote index file
     async fn remote_blob_reader(
         &self,
-        file_id: FileId,
+        file_id: RegionFileId,
         column_id: ColumnId,
         file_size_hint: Option<u64>,
     ) -> Result<BlobReader> {
@@ -281,7 +293,7 @@ impl BloomFilterIndexApplier {
             .puffin_manager_factory
             .build(
                 self.object_store.clone(),
-                RegionFilePathFactory::new(self.region_dir.clone()),
+                RegionFilePathFactory::new(self.table_dir.clone(), self.path_type),
             )
             .with_puffin_metadata_cache(self.puffin_metadata_cache.clone());
 
@@ -298,72 +310,30 @@ impl BloomFilterIndexApplier {
             .context(PuffinBuildReaderSnafu)
     }
 
-    async fn apply_filters<R: BloomFilterReader + Send + 'static>(
+    async fn apply_predicates<R: BloomFilterReader + Send + 'static>(
         &self,
         reader: R,
-        predicates: &[Predicate],
-        input: &[(usize, Range<usize>)],
+        predicates: &[InListPredicate],
         output: &mut [(usize, Vec<Range<usize>>)],
     ) -> std::result::Result<(), index::bloom_filter::error::Error> {
         let mut applier = BloomFilterApplier::new(Box::new(reader)).await?;
 
-        for ((_, r), (_, output)) in input.iter().zip(output.iter_mut()) {
+        for (_, row_group_output) in output.iter_mut() {
             // All rows are filtered out, skip the search
-            if output.is_empty() {
+            if row_group_output.is_empty() {
                 continue;
             }
 
-            for predicate in predicates {
-                match predicate {
-                    Predicate::InList(in_list) => {
-                        let res = applier.search(&in_list.list, r.clone()).await?;
-                        if res.is_empty() {
-                            output.clear();
-                            break;
-                        }
-
-                        *output = intersect_ranges(output, &res);
-                        if output.is_empty() {
-                            break;
-                        }
-                    }
-                }
-            }
+            *row_group_output = applier.search(predicates, row_group_output).await?;
         }
 
         Ok(())
     }
-}
 
-/// Intersects two lists of ranges and returns the intersection.
-///
-/// The input lists are assumed to be sorted and non-overlapping.
-fn intersect_ranges(lhs: &[Range<usize>], rhs: &[Range<usize>]) -> Vec<Range<usize>> {
-    let mut i = 0;
-    let mut j = 0;
-
-    let mut output = Vec::new();
-    while i < lhs.len() && j < rhs.len() {
-        let r1 = &lhs[i];
-        let r2 = &rhs[j];
-
-        // Find intersection if exists
-        let start = r1.start.max(r2.start);
-        let end = r1.end.min(r2.end);
-
-        if start < end {
-            output.push(start..end);
-        }
-
-        // Move forward the range that ends first
-        if r1.end < r2.end {
-            i += 1;
-        } else {
-            j += 1;
-        }
+    /// Returns the predicate key.
+    pub fn predicate_key(&self) -> &PredicateKey {
+        &self.predicate_key
     }
-
-    output
 }
 
 fn is_blob_not_found(err: &Error) -> bool {
@@ -385,6 +355,7 @@ mod tests {
     use store_api::metadata::RegionMetadata;
 
     use super::*;
+    use crate::sst::file::FileId;
     use crate::sst::index::bloom_filter::creator::tests::{
         mock_object_store, mock_region_metadata, new_batch, new_intm_mgr,
     };
@@ -392,23 +363,24 @@ mod tests {
 
     #[allow(clippy::type_complexity)]
     fn tester(
-        region_dir: String,
+        table_dir: String,
         object_store: ObjectStore,
         metadata: &RegionMetadata,
         puffin_manager_factory: PuffinManagerFactory,
-        file_id: FileId,
+        file_id: RegionFileId,
     ) -> impl Fn(&[Expr], Vec<(usize, bool)>) -> BoxFuture<'static, Vec<(usize, Vec<Range<usize>>)>>
            + use<'_> {
         move |exprs, row_groups| {
-            let region_dir = region_dir.clone();
-            let object_store = object_store.clone();
+            let table_dir = table_dir.clone();
+            let object_store: ObjectStore = object_store.clone();
             let metadata = metadata.clone();
             let puffin_manager_factory = puffin_manager_factory.clone();
             let exprs = exprs.to_vec();
 
             Box::pin(async move {
                 let builder = BloomFilterIndexApplierBuilder::new(
-                    region_dir,
+                    table_dir,
+                    PathType::Bare,
                     object_store,
                     &metadata,
                     puffin_manager_factory,
@@ -419,6 +391,9 @@ mod tests {
                     .apply(file_id, None, row_groups.into_iter())
                     .await
                     .unwrap()
+                    .into_iter()
+                    .filter(|(_, ranges)| !ranges.is_empty())
+                    .collect()
             })
         }
     }
@@ -448,13 +423,17 @@ mod tests {
         let object_store = mock_object_store();
         let intm_mgr = new_intm_mgr(d.path().to_string_lossy()).await;
         let memory_usage_threshold = Some(1024);
-        let file_id = FileId::random();
-        let region_dir = "region_dir".to_string();
+        let file_id = RegionFileId::new(region_metadata.region_id, FileId::random());
+        let table_dir = "table_dir".to_string();
 
-        let mut indexer =
-            BloomFilterIndexer::new(file_id, &region_metadata, intm_mgr, memory_usage_threshold)
-                .unwrap()
-                .unwrap();
+        let mut indexer = BloomFilterIndexer::new(
+            file_id.file_id(),
+            &region_metadata,
+            intm_mgr,
+            memory_usage_threshold,
+        )
+        .unwrap()
+        .unwrap();
 
         // push 20 rows
         let mut batch = new_batch("tag1", 0..10);
@@ -464,7 +443,7 @@ mod tests {
 
         let puffin_manager = factory.build(
             object_store.clone(),
-            RegionFilePathFactory::new(region_dir.clone()),
+            RegionFilePathFactory::new(table_dir.clone(), PathType::Bare),
         );
 
         let mut puffin_writer = puffin_manager.writer(&file_id).await.unwrap();
@@ -472,7 +451,7 @@ mod tests {
         puffin_writer.finish().await.unwrap();
 
         let tester = tester(
-            region_dir.clone(),
+            table_dir.clone(),
             object_store.clone(),
             &region_metadata,
             factory.clone(),
@@ -522,56 +501,5 @@ mod tests {
         )
         .await;
         assert_eq!(res, vec![(0, vec![0..4]), (1, vec![3..5])]);
-    }
-
-    #[test]
-    #[allow(clippy::single_range_in_vec_init)]
-    fn test_intersect_ranges() {
-        // empty inputs
-        assert_eq!(intersect_ranges(&[], &[]), Vec::<Range<usize>>::new());
-        assert_eq!(intersect_ranges(&[1..5], &[]), Vec::<Range<usize>>::new());
-        assert_eq!(intersect_ranges(&[], &[1..5]), Vec::<Range<usize>>::new());
-
-        // no overlap
-        assert_eq!(
-            intersect_ranges(&[1..3, 5..7], &[3..5, 7..9]),
-            Vec::<Range<usize>>::new()
-        );
-
-        // single overlap
-        assert_eq!(intersect_ranges(&[1..5], &[3..7]), vec![3..5]);
-
-        // multiple overlaps
-        assert_eq!(
-            intersect_ranges(&[1..5, 7..10, 12..15], &[2..6, 8..13]),
-            vec![2..5, 8..10, 12..13]
-        );
-
-        // exact overlap
-        assert_eq!(
-            intersect_ranges(&[1..3, 5..7], &[1..3, 5..7]),
-            vec![1..3, 5..7]
-        );
-
-        // contained ranges
-        assert_eq!(
-            intersect_ranges(&[1..10], &[2..4, 5..7, 8..9]),
-            vec![2..4, 5..7, 8..9]
-        );
-
-        // partial overlaps
-        assert_eq!(
-            intersect_ranges(&[1..4, 6..9], &[2..7, 8..10]),
-            vec![2..4, 6..7, 8..9]
-        );
-
-        // single point overlap
-        assert_eq!(
-            intersect_ranges(&[1..3], &[3..5]),
-            Vec::<Range<usize>>::new()
-        );
-
-        // large ranges
-        assert_eq!(intersect_ranges(&[0..100], &[50..150]), vec![50..100]);
     }
 }

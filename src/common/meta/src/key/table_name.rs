@@ -23,8 +23,8 @@ use table::metadata::TableId;
 use table::table_name::TableName;
 use table::table_reference::TableReference;
 
-use super::{MetadataKey, MetadataValue, TABLE_NAME_KEY_PATTERN, TABLE_NAME_KEY_PREFIX};
 use crate::error::{Error, InvalidMetadataSnafu, Result};
+use crate::key::{MetadataKey, MetadataValue, TABLE_NAME_KEY_PATTERN, TABLE_NAME_KEY_PREFIX};
 use crate::kv_backend::memory::MemoryKvBackend;
 use crate::kv_backend::txn::{Txn, TxnOp};
 use crate::kv_backend::KvBackendRef;
@@ -101,6 +101,26 @@ pub fn table_decoder(kv: KeyValue) -> Result<(String, TableNameValue)> {
     let table_name_value = TableNameValue::try_from_raw_value(&kv.value)?;
 
     Ok((table_name_key.table.to_string(), table_name_value))
+}
+
+impl<'a> From<&TableReference<'a>> for TableNameKey<'a> {
+    fn from(value: &TableReference<'a>) -> Self {
+        Self {
+            catalog: value.catalog,
+            schema: value.schema,
+            table: value.table,
+        }
+    }
+}
+
+impl<'a> From<TableReference<'a>> for TableNameKey<'a> {
+    fn from(value: TableReference<'a>) -> Self {
+        Self {
+            catalog: value.catalog,
+            schema: value.schema,
+            table: value.table,
+        }
+    }
 }
 
 impl<'a> From<&'a TableName> for TableNameKey<'a> {

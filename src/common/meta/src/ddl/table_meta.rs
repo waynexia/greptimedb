@@ -20,8 +20,8 @@ use common_telemetry::{debug, info};
 use snafu::ensure;
 use store_api::storage::{RegionId, RegionNumber, TableId};
 
-use crate::ddl::{TableMetadata, TableMetadataAllocatorContext};
-use crate::error::{self, Result, UnsupportedSnafu};
+use crate::ddl::TableMetadata;
+use crate::error::{Result, UnsupportedSnafu};
 use crate::key::table_route::PhysicalTableRouteValue;
 use crate::peer::Peer;
 use crate::rpc::ddl::CreateTableTask;
@@ -98,38 +98,33 @@ impl TableMetadataAllocator {
     fn create_wal_options(
         &self,
         table_route: &PhysicalTableRouteValue,
+        skip_wal: bool,
     ) -> Result<HashMap<RegionNumber, String>> {
         let region_numbers = table_route
             .region_routes
             .iter()
             .map(|route| route.region.id.region_number())
             .collect();
-        allocate_region_wal_options(region_numbers, &self.wal_options_allocator)
+        allocate_region_wal_options(region_numbers, &self.wal_options_allocator, skip_wal)
     }
 
     async fn create_table_route(
         &self,
-        ctx: &TableMetadataAllocatorContext,
         table_id: TableId,
         task: &CreateTableTask,
     ) -> Result<PhysicalTableRouteValue> {
-        let regions = task.partitions.len();
-        ensure!(
-            regions > 0,
-            error::UnexpectedSnafu {
-                err_msg: "The number of partitions must be greater than 0"
-            }
-        );
+        let regions = task.partitions.len().max(1);
+        let peers = self.peer_allocator.alloc(regions).await?;
+        debug!("Allocated peers {:?} for table {}", peers, table_id);
 
-        let peers = self.peer_allocator.alloc(ctx, regions).await?;
-        let region_routes = task
+        let mut region_routes = task
             .partitions
             .iter()
             .enumerate()
             .map(|(i, partition)| {
                 let region = Region {
                     id: RegionId::new(table_id, i as u32),
-                    partition: Some(partition.clone().into()),
+                    partition_expr: partition.expression.clone(),
                     ..Default::default()
                 };
 
@@ -143,15 +138,23 @@ impl TableMetadataAllocator {
             })
             .collect::<Vec<_>>();
 
+        // If the table has no partitions, we need to create a default region.
+        if region_routes.is_empty() {
+            region_routes.push(RegionRoute {
+                region: Region {
+                    id: RegionId::new(table_id, 0),
+                    ..Default::default()
+                },
+                leader_peer: Some(peers[0].clone()),
+                ..Default::default()
+            });
+        }
+
         Ok(PhysicalTableRouteValue::new(region_routes))
     }
 
     /// Create VIEW metadata
-    pub async fn create_view(
-        &self,
-        _ctx: &TableMetadataAllocatorContext,
-        table_id: &Option<api::v1::TableId>,
-    ) -> Result<TableMetadata> {
+    pub async fn create_view(&self, table_id: &Option<api::v1::TableId>) -> Result<TableMetadata> {
         let table_id = self.allocate_table_id(table_id).await?;
 
         Ok(TableMetadata {
@@ -160,14 +163,12 @@ impl TableMetadataAllocator {
         })
     }
 
-    pub async fn create(
-        &self,
-        ctx: &TableMetadataAllocatorContext,
-        task: &CreateTableTask,
-    ) -> Result<TableMetadata> {
+    pub async fn create(&self, task: &CreateTableTask) -> Result<TableMetadata> {
         let table_id = self.allocate_table_id(&task.create_table.table_id).await?;
-        let table_route = self.create_table_route(ctx, table_id, task).await?;
-        let region_wal_options = self.create_wal_options(&table_route)?;
+        let table_route = self.create_table_route(table_id, task).await?;
+
+        let region_wal_options =
+            self.create_wal_options(&table_route, task.table_info.meta.options.skip_wal)?;
 
         debug!(
             "Allocated region wal options {:?} for table {}",
@@ -180,6 +181,10 @@ impl TableMetadataAllocator {
             region_wal_options,
         })
     }
+
+    pub fn table_id_sequence(&self) -> SequenceRef {
+        self.table_id_sequence.clone()
+    }
 }
 
 pub type PeerAllocatorRef = Arc<dyn PeerAllocator>;
@@ -188,19 +193,14 @@ pub type PeerAllocatorRef = Arc<dyn PeerAllocator>;
 #[async_trait]
 pub trait PeerAllocator: Send + Sync {
     /// Allocates `regions` size [`Peer`]s.
-    async fn alloc(&self, ctx: &TableMetadataAllocatorContext, regions: usize)
-        -> Result<Vec<Peer>>;
+    async fn alloc(&self, regions: usize) -> Result<Vec<Peer>>;
 }
 
 struct NoopPeerAllocator;
 
 #[async_trait]
 impl PeerAllocator for NoopPeerAllocator {
-    async fn alloc(
-        &self,
-        _ctx: &TableMetadataAllocatorContext,
-        regions: usize,
-    ) -> Result<Vec<Peer>> {
+    async fn alloc(&self, regions: usize) -> Result<Vec<Peer>> {
         Ok(vec![Peer::default(); regions])
     }
 }

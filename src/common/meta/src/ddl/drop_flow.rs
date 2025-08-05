@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod metadata;
+
 use api::v1::flow::{flow_request, DropRequest, FlowRequest};
 use async_trait::async_trait;
 use common_catalog::format_full_flow_name;
@@ -28,8 +29,8 @@ use serde::{Deserialize, Serialize};
 use snafu::{ensure, ResultExt};
 use strum::AsRefStr;
 
-use super::utils::{add_peer_context_if_needed, handle_retry_error};
 use crate::cache_invalidator::Context;
+use crate::ddl::utils::{add_peer_context_if_needed, map_to_procedure_error};
 use crate::ddl::DdlContext;
 use crate::error::{self, Result};
 use crate::flow_name::FlowName;
@@ -37,8 +38,8 @@ use crate::instruction::{CacheIdent, DropFlow};
 use crate::key::flow::flow_info::FlowInfoValue;
 use crate::key::flow::flow_route::FlowRouteValue;
 use crate::lock_key::{CatalogLock, FlowLock};
+use crate::metrics;
 use crate::rpc::ddl::DropFlowTask;
-use crate::{metrics, ClusterId};
 
 /// The procedure for dropping a flow.
 pub struct DropFlowProcedure {
@@ -51,12 +52,11 @@ pub struct DropFlowProcedure {
 impl DropFlowProcedure {
     pub const TYPE_NAME: &'static str = "metasrv-procedure::DropFlow";
 
-    pub fn new(cluster_id: ClusterId, task: DropFlowTask, context: DdlContext) -> Self {
+    pub fn new(task: DropFlowTask, context: DdlContext) -> Self {
         Self {
             context,
             data: DropFlowData {
                 state: DropFlowState::Prepare,
-                cluster_id,
                 task,
                 flow_info_value: None,
                 flow_route_values: vec![],
@@ -154,6 +154,12 @@ impl DropFlowProcedure {
         };
         let flow_info_value = self.data.flow_info_value.as_ref().unwrap();
 
+        let flow_part2nodes = flow_info_value
+            .flownode_ids()
+            .clone()
+            .into_iter()
+            .collect::<Vec<_>>();
+
         self.context
             .cache_invalidator
             .invalidate(
@@ -165,8 +171,9 @@ impl DropFlowProcedure {
                         flow_name: flow_info_value.flow_name.to_string(),
                     }),
                     CacheIdent::DropFlow(DropFlow {
+                        flow_id,
                         source_table_ids: flow_info_value.source_table_ids.clone(),
-                        flownode_ids: flow_info_value.flownode_ids.values().cloned().collect(),
+                        flow_part2node_id: flow_part2nodes,
                     }),
                 ],
             )
@@ -194,7 +201,7 @@ impl Procedure for DropFlowProcedure {
             DropFlowState::InvalidateFlowCache => self.on_broadcast().await,
             DropFlowState::DropFlows => self.on_flownode_drop_flows().await,
         }
-        .map_err(handle_retry_error)
+        .map_err(map_to_procedure_error)
     }
 
     fn dump(&self) -> ProcedureResult<String> {
@@ -218,7 +225,6 @@ impl Procedure for DropFlowProcedure {
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct DropFlowData {
     state: DropFlowState,
-    cluster_id: ClusterId,
     task: DropFlowTask,
     pub(crate) flow_info_value: Option<FlowInfoValue>,
     pub(crate) flow_route_values: Vec<FlowRouteValue>,

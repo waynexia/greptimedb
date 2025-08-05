@@ -24,7 +24,8 @@ use cache::{
     with_default_composite_cache_registry,
 };
 use catalog::information_extension::DistributedInformationExtension;
-use catalog::kvbackend::{CachedKvBackendBuilder, KvBackendCatalogManager, MetaKvBackend};
+use catalog::kvbackend::{CachedKvBackendBuilder, KvBackendCatalogManagerBuilder, MetaKvBackend};
+use catalog::process_manager::ProcessManager;
 use client::client_manager::NodeClients;
 use client::Client;
 use common_base::Plugins;
@@ -43,22 +44,23 @@ use common_runtime::runtime::BuilderBuild;
 use common_runtime::Builder as RuntimeBuilder;
 use common_test_util::temp_dir::create_temp_dir;
 use common_wal::config::{DatanodeWalConfig, MetasrvWalConfig};
-use datanode::config::{DatanodeOptions, ObjectStoreConfig};
+use datanode::config::DatanodeOptions;
 use datanode::datanode::{Datanode, DatanodeBuilder, ProcedureConfig};
-use frontend::frontend::FrontendOptions;
+use frontend::frontend::{Frontend, FrontendOptions};
 use frontend::heartbeat::HeartbeatTask;
 use frontend::instance::builder::FrontendBuilder;
-use frontend::instance::{FrontendInstance, Instance as FeInstance};
+use frontend::instance::Instance as FeInstance;
 use hyper_util::rt::TokioIo;
 use meta_client::client::MetaClientBuilder;
 use meta_srv::cluster::MetaPeerClientRef;
 use meta_srv::metasrv::{Metasrv, MetasrvOptions, SelectorRef};
 use meta_srv::mocks::MockInfo;
-use query::stats::StatementStatistics;
+use object_store::config::ObjectStoreConfig;
 use servers::grpc::flight::FlightCraftWrapper;
 use servers::grpc::region_server::RegionServerRequestHandler;
+use servers::grpc::GrpcOptions;
 use servers::heartbeat_options::HeartbeatOptions;
-use servers::Mode;
+use servers::server::ServerHandlers;
 use tempfile::TempDir;
 use tonic::codec::CompressionEncoding;
 use tonic::transport::Server;
@@ -66,19 +68,24 @@ use tower::service_fn;
 use uuid::Uuid;
 
 use crate::test_util::{
-    self, create_datanode_opts, create_tmp_dir_and_datanode_opts, FileDirGuard, StorageGuard,
-    StorageType, PEER_PLACEHOLDER_ADDR,
+    self, create_datanode_opts, create_tmp_dir_and_datanode_opts, FileDirGuard, StorageType,
+    TestGuard, PEER_PLACEHOLDER_ADDR,
 };
 
 pub struct GreptimeDbCluster {
-    pub storage_guards: Vec<StorageGuard>,
-    pub dir_guards: Vec<FileDirGuard>,
+    pub guards: Vec<TestGuard>,
     pub datanode_options: Vec<DatanodeOptions>,
 
     pub datanode_instances: HashMap<DatanodeId, Datanode>,
     pub kv_backend: KvBackendRef,
     pub metasrv: Arc<Metasrv>,
-    pub frontend: Arc<FeInstance>,
+    pub frontend: Arc<Frontend>,
+}
+
+impl GreptimeDbCluster {
+    pub fn fe_instance(&self) -> &Arc<FeInstance> {
+        &self.frontend.instance
+    }
 }
 
 pub struct GreptimeDbClusterBuilder {
@@ -170,8 +177,7 @@ impl GreptimeDbClusterBuilder {
     pub async fn build_with(
         &self,
         datanode_options: Vec<DatanodeOptions>,
-        storage_guards: Vec<StorageGuard>,
-        dir_guards: Vec<FileDirGuard>,
+        guards: Vec<TestGuard>,
     ) -> GreptimeDbCluster {
         let datanodes = datanode_options.len();
         let channel_config = ChannelConfig::new().timeout(Duration::from_secs(20));
@@ -184,9 +190,13 @@ impl GreptimeDbClusterBuilder {
                 max_retry_times: 5,
                 retry_delay: Duration::from_secs(1),
                 max_metadata_value_size: None,
+                max_running_procedures: 128,
             },
             wal: self.metasrv_wal_config.clone(),
-            server_addr: "127.0.0.1:3002".to_string(),
+            grpc: GrpcOptions {
+                server_addr: "127.0.0.1:3002".to_string(),
+                ..Default::default()
+            },
             ..Default::default()
         };
 
@@ -208,55 +218,52 @@ impl GreptimeDbClusterBuilder {
         self.wait_datanodes_alive(metasrv.metasrv.meta_peer_client(), datanodes)
             .await;
 
-        let frontend = self.build_frontend(metasrv.clone(), datanode_clients).await;
+        let mut frontend = self.build_frontend(metasrv.clone(), datanode_clients).await;
 
-        test_util::prepare_another_catalog_and_schema(frontend.as_ref()).await;
+        test_util::prepare_another_catalog_and_schema(&frontend.instance).await;
 
         frontend.start().await.unwrap();
 
         GreptimeDbCluster {
             datanode_options,
-            storage_guards,
-            dir_guards,
+            guards,
             datanode_instances,
             kv_backend: self.kv_backend.clone(),
             metasrv: metasrv.metasrv,
-            frontend,
+            frontend: Arc::new(frontend),
         }
     }
 
     pub async fn build(&self) -> GreptimeDbCluster {
         let datanodes = self.datanodes.unwrap_or(4);
-        let (datanode_options, storage_guards, dir_guards) =
-            self.build_datanode_options_and_guards(datanodes).await;
-        self.build_with(datanode_options, storage_guards, dir_guards)
-            .await
+        let (datanode_options, guards) = self.build_datanode_options_and_guards(datanodes).await;
+        self.build_with(datanode_options, guards).await
     }
 
     async fn build_datanode_options_and_guards(
         &self,
         datanodes: u32,
-    ) -> (Vec<DatanodeOptions>, Vec<StorageGuard>, Vec<FileDirGuard>) {
+    ) -> (Vec<DatanodeOptions>, Vec<TestGuard>) {
         let mut options = Vec::with_capacity(datanodes as usize);
-        let mut storage_guards = Vec::with_capacity(datanodes as usize);
-        let mut dir_guards = Vec::with_capacity(datanodes as usize);
+        let mut guards = Vec::with_capacity(datanodes as usize);
 
         for i in 0..datanodes {
             let datanode_id = i as u64 + 1;
-            let mode = Mode::Distributed;
             let mut opts = if let Some(store_config) = &self.store_config {
                 let home_dir = if let Some(home_dir) = &self.shared_home_dir {
                     home_dir.path().to_str().unwrap().to_string()
                 } else {
                     let home_tmp_dir = create_temp_dir(&format!("gt_home_{}", &self.cluster_name));
                     let home_dir = home_tmp_dir.path().to_str().unwrap().to_string();
-                    dir_guards.push(FileDirGuard::new(home_tmp_dir));
+                    guards.push(TestGuard {
+                        home_guard: FileDirGuard::new(home_tmp_dir),
+                        storage_guards: Vec::new(),
+                    });
 
                     home_dir
                 };
 
                 create_datanode_opts(
-                    mode,
                     store_config.clone(),
                     vec![],
                     home_dir,
@@ -264,15 +271,12 @@ impl GreptimeDbClusterBuilder {
                 )
             } else {
                 let (opts, guard) = create_tmp_dir_and_datanode_opts(
-                    mode,
                     StorageType::File,
                     self.store_providers.clone().unwrap_or_default(),
                     &format!("{}-dn-{}", self.cluster_name, datanode_id),
                     self.datanode_wal_config.clone(),
                 );
-
-                storage_guards.push(guard.storage_guards);
-                dir_guards.push(guard.home_guard);
+                guards.push(guard);
 
                 opts
             };
@@ -280,11 +284,7 @@ impl GreptimeDbClusterBuilder {
 
             options.push(opts);
         }
-        (
-            options,
-            storage_guards.into_iter().flatten().collect(),
-            dir_guards,
-        )
+        (options, guards)
     }
 
     async fn build_datanodes_with_options(
@@ -308,11 +308,10 @@ impl GreptimeDbClusterBuilder {
         expected_datanodes: usize,
     ) {
         for _ in 0..10 {
-            let alive_datanodes =
-                meta_srv::lease::alive_datanodes(1000, meta_peer_client, u64::MAX)
-                    .await
-                    .unwrap()
-                    .len();
+            let alive_datanodes = meta_srv::lease::alive_datanodes(meta_peer_client, u64::MAX)
+                .await
+                .unwrap()
+                .len();
             if alive_datanodes == expected_datanodes {
                 return;
             }
@@ -322,10 +321,9 @@ impl GreptimeDbClusterBuilder {
     }
 
     async fn create_datanode(&self, opts: DatanodeOptions, metasrv: MockInfo) -> Datanode {
-        let mut meta_client =
-            MetaClientBuilder::datanode_default_options(1000, opts.node_id.unwrap())
-                .channel_manager(metasrv.channel_manager)
-                .build();
+        let mut meta_client = MetaClientBuilder::datanode_default_options(opts.node_id.unwrap())
+            .channel_manager(metasrv.channel_manager)
+            .build();
         meta_client.start(&[&metasrv.server_addr]).await.unwrap();
         let meta_client = Arc::new(meta_client);
 
@@ -339,13 +337,11 @@ impl GreptimeDbClusterBuilder {
                 .build(),
         );
 
-        let mut datanode = DatanodeBuilder::new(opts, Plugins::default())
-            .with_kv_backend(meta_backend)
+        let mut builder = DatanodeBuilder::new(opts, Plugins::default(), meta_backend);
+        builder
             .with_cache_registry(layered_cache_registry)
-            .with_meta_client(meta_client)
-            .build()
-            .await
-            .unwrap();
+            .with_meta_client(meta_client);
+        let mut datanode = builder.build().await.unwrap();
 
         datanode.start_heartbeat().await.unwrap();
 
@@ -356,8 +352,8 @@ impl GreptimeDbClusterBuilder {
         &self,
         metasrv: MockInfo,
         datanode_clients: Arc<NodeClients>,
-    ) -> Arc<FeInstance> {
-        let mut meta_client = MetaClientBuilder::frontend_default_options(1000)
+    ) -> Frontend {
+        let mut meta_client = MetaClientBuilder::frontend_default_options()
             .channel_manager(metasrv.channel_manager)
             .enable_access_cluster_info()
             .build();
@@ -385,12 +381,12 @@ impl GreptimeDbClusterBuilder {
 
         let information_extension =
             Arc::new(DistributedInformationExtension::new(meta_client.clone()));
-        let catalog_manager = KvBackendCatalogManager::new(
+        let catalog_manager = KvBackendCatalogManagerBuilder::new(
             information_extension,
             cached_meta_backend.clone(),
             cache_registry.clone(),
-            None,
-        );
+        )
+        .build();
 
         let handlers_executor = HandlerGroupExecutor::new(vec![
             Arc::new(ParseMailboxMessageHandler),
@@ -405,6 +401,7 @@ impl GreptimeDbClusterBuilder {
             Arc::new(handlers_executor),
         );
 
+        let server_addr = options.grpc.server_addr.clone();
         let instance = FrontendBuilder::new(
             options,
             cached_meta_backend.clone(),
@@ -412,15 +409,20 @@ impl GreptimeDbClusterBuilder {
             catalog_manager,
             datanode_clients,
             meta_client,
-            StatementStatistics::default(),
+            Arc::new(ProcessManager::new(server_addr, None)),
         )
         .with_local_cache_invalidator(cache_registry)
-        .with_heartbeat_task(heartbeat_task)
         .try_build()
         .await
         .unwrap();
+        let instance = Arc::new(instance);
 
-        Arc::new(instance)
+        Frontend {
+            instance,
+            servers: ServerHandlers::default(),
+            heartbeat_task: Some(heartbeat_task),
+            export_metrics_task: None,
+        }
     }
 }
 
@@ -489,10 +491,7 @@ async fn create_datanode_client(datanode: &Datanode) -> (String, Client) {
                     if let Some(client) = client {
                         Ok(TokioIo::new(client))
                     } else {
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            "Client already taken",
-                        ))
+                        Err(std::io::Error::other("Client already taken"))
                     }
                 }
             }),

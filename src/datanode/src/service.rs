@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use common_config::Configurable;
 use servers::grpc::builder::GrpcServerBuilder;
-use servers::grpc::{GrpcServer, GrpcServerConfig};
+use servers::grpc::GrpcServer;
 use servers::http::HttpServerBuilder;
 use servers::metrics_handler::MetricsHandler;
 use servers::server::{ServerHandler, ServerHandlers};
@@ -62,7 +62,7 @@ impl<'a> DatanodeServiceBuilder<'a> {
         }
     }
 
-    pub async fn build(mut self) -> Result<ServerHandlers> {
+    pub fn build(mut self) -> Result<ServerHandlers> {
         let handlers = ServerHandlers::default();
 
         if let Some(grpc_server) = self.grpc_server.take() {
@@ -70,7 +70,7 @@ impl<'a> DatanodeServiceBuilder<'a> {
                 addr: &self.opts.grpc.bind_addr,
             })?;
             let handler: ServerHandler = (Box::new(grpc_server), addr);
-            handlers.insert(handler).await;
+            handlers.insert(handler);
         }
 
         if self.enable_http_service {
@@ -82,7 +82,7 @@ impl<'a> DatanodeServiceBuilder<'a> {
                 addr: &self.opts.http.addr,
             })?;
             let handler: ServerHandler = (Box::new(http_server), addr);
-            handlers.insert(handler).await;
+            handlers.insert(handler);
         }
 
         Ok(handlers)
@@ -92,13 +92,7 @@ impl<'a> DatanodeServiceBuilder<'a> {
         opts: &DatanodeOptions,
         region_server: &RegionServer,
     ) -> GrpcServerBuilder {
-        let config = GrpcServerConfig {
-            max_recv_message_size: opts.grpc.max_recv_message_size.as_bytes() as usize,
-            max_send_message_size: opts.grpc.max_send_message_size.as_bytes() as usize,
-            tls: opts.grpc.tls.clone(),
-        };
-
-        GrpcServerBuilder::new(config, region_server.runtime())
+        GrpcServerBuilder::new(opts.grpc.as_config(), region_server.runtime())
             .flight_handler(Arc::new(region_server.clone()))
             .region_server_handler(Arc::new(region_server.clone()))
     }

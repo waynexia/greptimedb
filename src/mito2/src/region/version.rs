@@ -31,7 +31,7 @@ use store_api::metadata::RegionMetadataRef;
 use store_api::storage::SequenceNumber;
 
 use crate::error::Result;
-use crate::manifest::action::RegionEdit;
+use crate::manifest::action::{RegionEdit, TruncateKind};
 use crate::memtable::time_partition::{TimePartitions, TimePartitionsRef};
 use crate::memtable::version::{MemtableVersion, MemtableVersionRef};
 use crate::memtable::{MemtableBuilderRef, MemtableId};
@@ -75,6 +75,12 @@ impl VersionControl {
     pub(crate) fn set_sequence_and_entry_id(&self, seq: SequenceNumber, entry_id: EntryId) {
         let mut data = self.data.write().unwrap();
         data.committed_sequence = seq;
+        data.last_entry_id = entry_id;
+    }
+
+    /// Updates last entry id.
+    pub(crate) fn set_entry_id(&self, entry_id: EntryId) {
+        let mut data = self.data.write().unwrap();
         data.last_entry_id = entry_id;
     }
 
@@ -142,7 +148,7 @@ impl VersionControl {
     /// Mark all opened files as deleted and set the delete marker in [VersionControlData]
     pub(crate) fn mark_dropped(&self, memtable_builder: &MemtableBuilderRef) {
         let version = self.current().version;
-        let part_duration = version.memtables.mutable.part_duration();
+        let part_duration = Some(version.memtables.mutable.part_duration());
         let next_memtable_id = version.memtables.mutable.next_memtable_id();
         let new_mutable = Arc::new(TimePartitions::new(
             version.metadata.clone(),
@@ -166,7 +172,7 @@ impl VersionControl {
     /// new schema. Memtables of the version must be empty.
     pub(crate) fn alter_schema(&self, metadata: RegionMetadataRef, builder: &MemtableBuilderRef) {
         let version = self.current().version;
-        let part_duration = version.memtables.mutable.part_duration();
+        let part_duration = Some(version.memtables.mutable.part_duration());
         let next_memtable_id = version.memtables.mutable.next_memtable_id();
         let new_mutable = Arc::new(TimePartitions::new(
             metadata.clone(),
@@ -190,8 +196,7 @@ impl VersionControl {
     /// Truncate current version.
     pub(crate) fn truncate(
         &self,
-        truncated_entry_id: EntryId,
-        truncated_sequence: SequenceNumber,
+        truncate_kind: TruncateKind,
         memtable_builder: &MemtableBuilderRef,
     ) {
         let version = self.current().version;
@@ -202,19 +207,35 @@ impl VersionControl {
             version.metadata.clone(),
             memtable_builder.clone(),
             next_memtable_id,
-            part_duration,
+            Some(part_duration),
         ));
-        let new_version = Arc::new(
-            VersionBuilder::new(version.metadata.clone(), new_mutable)
-                .flushed_entry_id(truncated_entry_id)
-                .flushed_sequence(truncated_sequence)
-                .truncated_entry_id(Some(truncated_entry_id))
-                .build(),
-        );
+        let new_version = match truncate_kind {
+            TruncateKind::All {
+                truncated_entry_id,
+                truncated_sequence,
+            } => Arc::new(
+                VersionBuilder::new(version.metadata.clone(), new_mutable)
+                    .flushed_entry_id(truncated_entry_id)
+                    .flushed_sequence(truncated_sequence)
+                    .truncated_entry_id(Some(truncated_entry_id))
+                    .build(),
+            ),
+            TruncateKind::Partial { files_to_remove } => Arc::new(
+                VersionBuilder::from_version(version)
+                    .remove_files(files_to_remove.into_iter())
+                    .build(),
+            ),
+        };
 
         let mut version_data = self.data.write().unwrap();
         version_data.version.ssts.mark_all_deleted();
         version_data.version = new_version;
+    }
+
+    /// Overwrites the current version with a new version.
+    pub(crate) fn overwrite_current(&self, version: VersionRef) {
+        let mut version_data = self.data.write().unwrap();
+        version_data.version = version;
     }
 }
 
@@ -235,6 +256,13 @@ pub(crate) struct VersionControlData {
     pub(crate) last_entry_id: EntryId,
     /// Marker of whether this region is dropped/dropping
     pub(crate) is_dropped: bool,
+}
+
+impl VersionControlData {
+    /// Approximate timeseries count in current version.
+    pub(crate) fn series_count(&self) -> usize {
+        self.version.memtables.mutable.series_count()
+    }
 }
 
 /// Static metadata of a region.
@@ -392,6 +420,14 @@ impl VersionBuilder {
     ) -> Self {
         let mut ssts = (*self.ssts).clone();
         ssts.add_files(file_purger, files);
+        self.ssts = Arc::new(ssts);
+
+        self
+    }
+
+    pub(crate) fn remove_files(mut self, files: impl Iterator<Item = FileMeta>) -> Self {
+        let mut ssts = (*self.ssts).clone();
+        ssts.remove_files(files);
         self.ssts = Arc::new(ssts);
 
         self

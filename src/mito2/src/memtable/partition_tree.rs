@@ -19,7 +19,6 @@ mod dedup;
 mod dict;
 mod merger;
 mod partition;
-mod primary_key_filter;
 mod shard;
 mod shard_builder;
 mod tree;
@@ -29,7 +28,8 @@ use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use common_base::readable_size::ReadableSize;
-pub(crate) use primary_key_filter::{DensePrimaryKeyFilter, SparsePrimaryKeyFilter};
+use mito_codec::key_values::KeyValue;
+use mito_codec::row_converter::{build_primary_key_codec, PrimaryKeyCodec};
 use serde::{Deserialize, Serialize};
 use store_api::metadata::RegionMetadataRef;
 use store_api::storage::{ColumnId, SequenceNumber};
@@ -37,15 +37,15 @@ use table::predicate::Predicate;
 
 use crate::error::{Result, UnsupportedOperationSnafu};
 use crate::flush::WriteBufferManagerRef;
-use crate::memtable::key_values::KeyValue;
+use crate::memtable::bulk::part::BulkPart;
 use crate::memtable::partition_tree::tree::PartitionTree;
 use crate::memtable::stats::WriteMetrics;
 use crate::memtable::{
-    AllocTracker, BoxedBatchIterator, BulkPart, IterBuilder, KeyValues, Memtable, MemtableBuilder,
-    MemtableId, MemtableRange, MemtableRangeContext, MemtableRanges, MemtableRef, MemtableStats,
+    AllocTracker, BoxedBatchIterator, IterBuilder, KeyValues, MemScanMetrics, Memtable,
+    MemtableBuilder, MemtableId, MemtableRange, MemtableRangeContext, MemtableRanges, MemtableRef,
+    MemtableStats, PredicateGroup,
 };
 use crate::region::options::MergeMode;
-use crate::row_converter::{build_primary_key_codec, PrimaryKeyCodec};
 
 /// Use `1/DICTIONARY_SIZE_FACTOR` of OS memory as dictionary size.
 pub(crate) const DICTIONARY_SIZE_FACTOR: u64 = 8;
@@ -146,15 +146,11 @@ impl Memtable for PartitionTreeMemtable {
         // Ensures the memtable always updates stats.
         let res = self.tree.write(kvs, &mut pk_buffer, &mut metrics);
 
-        self.update_stats(&metrics);
-
-        // update max_sequence
         if res.is_ok() {
-            let sequence = kvs.max_sequence();
-            self.max_sequence.fetch_max(sequence, Ordering::Relaxed);
+            metrics.max_sequence = kvs.max_sequence();
+            metrics.num_rows = kvs.num_rows();
+            self.update_stats(&metrics);
         }
-
-        self.num_rows.fetch_add(kvs.num_rows(), Ordering::Relaxed);
         res
     }
 
@@ -164,15 +160,12 @@ impl Memtable for PartitionTreeMemtable {
         // Ensures the memtable always updates stats.
         let res = self.tree.write_one(key_value, &mut pk_buffer, &mut metrics);
 
-        self.update_stats(&metrics);
-
         // update max_sequence
         if res.is_ok() {
-            self.max_sequence
-                .fetch_max(key_value.sequence(), Ordering::Relaxed);
+            metrics.max_sequence = metrics.max_sequence.max(key_value.sequence());
+            metrics.num_rows = 1;
+            self.update_stats(&metrics);
         }
-
-        self.num_rows.fetch_add(1, Ordering::Relaxed);
         res
     }
 
@@ -183,34 +176,36 @@ impl Memtable for PartitionTreeMemtable {
         .fail()
     }
 
+    #[cfg(any(test, feature = "test"))]
     fn iter(
         &self,
         projection: Option<&[ColumnId]>,
         predicate: Option<Predicate>,
         sequence: Option<SequenceNumber>,
     ) -> Result<BoxedBatchIterator> {
-        self.tree.read(projection, predicate, sequence)
+        self.tree.read(projection, predicate, sequence, None)
     }
 
     fn ranges(
         &self,
         projection: Option<&[ColumnId]>,
-        predicate: Option<Predicate>,
+        predicate: PredicateGroup,
         sequence: Option<SequenceNumber>,
-    ) -> MemtableRanges {
+    ) -> Result<MemtableRanges> {
         let projection = projection.map(|ids| ids.to_vec());
         let builder = Box::new(PartitionTreeIterBuilder {
             tree: self.tree.clone(),
             projection,
-            predicate,
+            predicate: predicate.predicate().cloned(),
             sequence,
         });
-        let context = Arc::new(MemtableRangeContext::new(self.id, builder));
+        let context = Arc::new(MemtableRangeContext::new(self.id, builder, predicate));
 
-        MemtableRanges {
-            ranges: [(0, MemtableRange::new(context))].into(),
-            stats: self.stats(),
-        }
+        let stats = self.stats();
+        Ok(MemtableRanges {
+            ranges: [(0, MemtableRange::new(context, stats.num_rows))].into(),
+            stats,
+        })
     }
 
     fn is_empty(&self) -> bool {
@@ -234,6 +229,7 @@ impl Memtable for PartitionTreeMemtable {
                 num_rows: 0,
                 num_ranges: 0,
                 max_sequence: 0,
+                series_count: 0,
             };
         }
 
@@ -248,12 +244,14 @@ impl Memtable for PartitionTreeMemtable {
             .expect("Timestamp column must have timestamp type");
         let max_timestamp = ts_type.create_timestamp(self.max_timestamp.load(Ordering::Relaxed));
         let min_timestamp = ts_type.create_timestamp(self.min_timestamp.load(Ordering::Relaxed));
+        let series_count = self.tree.series_count();
         MemtableStats {
             estimated_bytes,
             time_range: Some((min_timestamp, max_timestamp)),
             num_rows: self.num_rows.load(Ordering::Relaxed),
             num_ranges: 1,
             max_sequence: self.max_sequence.load(Ordering::Relaxed),
+            series_count,
         }
     }
 
@@ -301,7 +299,23 @@ impl PartitionTreeMemtable {
     fn update_stats(&self, metrics: &WriteMetrics) {
         // Only let the tracker tracks value bytes.
         self.alloc_tracker.on_allocation(metrics.value_bytes);
-        metrics.update_timestamp_range(&self.max_timestamp, &self.min_timestamp);
+        self.max_timestamp
+            .fetch_max(metrics.max_ts, Ordering::SeqCst);
+        self.min_timestamp
+            .fetch_min(metrics.min_ts, Ordering::SeqCst);
+        self.num_rows.fetch_add(metrics.num_rows, Ordering::SeqCst);
+        self.max_sequence
+            .fetch_max(metrics.max_sequence, Ordering::SeqCst);
+    }
+
+    #[cfg(any(test, feature = "test"))]
+    pub fn iter(
+        &self,
+        projection: Option<&[ColumnId]>,
+        predicate: Option<Predicate>,
+        sequence: Option<SequenceNumber>,
+    ) -> Result<BoxedBatchIterator> {
+        self.tree.read(projection, predicate, sequence, None)
     }
 }
 
@@ -336,6 +350,10 @@ impl MemtableBuilder for PartitionTreeMemtableBuilder {
             &self.config,
         ))
     }
+
+    fn use_bulk_insert(&self, _metadata: &RegionMetadataRef) -> bool {
+        false
+    }
 }
 
 struct PartitionTreeIterBuilder {
@@ -346,32 +364,37 @@ struct PartitionTreeIterBuilder {
 }
 
 impl IterBuilder for PartitionTreeIterBuilder {
-    fn build(&self) -> Result<BoxedBatchIterator> {
+    fn build(&self, metrics: Option<MemScanMetrics>) -> Result<BoxedBatchIterator> {
         self.tree.read(
             self.projection.as_deref(),
             self.predicate.clone(),
             self.sequence,
+            metrics,
         )
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
     use api::v1::value::ValueData;
-    use api::v1::{Row, Rows, SemanticType};
+    use api::v1::{Mutation, OpType, Row, Rows, SemanticType};
     use common_time::Timestamp;
     use datafusion_common::{Column, ScalarValue};
     use datafusion_expr::{BinaryExpr, Expr, Operator};
     use datatypes::data_type::ConcreteDataType;
+    use datatypes::prelude::Vector;
     use datatypes::scalars::ScalarVector;
     use datatypes::schema::ColumnSchema;
     use datatypes::value::Value;
-    use datatypes::vectors::Int64Vector;
+    use datatypes::vectors::{Int64Vector, StringVector};
+    use mito_codec::row_converter::DensePrimaryKeyCodec;
     use store_api::metadata::{ColumnMetadata, RegionMetadataBuilder};
     use store_api::storage::RegionId;
 
     use super::*;
-    use crate::row_converter::DensePrimaryKeyCodec;
     use crate::test_util::memtable_util::{
         self, collect_iter_timestamps, region_metadata_to_row_schema,
     };
@@ -384,9 +407,9 @@ mod tests {
 
     fn write_iter_sorted_input(has_pk: bool) {
         let metadata = if has_pk {
-            memtable_util::metadata_with_primary_key(vec![1, 0], true)
+            Arc::new(memtable_util::metadata_with_primary_key(vec![1, 0], true))
         } else {
-            memtable_util::metadata_with_primary_key(vec![], false)
+            Arc::new(memtable_util::metadata_with_primary_key(vec![], false))
         };
         let timestamps = (0..100).collect::<Vec<_>>();
         let kvs =
@@ -429,9 +452,9 @@ mod tests {
 
     fn write_iter_unsorted_input(has_pk: bool) {
         let metadata = if has_pk {
-            memtable_util::metadata_with_primary_key(vec![1, 0], true)
+            Arc::new(memtable_util::metadata_with_primary_key(vec![1, 0], true))
         } else {
-            memtable_util::metadata_with_primary_key(vec![], false)
+            Arc::new(memtable_util::metadata_with_primary_key(vec![], false))
         };
         let codec = Arc::new(DensePrimaryKeyCodec::new(&metadata));
         let memtable = PartitionTreeMemtable::new(
@@ -494,9 +517,9 @@ mod tests {
 
     fn write_iter_projection(has_pk: bool) {
         let metadata = if has_pk {
-            memtable_util::metadata_with_primary_key(vec![1, 0], true)
+            Arc::new(memtable_util::metadata_with_primary_key(vec![1, 0], true))
         } else {
-            memtable_util::metadata_with_primary_key(vec![], false)
+            Arc::new(memtable_util::metadata_with_primary_key(vec![], false))
         };
         // Try to build a memtable via the builder.
         let memtable = PartitionTreeMemtableBuilder::new(PartitionTreeConfig::default(), None)
@@ -534,7 +557,7 @@ mod tests {
     }
 
     fn write_iter_multi_keys(max_keys: usize, freeze_threshold: usize) {
-        let metadata = memtable_util::metadata_with_primary_key(vec![1, 0], true);
+        let metadata = Arc::new(memtable_util::metadata_with_primary_key(vec![1, 0], true));
         let codec = Arc::new(DensePrimaryKeyCodec::new(&metadata));
         let memtable = PartitionTreeMemtable::new(
             1,
@@ -584,7 +607,7 @@ mod tests {
 
     #[test]
     fn test_memtable_filter() {
-        let metadata = memtable_util::metadata_with_primary_key(vec![0, 1], false);
+        let metadata = Arc::new(memtable_util::metadata_with_primary_key(vec![0, 1], false));
         // Try to build a memtable via the builder.
         let memtable = PartitionTreeMemtableBuilder::new(
             PartitionTreeConfig {
@@ -605,10 +628,7 @@ mod tests {
         for i in 0..100 {
             let timestamps: Vec<_> = (0..10).map(|v| i as i64 * 1000 + v).collect();
             let expr = Expr::BinaryExpr(BinaryExpr {
-                left: Box::new(Expr::Column(Column {
-                    relation: None,
-                    name: "k1".to_string(),
-                })),
+                left: Box::new(Expr::Column(Column::from_name("k1"))),
                 op: Operator::Eq,
                 right: Box::new(Expr::Literal(ScalarValue::UInt32(Some(i)))),
             });
@@ -789,5 +809,149 @@ mod tests {
         } else {
             unreachable!()
         }
+    }
+
+    fn kv_region_metadata() -> RegionMetadataRef {
+        let mut builder = RegionMetadataBuilder::new(RegionId::new(123, 456));
+        builder
+            .push_column_metadata(ColumnMetadata {
+                column_schema: ColumnSchema::new(
+                    "ts",
+                    ConcreteDataType::timestamp_millisecond_datatype(),
+                    false,
+                ),
+                semantic_type: SemanticType::Timestamp,
+                column_id: 0,
+            })
+            .push_column_metadata(ColumnMetadata {
+                column_schema: ColumnSchema::new("k", ConcreteDataType::string_datatype(), false),
+                semantic_type: SemanticType::Tag,
+                column_id: 1,
+            })
+            .push_column_metadata(ColumnMetadata {
+                column_schema: ColumnSchema::new("v", ConcreteDataType::string_datatype(), false),
+                semantic_type: SemanticType::Field,
+                column_id: 2,
+            })
+            .primary_key(vec![1]);
+        let region_metadata = builder.build().unwrap();
+        Arc::new(region_metadata)
+    }
+
+    fn kv_column_schemas() -> Vec<api::v1::ColumnSchema> {
+        vec![
+            api::v1::ColumnSchema {
+                column_name: "ts".to_string(),
+                datatype: api::v1::ColumnDataType::TimestampMillisecond as i32,
+                semantic_type: SemanticType::Timestamp as i32,
+                ..Default::default()
+            },
+            api::v1::ColumnSchema {
+                column_name: "k".to_string(),
+                datatype: api::v1::ColumnDataType::String as i32,
+                semantic_type: SemanticType::Tag as i32,
+                ..Default::default()
+            },
+            api::v1::ColumnSchema {
+                column_name: "v".to_string(),
+                datatype: api::v1::ColumnDataType::String as i32,
+                semantic_type: SemanticType::Field as i32,
+                ..Default::default()
+            },
+        ]
+    }
+
+    fn key_values<T: AsRef<str>>(
+        metadata: &RegionMetadataRef,
+        keys: impl Iterator<Item = T>,
+    ) -> KeyValues {
+        let rows = keys
+            .map(|c| Row {
+                values: vec![
+                    api::v1::Value {
+                        value_data: Some(ValueData::TimestampMillisecondValue(0)),
+                    },
+                    api::v1::Value {
+                        value_data: Some(ValueData::StringValue(c.as_ref().to_string())),
+                    },
+                    api::v1::Value {
+                        value_data: Some(ValueData::StringValue(c.as_ref().to_string())),
+                    },
+                ],
+            })
+            .collect();
+        let mutation = Mutation {
+            op_type: OpType::Put as i32,
+            sequence: 0,
+            rows: Some(Rows {
+                schema: kv_column_schemas(),
+                rows,
+            }),
+            write_hint: None,
+        };
+        KeyValues::new(metadata, mutation).unwrap()
+    }
+
+    fn collect_kvs(
+        iter: BoxedBatchIterator,
+        region_meta: &RegionMetadataRef,
+    ) -> HashMap<String, String> {
+        let decoder = DensePrimaryKeyCodec::new(region_meta);
+        let mut res = HashMap::new();
+        for v in iter {
+            let batch = v.unwrap();
+            let values = decoder.decode(batch.primary_key()).unwrap().into_dense();
+            let field_vector = batch.fields()[0]
+                .data
+                .as_any()
+                .downcast_ref::<StringVector>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                res.insert(
+                    values[0].as_string().unwrap(),
+                    field_vector.get(row).as_string().unwrap(),
+                );
+            }
+        }
+        res
+    }
+
+    #[test]
+    fn test_reorder_insert_key_values() {
+        let metadata = kv_region_metadata();
+        let memtable = PartitionTreeMemtableBuilder::new(PartitionTreeConfig::default(), None)
+            .build(1, &metadata);
+
+        memtable
+            .write(&key_values(&metadata, ('a'..'h').map(|c| c.to_string())))
+            .unwrap();
+        memtable.freeze().unwrap();
+        assert_eq!(
+            collect_kvs(memtable.iter(None, None, None).unwrap(), &metadata),
+            ('a'..'h').map(|c| (c.to_string(), c.to_string())).collect()
+        );
+        let forked = memtable.fork(2, &metadata);
+
+        let keys = ["c", "f", "i", "h", "b", "e", "g"];
+        forked.write(&key_values(&metadata, keys.iter())).unwrap();
+        forked.freeze().unwrap();
+        assert_eq!(
+            collect_kvs(forked.iter(None, None, None).unwrap(), &metadata),
+            keys.iter()
+                .map(|c| (c.to_string(), c.to_string()))
+                .collect()
+        );
+
+        let forked2 = forked.fork(3, &metadata);
+
+        let keys = ["g", "e", "a", "f", "b", "c", "h"];
+        forked2.write(&key_values(&metadata, keys.iter())).unwrap();
+
+        let kvs = collect_kvs(forked2.iter(None, None, None).unwrap(), &metadata);
+        let expected = keys
+            .iter()
+            .map(|c| (c.to_string(), c.to_string()))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(kvs, expected);
     }
 }

@@ -6,6 +6,7 @@ license.workspace = true
 
 [features]
 testing = []
+enterprise = ["common-meta/enterprise", "operator/enterprise", "sql/enterprise"]
 
 [lints]
 workspace = true
@@ -13,8 +14,10 @@ workspace = true
 [dependencies]
 api.workspace = true
 arc-swap = "1.0"
+async-stream.workspace = true
 async-trait.workspace = true
 auth.workspace = true
+bytes.workspace = true
 cache.workspace = true
 catalog.workspace = true
 client.workspace = true
@@ -23,6 +26,7 @@ common-catalog.workspace = true
 common-config.workspace = true
 common-datasource.workspace = true
 common-error.workspace = true
+common-frontend.workspace = true
 common-function.workspace = true
 common-grpc.workspace = true
 common-macro.workspace = true
@@ -35,10 +39,12 @@ common-runtime.workspace = true
 common-telemetry.workspace = true
 common-time.workspace = true
 common-version.workspace = true
+dashmap.workspace = true
 datafusion.workspace = true
 datafusion-expr.workspace = true
 datanode.workspace = true
 datatypes.workspace = true
+futures.workspace = true
 humantime-serde.workspace = true
 lazy_static.workspace = true
 log-query.workspace = true
@@ -47,12 +53,14 @@ meta-client.workspace = true
 num_cpus.workspace = true
 opentelemetry-proto.workspace = true
 operator.workspace = true
+otel-arrow-rust.workspace = true
 partition.workspace = true
 pipeline.workspace = true
 prometheus.workspace = true
 promql-parser.workspace = true
 prost.workspace = true
 query.workspace = true
+rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 servers.workspace = true
@@ -61,10 +69,13 @@ snafu.workspace = true
 sql.workspace = true
 sqlparser.workspace = true
 store-api.workspace = true
+substrait.workspace = true
 table.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 toml.workspace = true
 tonic.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 catalog = { workspace = true, features = ["testing"] }

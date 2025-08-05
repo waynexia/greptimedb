@@ -48,6 +48,11 @@ impl TableRouteKey {
     pub fn new(table_id: TableId) -> Self {
         Self { table_id }
     }
+
+    /// Returns the range prefix of the table route key.
+    pub fn range_prefix() -> Vec<u8> {
+        format!("{}/", TABLE_ROUTE_PREFIX).into_bytes()
+    }
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
@@ -181,6 +186,17 @@ impl TableRouteValue {
         match self {
             TableRouteValue::Physical(x) => x,
             _ => unreachable!("Mistakenly been treated as a Physical TableRoute: {self:?}"),
+        }
+    }
+
+    /// Converts to [`LogicalTableRouteValue`].
+    ///
+    /// # Panic
+    /// If it is not the [`LogicalTableRouteValue`].
+    pub fn into_logical_table_route(self) -> LogicalTableRouteValue {
+        match self {
+            TableRouteValue::Logical(x) => x,
+            _ => unreachable!("Mistakenly been treated as a Logical TableRoute: {self:?}"),
         }
     }
 
@@ -478,10 +494,11 @@ impl TableRouteStorage {
         ))
     }
 
+    // TODO(LFC): restore its original visibility after some test utility codes are refined
     /// Builds a update table route transaction,
     /// it expected the remote value equals the `current_table_route_value`.
     /// It retrieves the latest value if the comparing failed.
-    pub(crate) fn build_update_txn(
+    pub fn build_update_txn(
         &self,
         table_id: TableId,
         current_table_route_value: &DeserializedValueWithBytes<TableRouteValue>,
@@ -705,6 +722,7 @@ mod tests {
                         name: "r1".to_string(),
                         partition: None,
                         attrs: Default::default(),
+                        partition_expr: Default::default(),
                     },
                     leader_peer: Some(Peer {
                         id: 2,
@@ -720,6 +738,7 @@ mod tests {
                         name: "r1".to_string(),
                         partition: None,
                         attrs: Default::default(),
+                        partition_expr: Default::default(),
                     },
                     leader_peer: Some(Peer {
                         id: 2,

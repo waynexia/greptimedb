@@ -17,7 +17,6 @@ mod validate;
 
 use std::collections::{HashMap, HashSet};
 
-use common_telemetry::error;
 use extract_new_columns::extract_new_columns;
 use snafu::{ensure, OptionExt, ResultExt};
 use store_api::metadata::ColumnMetadata;
@@ -31,7 +30,7 @@ use crate::error::{
     LogicalRegionNotFoundSnafu, PhysicalRegionNotFoundSnafu, Result, SerializeColumnMetadataSnafu,
     UnexpectedRequestSnafu,
 };
-use crate::utils::to_data_region_id;
+use crate::utils::{append_manifest_info, encode_manifest_info_to_extensions, to_data_region_id};
 
 impl MetricEngineInner {
     pub async fn alter_regions(
@@ -54,37 +53,77 @@ impl MetricEngineInner {
             let (region_id, request) = requests.pop().unwrap();
             self.alter_physical_region(region_id, request).await?;
         } else {
-            self.alter_logical_regions(requests, extension_return_value)
-                .await?;
+            // Fast path for single logical region alter request
+            if requests.len() == 1 {
+                // Safety: requests is not empty
+                let region_id = requests.first().unwrap().0;
+                let physical_region_id = self
+                    .state
+                    .read()
+                    .unwrap()
+                    .get_physical_region_id(region_id)
+                    .with_context(|| LogicalRegionNotFoundSnafu { region_id })?;
+                let mut manifest_infos = Vec::with_capacity(1);
+                self.alter_logical_regions(physical_region_id, requests, extension_return_value)
+                    .await?;
+                append_manifest_info(&self.mito, physical_region_id, &mut manifest_infos);
+                encode_manifest_info_to_extensions(&manifest_infos, extension_return_value)?;
+            } else {
+                let grouped_requests =
+                    self.group_logical_region_requests_by_physical_region_id(requests)?;
+                let mut manifest_infos = Vec::with_capacity(grouped_requests.len());
+                for (physical_region_id, requests) in grouped_requests {
+                    self.alter_logical_regions(
+                        physical_region_id,
+                        requests,
+                        extension_return_value,
+                    )
+                    .await?;
+                    append_manifest_info(&self.mito, physical_region_id, &mut manifest_infos);
+                }
+                encode_manifest_info_to_extensions(&manifest_infos, extension_return_value)?;
+            }
         }
         Ok(0)
+    }
+
+    /// Groups the alter logical region requests by physical region id.
+    fn group_logical_region_requests_by_physical_region_id(
+        &self,
+        requests: Vec<(RegionId, RegionAlterRequest)>,
+    ) -> Result<HashMap<RegionId, Vec<(RegionId, RegionAlterRequest)>>> {
+        let mut result = HashMap::with_capacity(requests.len());
+        let state = self.state.read().unwrap();
+
+        for (region_id, request) in requests {
+            let physical_region_id = state
+                .get_physical_region_id(region_id)
+                .with_context(|| LogicalRegionNotFoundSnafu { region_id })?;
+            result
+                .entry(physical_region_id)
+                .or_insert_with(Vec::new)
+                .push((region_id, request));
+        }
+
+        Ok(result)
     }
 
     /// Alter multiple logical regions on the same physical region.
     pub async fn alter_logical_regions(
         &self,
+        physical_region_id: RegionId,
         requests: Vec<(RegionId, RegionAlterRequest)>,
         extension_return_value: &mut HashMap<String, Vec<u8>>,
     ) -> Result<AffectedRows> {
         // Checks all alter requests are add columns.
         validate_alter_region_requests(&requests)?;
 
-        let first_logical_region_id = requests[0].0;
-
         // Finds new columns to add
         let mut new_column_names = HashSet::new();
         let mut new_columns_to_add = vec![];
 
-        let (physical_region_id, index_options) = {
+        let index_options = {
             let state = &self.state.read().unwrap();
-            let physical_region_id = state
-                .get_physical_region_id(first_logical_region_id)
-                .with_context(|| {
-                    error!("Trying to alter an nonexistent region {first_logical_region_id}");
-                    LogicalRegionNotFoundSnafu {
-                        region_id: first_logical_region_id,
-                    }
-                })?;
             let region_state = state
                 .physical_region_states()
                 .get(&physical_region_id)
@@ -100,7 +139,7 @@ impl MetricEngineInner {
                 &mut new_columns_to_add,
             )?;
 
-            (physical_region_id, region_state.options().index)
+            region_state.options().index
         };
         let data_region_id = to_data_region_id(physical_region_id);
 
@@ -112,7 +151,7 @@ impl MetricEngineInner {
             let _write_guard = self
                 .metadata_region
                 .write_lock_logical_region(*region_id)
-                .await;
+                .await?;
             write_guards.insert(*region_id, _write_guard);
         }
 
@@ -183,13 +222,17 @@ mod test {
     use std::time::Duration;
 
     use api::v1::SemanticType;
-    use datatypes::data_type::ConcreteDataType;
-    use datatypes::schema::ColumnSchema;
-    use store_api::metadata::ColumnMetadata;
-    use store_api::region_request::{AddColumn, SetRegionOption};
+    use common_meta::ddl::test_util::assert_column_name_and_id;
+    use common_meta::ddl::utils::{parse_column_metadatas, parse_manifest_infos_from_extensions};
+    use store_api::metric_engine_consts::ALTER_PHYSICAL_EXTENSION_KEY;
+    use store_api::region_engine::RegionEngine;
+    use store_api::region_request::{
+        AlterKind, BatchRegionDdlRequest, RegionAlterRequest, SetRegionOption,
+    };
+    use store_api::storage::consts::ReservedColumnId;
+    use store_api::storage::RegionId;
 
-    use super::*;
-    use crate::test_util::TestEnv;
+    use crate::test_util::{alter_logical_region_request, create_logical_region_request, TestEnv};
 
     #[tokio::test]
     async fn test_alter_region() {
@@ -200,23 +243,7 @@ mod test {
 
         // alter physical region
         let physical_region_id = env.default_physical_region_id();
-        let request = RegionAlterRequest {
-            schema_version: 0,
-            kind: AlterKind::AddColumns {
-                columns: vec![AddColumn {
-                    column_metadata: ColumnMetadata {
-                        column_id: 0,
-                        semantic_type: SemanticType::Tag,
-                        column_schema: ColumnSchema::new(
-                            "tag1",
-                            ConcreteDataType::string_datatype(),
-                            false,
-                        ),
-                    },
-                    location: None,
-                }],
-            },
-        };
+        let request = alter_logical_region_request(&["tag1"]);
 
         let result = engine_inner
             .alter_physical_region(physical_region_id, request.clone())
@@ -229,7 +256,6 @@ mod test {
 
         // alter physical region's option should work
         let alter_region_option_request = RegionAlterRequest {
-            schema_version: 0,
             kind: AlterKind::SetRegionOptions {
                 options: vec![SetRegionOption::Ttl(Some(Duration::from_secs(500).into()))],
             },
@@ -250,10 +276,18 @@ mod test {
         assert!(!is_column_exist);
 
         let region_id = env.default_logical_region_id();
-        engine_inner
-            .alter_logical_regions(vec![(region_id, request)], &mut HashMap::new())
+        let response = env
+            .metric()
+            .handle_batch_ddl_requests(BatchRegionDdlRequest::Alter(vec![(
+                region_id,
+                request.clone(),
+            )]))
             .await
             .unwrap();
+        let manifest_infos = parse_manifest_infos_from_extensions(&response.extensions).unwrap();
+        assert_eq!(manifest_infos[0].0, physical_region_id);
+        assert!(manifest_infos[0].1.is_metric());
+
         let semantic_type = metadata_region
             .column_semantic_type(physical_region_id, logical_region_id, "tag1")
             .await
@@ -266,5 +300,77 @@ mod test {
             .unwrap()
             .unwrap();
         assert_eq!(timestamp_index, SemanticType::Timestamp);
+        let column_metadatas =
+            parse_column_metadatas(&response.extensions, ALTER_PHYSICAL_EXTENSION_KEY).unwrap();
+        assert_column_name_and_id(
+            &column_metadatas,
+            &[
+                ("greptime_timestamp", 0),
+                ("greptime_value", 1),
+                ("__table_id", ReservedColumnId::table_id()),
+                ("__tsid", ReservedColumnId::tsid()),
+                ("job", 2),
+                ("tag1", 3),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn test_alter_logical_regions() {
+        let env = TestEnv::new().await;
+        let engine = env.metric();
+        let physical_region_id1 = RegionId::new(1024, 0);
+        let physical_region_id2 = RegionId::new(1024, 1);
+        let logical_region_id1 = RegionId::new(1025, 0);
+        let logical_region_id2 = RegionId::new(1025, 1);
+        env.create_physical_region(physical_region_id1, "/test_dir1")
+            .await;
+        env.create_physical_region(physical_region_id2, "/test_dir2")
+            .await;
+
+        let region_create_request1 = crate::test_util::create_logical_region_request(
+            &["job"],
+            physical_region_id1,
+            "logical1",
+        );
+        let region_create_request2 =
+            create_logical_region_request(&["job"], physical_region_id2, "logical2");
+        engine
+            .handle_batch_ddl_requests(BatchRegionDdlRequest::Create(vec![
+                (logical_region_id1, region_create_request1),
+                (logical_region_id2, region_create_request2),
+            ]))
+            .await
+            .unwrap();
+
+        let region_alter_request1 = alter_logical_region_request(&["tag1"]);
+        let region_alter_request2 = alter_logical_region_request(&["tag1"]);
+        let response = engine
+            .handle_batch_ddl_requests(BatchRegionDdlRequest::Alter(vec![
+                (logical_region_id1, region_alter_request1),
+                (logical_region_id2, region_alter_request2),
+            ]))
+            .await
+            .unwrap();
+
+        let manifest_infos = parse_manifest_infos_from_extensions(&response.extensions).unwrap();
+        assert_eq!(manifest_infos.len(), 2);
+        let region_ids = manifest_infos.into_iter().map(|i| i.0).collect::<Vec<_>>();
+        assert!(region_ids.contains(&physical_region_id1));
+        assert!(region_ids.contains(&physical_region_id2));
+
+        let column_metadatas =
+            parse_column_metadatas(&response.extensions, ALTER_PHYSICAL_EXTENSION_KEY).unwrap();
+        assert_column_name_and_id(
+            &column_metadatas,
+            &[
+                ("greptime_timestamp", 0),
+                ("greptime_value", 1),
+                ("__table_id", ReservedColumnId::table_id()),
+                ("__tsid", ReservedColumnId::tsid()),
+                ("job", 2),
+                ("tag1", 3),
+            ],
+        );
     }
 }

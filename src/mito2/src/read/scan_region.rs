@@ -16,31 +16,41 @@
 
 use std::collections::HashSet;
 use std::fmt;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Instant;
 
+use api::v1::SemanticType;
 use common_error::ext::BoxedError;
+use common_recordbatch::filter::SimpleFilterEvaluator;
 use common_recordbatch::SendableRecordBatchStream;
 use common_telemetry::{debug, error, tracing, warn};
 use common_time::range::TimestampRange;
+use datafusion_common::Column;
 use datafusion_expr::utils::expr_to_columns;
+use datafusion_expr::Expr;
 use smallvec::SmallVec;
+use store_api::metadata::{RegionMetadata, RegionMetadataRef};
 use store_api::region_engine::{PartitionRange, RegionScannerRef};
-use store_api::storage::{ScanRequest, TimeSeriesRowSelector};
+use store_api::storage::{RegionId, ScanRequest, TimeSeriesDistribution, TimeSeriesRowSelector};
 use table::predicate::{build_time_range_predicate, Predicate};
 use tokio::sync::{mpsc, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::access_layer::AccessLayerRef;
 use crate::cache::CacheStrategy;
-use crate::config::DEFAULT_SCAN_CHANNEL_SIZE;
+use crate::config::{DEFAULT_MAX_CONCURRENT_SCAN_FILES, DEFAULT_SCAN_CHANNEL_SIZE};
 use crate::error::Result;
+#[cfg(feature = "enterprise")]
+use crate::extension::{BoxedExtensionRange, BoxedExtensionRangeProvider};
 use crate::memtable::MemtableRange;
 use crate::metrics::READ_SST_COUNT;
 use crate::read::compat::{self, CompatBatch};
 use crate::read::projection::ProjectionMapper;
 use crate::read::range::{FileRangeBuilder, MemRangeBuilder, RangeMeta, RowGroupIndex};
 use crate::read::seq_scan::SeqScan;
+use crate::read::series_scan::SeriesScan;
+use crate::read::stream::ScanBatchStream;
 use crate::read::unordered_scan::UnorderedScan;
 use crate::read::{Batch, Source};
 use crate::region::options::MergeMode;
@@ -61,6 +71,8 @@ pub(crate) enum Scanner {
     Seq(SeqScan),
     /// Unordered scan.
     Unordered(UnorderedScan),
+    /// Per-series scan.
+    Series(SeriesScan),
 }
 
 impl Scanner {
@@ -70,6 +82,16 @@ impl Scanner {
         match self {
             Scanner::Seq(seq_scan) => seq_scan.build_stream(),
             Scanner::Unordered(unordered_scan) => unordered_scan.build_stream().await,
+            Scanner::Series(series_scan) => series_scan.build_stream().await,
+        }
+    }
+
+    /// Create a stream of [`Batch`] by this scanner.
+    pub(crate) fn scan_batch(&self) -> Result<ScanBatchStream> {
+        match self {
+            Scanner::Seq(x) => x.scan_all_partitions(),
+            Scanner::Unordered(x) => x.scan_all_partitions(),
+            Scanner::Series(x) => x.scan_all_partitions(),
         }
     }
 }
@@ -81,6 +103,7 @@ impl Scanner {
         match self {
             Scanner::Seq(seq_scan) => seq_scan.input().num_files(),
             Scanner::Unordered(unordered_scan) => unordered_scan.input().num_files(),
+            Scanner::Series(series_scan) => series_scan.input().num_files(),
         }
     }
 
@@ -89,14 +112,16 @@ impl Scanner {
         match self {
             Scanner::Seq(seq_scan) => seq_scan.input().num_memtables(),
             Scanner::Unordered(unordered_scan) => unordered_scan.input().num_memtables(),
+            Scanner::Series(series_scan) => series_scan.input().num_memtables(),
         }
     }
 
     /// Returns SST file ids to scan.
-    pub(crate) fn file_ids(&self) -> Vec<crate::sst::file::FileId> {
+    pub(crate) fn file_ids(&self) -> Vec<crate::sst::file::RegionFileId> {
         match self {
             Scanner::Seq(seq_scan) => seq_scan.input().file_ids(),
             Scanner::Unordered(unordered_scan) => unordered_scan.input().file_ids(),
+            Scanner::Series(series_scan) => series_scan.input().file_ids(),
         }
     }
 
@@ -108,6 +133,7 @@ impl Scanner {
         match self {
             Scanner::Seq(seq_scan) => seq_scan.prepare(request).unwrap(),
             Scanner::Unordered(unordered_scan) => unordered_scan.prepare(request).unwrap(),
+            Scanner::Series(series_scan) => series_scan.prepare(request).unwrap(),
         }
     }
 }
@@ -173,6 +199,8 @@ pub(crate) struct ScanRegion {
     cache_strategy: CacheStrategy,
     /// Capacity of the channel to send data from parallel scan tasks to the main task.
     parallel_scan_channel_size: usize,
+    /// Maximum number of SST files to scan concurrently.
+    max_concurrent_scan_files: usize,
     /// Whether to ignore inverted index.
     ignore_inverted_index: bool,
     /// Whether to ignore fulltext index.
@@ -181,6 +209,11 @@ pub(crate) struct ScanRegion {
     ignore_bloom_filter: bool,
     /// Start time of the scan task.
     start_time: Option<Instant>,
+    /// Whether to filter out the deleted rows.
+    /// Usually true for normal read, and false for scan for compaction.
+    filter_deleted: bool,
+    #[cfg(feature = "enterprise")]
+    extension_range_provider: Option<BoxedExtensionRangeProvider>,
 }
 
 impl ScanRegion {
@@ -197,10 +230,14 @@ impl ScanRegion {
             request,
             cache_strategy,
             parallel_scan_channel_size: DEFAULT_SCAN_CHANNEL_SIZE,
+            max_concurrent_scan_files: DEFAULT_MAX_CONCURRENT_SCAN_FILES,
             ignore_inverted_index: false,
             ignore_fulltext_index: false,
             ignore_bloom_filter: false,
             start_time: None,
+            filter_deleted: true,
+            #[cfg(feature = "enterprise")]
+            extension_range_provider: None,
         }
     }
 
@@ -211,6 +248,16 @@ impl ScanRegion {
         parallel_scan_channel_size: usize,
     ) -> Self {
         self.parallel_scan_channel_size = parallel_scan_channel_size;
+        self
+    }
+
+    /// Sets maximum number of SST files to scan concurrently.
+    #[must_use]
+    pub(crate) fn with_max_concurrent_scan_files(
+        mut self,
+        max_concurrent_scan_files: usize,
+    ) -> Self {
+        self.max_concurrent_scan_files = max_concurrent_scan_files;
         self
     }
 
@@ -241,62 +288,113 @@ impl ScanRegion {
         self
     }
 
+    pub(crate) fn set_filter_deleted(&mut self, filter_deleted: bool) {
+        self.filter_deleted = filter_deleted;
+    }
+
+    #[cfg(feature = "enterprise")]
+    pub(crate) fn set_extension_range_provider(
+        &mut self,
+        extension_range_provider: BoxedExtensionRangeProvider,
+    ) {
+        self.extension_range_provider = Some(extension_range_provider);
+    }
+
     /// Returns a [Scanner] to scan the region.
-    pub(crate) fn scanner(self) -> Result<Scanner> {
-        if self.use_unordered_scan() {
+    pub(crate) async fn scanner(self) -> Result<Scanner> {
+        if self.use_series_scan() {
+            self.series_scan().await.map(Scanner::Series)
+        } else if self.use_unordered_scan() {
             // If table is append only and there is no series row selector, we use unordered scan in query.
             // We still use seq scan in compaction.
-            self.unordered_scan().map(Scanner::Unordered)
+            self.unordered_scan().await.map(Scanner::Unordered)
         } else {
-            self.seq_scan().map(Scanner::Seq)
+            self.seq_scan().await.map(Scanner::Seq)
         }
     }
 
     /// Returns a [RegionScanner] to scan the region.
     #[tracing::instrument(level = tracing::Level::DEBUG, skip_all)]
-    pub(crate) fn region_scanner(self) -> Result<RegionScannerRef> {
-        if self.use_unordered_scan() {
-            self.unordered_scan().map(|scanner| Box::new(scanner) as _)
+    pub(crate) async fn region_scanner(self) -> Result<RegionScannerRef> {
+        if self.use_series_scan() {
+            self.series_scan()
+                .await
+                .map(|scanner| Box::new(scanner) as _)
+        } else if self.use_unordered_scan() {
+            self.unordered_scan()
+                .await
+                .map(|scanner| Box::new(scanner) as _)
         } else {
-            self.seq_scan().map(|scanner| Box::new(scanner) as _)
+            self.seq_scan().await.map(|scanner| Box::new(scanner) as _)
         }
     }
 
     /// Scan sequentially.
-    pub(crate) fn seq_scan(self) -> Result<SeqScan> {
-        let input = self.scan_input(true)?;
+    pub(crate) async fn seq_scan(self) -> Result<SeqScan> {
+        let input = self.scan_input().await?;
         Ok(SeqScan::new(input, false))
     }
 
     /// Unordered scan.
-    pub(crate) fn unordered_scan(self) -> Result<UnorderedScan> {
-        let input = self.scan_input(true)?;
+    pub(crate) async fn unordered_scan(self) -> Result<UnorderedScan> {
+        let input = self.scan_input().await?;
         Ok(UnorderedScan::new(input))
     }
 
-    #[cfg(test)]
-    pub(crate) fn scan_without_filter_deleted(self) -> Result<SeqScan> {
-        let input = self.scan_input(false)?;
-        Ok(SeqScan::new(input, false))
+    /// Scans by series.
+    pub(crate) async fn series_scan(self) -> Result<SeriesScan> {
+        let input = self.scan_input().await?;
+        Ok(SeriesScan::new(input))
     }
 
     /// Returns true if the region can use unordered scan for current request.
     fn use_unordered_scan(&self) -> bool {
-        // If table is append only and there is no series row selector, we use unordered scan in query.
+        // We use unordered scan when:
+        // 1. The region is in append mode.
+        // 2. There is no series row selector.
+        // 3. The required distribution is None or TimeSeriesDistribution::TimeWindowed.
+        //
         // We still use seq scan in compaction.
-        self.version.options.append_mode && self.request.series_row_selector.is_none()
+        self.version.options.append_mode
+            && self.request.series_row_selector.is_none()
+            && (self.request.distribution.is_none()
+                || self.request.distribution == Some(TimeSeriesDistribution::TimeWindowed))
+    }
+
+    /// Returns true if the region can use series scan for current request.
+    fn use_series_scan(&self) -> bool {
+        self.request.distribution == Some(TimeSeriesDistribution::PerSeries)
     }
 
     /// Creates a scan input.
-    fn scan_input(mut self, filter_deleted: bool) -> Result<ScanInput> {
+    async fn scan_input(mut self) -> Result<ScanInput> {
+        let sst_min_sequence = self.request.sst_min_sequence.and_then(NonZeroU64::new);
         let time_range = self.build_time_range_predicate();
+        let predicate = PredicateGroup::new(&self.version.metadata, &self.request.filters);
+
+        // The mapper always computes projected column ids as the schema of SSTs may change.
+        let mapper = match &self.request.projection {
+            Some(p) => ProjectionMapper::new(&self.version.metadata, p.iter().copied())?,
+            None => ProjectionMapper::all(&self.version.metadata)?,
+        };
 
         let ssts = &self.version.ssts;
         let mut files = Vec::new();
         for level in ssts.levels() {
             for file in level.files.values() {
+                let exceed_min_sequence = match (sst_min_sequence, file.meta_ref().sequence) {
+                    (Some(min_sequence), Some(file_sequence)) => file_sequence > min_sequence,
+                    // If the file's sequence is None (or actually is zero), it could mean the file
+                    // is generated and added to the region "directly". In this case, its data should
+                    // be considered as fresh as the memtable. So its sequence is treated greater than
+                    // the min_sequence, whatever the value of min_sequence is. Hence the default
+                    // "true" in this arm.
+                    (Some(_), None) => true,
+                    (None, _) => true,
+                };
+
                 // Finds SST files in range.
-                if file_in_range(file, &time_range) {
+                if exceed_min_sequence && file_in_range(file, &time_range) {
                     files.push(file.clone());
                 }
                 // There is no need to check and prune for file's sequence here as the sequence number is usually very new,
@@ -307,28 +405,39 @@ impl ScanRegion {
 
         let memtables = self.version.memtables.list_memtables();
         // Skip empty memtables and memtables out of time range.
-        let memtables: Vec<_> = memtables
-            .into_iter()
-            .filter(|mem| {
-                if mem.is_empty() {
-                    return false;
-                }
-                let stats = mem.stats();
-                // Safety: the memtable is not empty.
-                let (start, end) = stats.time_range().unwrap();
+        let mut mem_range_builders = Vec::new();
 
-                // The time range of the memtable is inclusive.
-                let memtable_range = TimestampRange::new_inclusive(Some(start), Some(end));
-                memtable_range.intersects(&time_range)
-            })
-            .collect();
+        for m in memtables {
+            // check if memtable is empty by reading stats.
+            let Some((start, end)) = m.stats().time_range() else {
+                continue;
+            };
+            // The time range of the memtable is inclusive.
+            let memtable_range = TimestampRange::new_inclusive(Some(start), Some(end));
+            if !memtable_range.intersects(&time_range) {
+                continue;
+            }
+            let ranges_in_memtable = m.ranges(
+                Some(mapper.column_ids()),
+                predicate.clone(),
+                self.request.sequence,
+            )?;
+            mem_range_builders.extend(ranges_in_memtable.ranges.into_values().map(|v| {
+                // todo: we should add stats to MemtableRange
+                let mut stats = ranges_in_memtable.stats.clone();
+                stats.num_ranges = 1;
+                stats.num_rows = v.num_rows();
+                MemRangeBuilder::new(v, stats)
+            }));
+        }
 
+        let region_id = self.region_id();
         debug!(
             "Scan region {}, request: {:?}, time range: {:?}, memtables: {}, ssts_to_read: {}, append_mode: {}",
-            self.version.metadata.region_id,
+            region_id,
             self.request,
             time_range,
-            memtables.len(),
+            mem_range_builders.len(),
             files.len(),
             self.version.options.append_mode,
         );
@@ -339,41 +448,45 @@ impl ScanRegion {
         let inverted_index_applier = self.build_invereted_index_applier();
         let bloom_filter_applier = self.build_bloom_filter_applier();
         let fulltext_index_applier = self.build_fulltext_index_applier();
-        let predicate = Predicate::new(self.request.filters.clone());
+        let predicate = PredicateGroup::new(&self.version.metadata, &self.request.filters);
         // The mapper always computes projected column ids as the schema of SSTs may change.
         let mapper = match &self.request.projection {
             Some(p) => ProjectionMapper::new(&self.version.metadata, p.iter().copied())?,
             None => ProjectionMapper::all(&self.version.metadata)?,
         };
-        // Get memtable ranges to scan.
-        let memtables = memtables
-            .into_iter()
-            .map(|mem| {
-                let ranges = mem.ranges(
-                    Some(mapper.column_ids()),
-                    Some(predicate.clone()),
-                    self.request.sequence,
-                );
-                MemRangeBuilder::new(ranges)
-            })
-            .collect();
 
         let input = ScanInput::new(self.access_layer, mapper)
             .with_time_range(Some(time_range))
-            .with_predicate(Some(predicate))
-            .with_memtables(memtables)
+            .with_predicate(predicate)
+            .with_memtables(mem_range_builders)
             .with_files(files)
             .with_cache(self.cache_strategy)
             .with_inverted_index_applier(inverted_index_applier)
             .with_bloom_filter_index_applier(bloom_filter_applier)
             .with_fulltext_index_applier(fulltext_index_applier)
             .with_parallel_scan_channel_size(self.parallel_scan_channel_size)
+            .with_max_concurrent_scan_files(self.max_concurrent_scan_files)
             .with_start_time(self.start_time)
             .with_append_mode(self.version.options.append_mode)
-            .with_filter_deleted(filter_deleted)
+            .with_filter_deleted(self.filter_deleted)
             .with_merge_mode(self.version.options.merge_mode())
-            .with_series_row_selector(self.request.series_row_selector);
+            .with_series_row_selector(self.request.series_row_selector)
+            .with_distribution(self.request.distribution);
+
+        #[cfg(feature = "enterprise")]
+        let input = if let Some(provider) = self.extension_range_provider {
+            let ranges = provider
+                .find_extension_ranges(time_range, &self.request)
+                .await?;
+            input.with_extension_ranges(ranges)
+        } else {
+            input
+        };
         Ok(input)
+    }
+
+    fn region_id(&self) -> RegionId {
+        self.version.metadata.region_id
     }
 
     /// Build time range predicate from filters.
@@ -432,7 +545,8 @@ impl ScanRegion {
         let puffin_metadata_cache = self.cache_strategy.puffin_metadata_cache().cloned();
 
         InvertedIndexApplierBuilder::new(
-            self.access_layer.region_dir().to_string(),
+            self.access_layer.table_dir().to_string(),
+            self.access_layer.path_type(),
             self.access_layer.object_store().clone(),
             self.version.metadata.as_ref(),
             self.version.metadata.inverted_indexed_column_ids(
@@ -466,7 +580,8 @@ impl ScanRegion {
         let puffin_metadata_cache = self.cache_strategy.puffin_metadata_cache().cloned();
 
         BloomFilterIndexApplierBuilder::new(
-            self.access_layer.region_dir().to_string(),
+            self.access_layer.table_dir().to_string(),
+            self.access_layer.path_type(),
             self.access_layer.object_store().clone(),
             self.version.metadata.as_ref(),
             self.access_layer.puffin_manager_factory().clone(),
@@ -489,16 +604,17 @@ impl ScanRegion {
 
         let file_cache = self.cache_strategy.write_cache().map(|w| w.file_cache());
         let puffin_metadata_cache = self.cache_strategy.puffin_metadata_cache().cloned();
-
+        let bloom_filter_index_cache = self.cache_strategy.bloom_filter_index_cache().cloned();
         FulltextIndexApplierBuilder::new(
-            self.access_layer.region_dir().to_string(),
-            self.version.metadata.region_id,
+            self.access_layer.table_dir().to_string(),
+            self.access_layer.path_type(),
             self.access_layer.object_store().clone(),
             self.access_layer.puffin_manager_factory().clone(),
             self.version.metadata.as_ref(),
         )
         .with_file_cache(file_cache)
         .with_puffin_metadata_cache(puffin_metadata_cache)
+        .with_bloom_filter_cache(bloom_filter_index_cache)
         .build(&self.request.filters)
         .inspect_err(|err| warn!(err; "Failed to build fulltext index applier"))
         .ok()
@@ -519,7 +635,7 @@ fn file_in_range(file: &FileHandle, predicate: &TimestampRange) -> bool {
 }
 
 /// Common input for different scanners.
-pub(crate) struct ScanInput {
+pub struct ScanInput {
     /// Region SST access layer.
     access_layer: AccessLayerRef,
     /// Maps projected Batches to RecordBatches.
@@ -527,7 +643,7 @@ pub(crate) struct ScanInput {
     /// Time range filter for time index.
     time_range: Option<TimestampRange>,
     /// Predicate to push down.
-    pub(crate) predicate: Option<Predicate>,
+    pub(crate) predicate: PredicateGroup,
     /// Memtable range builders for memtables in the time range..
     pub(crate) memtables: Vec<MemRangeBuilder>,
     /// Handles to SST files to scan.
@@ -538,6 +654,8 @@ pub(crate) struct ScanInput {
     ignore_file_not_found: bool,
     /// Capacity of the channel to send data from parallel scan tasks to the main task.
     pub(crate) parallel_scan_channel_size: usize,
+    /// Maximum number of SST files to scan concurrently.
+    pub(crate) max_concurrent_scan_files: usize,
     /// Index appliers.
     inverted_index_applier: Option<InvertedIndexApplierRef>,
     bloom_filter_index_applier: Option<BloomFilterIndexApplierRef>,
@@ -552,6 +670,10 @@ pub(crate) struct ScanInput {
     pub(crate) merge_mode: MergeMode,
     /// Hint to select rows from time series.
     pub(crate) series_row_selector: Option<TimeSeriesRowSelector>,
+    /// Hint for the required distribution of the scanner.
+    pub(crate) distribution: Option<TimeSeriesDistribution>,
+    #[cfg(feature = "enterprise")]
+    extension_ranges: Vec<BoxedExtensionRange>,
 }
 
 impl ScanInput {
@@ -562,12 +684,13 @@ impl ScanInput {
             access_layer,
             mapper: Arc::new(mapper),
             time_range: None,
-            predicate: None,
+            predicate: PredicateGroup::default(),
             memtables: Vec::new(),
             files: Vec::new(),
             cache_strategy: CacheStrategy::Disabled,
             ignore_file_not_found: false,
             parallel_scan_channel_size: DEFAULT_SCAN_CHANNEL_SIZE,
+            max_concurrent_scan_files: DEFAULT_MAX_CONCURRENT_SCAN_FILES,
             inverted_index_applier: None,
             bloom_filter_index_applier: None,
             fulltext_index_applier: None,
@@ -576,6 +699,9 @@ impl ScanInput {
             filter_deleted: true,
             merge_mode: MergeMode::default(),
             series_row_selector: None,
+            distribution: None,
+            #[cfg(feature = "enterprise")]
+            extension_ranges: Vec::new(),
         }
     }
 
@@ -588,7 +714,7 @@ impl ScanInput {
 
     /// Sets predicate to push down.
     #[must_use]
-    pub(crate) fn with_predicate(mut self, predicate: Option<Predicate>) -> Self {
+    pub(crate) fn with_predicate(mut self, predicate: PredicateGroup) -> Self {
         self.predicate = predicate;
         self
     }
@@ -628,6 +754,16 @@ impl ScanInput {
         parallel_scan_channel_size: usize,
     ) -> Self {
         self.parallel_scan_channel_size = parallel_scan_channel_size;
+        self
+    }
+
+    /// Sets maximum number of SST files to scan concurrently.
+    #[must_use]
+    pub(crate) fn with_max_concurrent_scan_files(
+        mut self,
+        max_concurrent_scan_files: usize,
+    ) -> Self {
+        self.max_concurrent_scan_files = max_concurrent_scan_files;
         self
     }
 
@@ -688,6 +824,16 @@ impl ScanInput {
         self
     }
 
+    /// Sets the distribution hint.
+    #[must_use]
+    pub(crate) fn with_distribution(
+        mut self,
+        distribution: Option<TimeSeriesDistribution>,
+    ) -> Self {
+        self.distribution = distribution;
+        self
+    }
+
     /// Sets the time series row selector.
     #[must_use]
     pub(crate) fn with_series_row_selector(
@@ -732,16 +878,15 @@ impl ScanInput {
     }
 
     /// Prunes a file to scan and returns the builder to build readers.
-    pub(crate) async fn prune_file(
+    pub async fn prune_file(
         &self,
-        file_index: usize,
+        file: &FileHandle,
         reader_metrics: &mut ReaderMetrics,
     ) -> Result<FileRangeBuilder> {
-        let file = &self.files[file_index];
         let res = self
             .access_layer
             .read_sst(file.clone())
-            .predicate(self.predicate.clone())
+            .predicate(self.predicate.predicate().cloned())
             .projection(Some(self.mapper.column_ids().to_vec()))
             .cache(self.cache_strategy.clone())
             .inverted_index_applier(self.inverted_index_applier.clone())
@@ -750,7 +895,7 @@ impl ScanInput {
             .expected_metadata(Some(self.mapper.metadata().clone()))
             .build_reader_input(reader_metrics)
             .await;
-        let (mut file_range_ctx, row_groups) = match res {
+        let (mut file_range_ctx, selection) = match res {
             Ok(x) => x,
             Err(e) => {
                 if e.is_object_not_found() && self.ignore_file_not_found {
@@ -773,7 +918,7 @@ impl ScanInput {
             )?;
             file_range_ctx.set_compat_batch(Some(compat));
         }
-        Ok(FileRangeBuilder::new(Arc::new(file_range_ctx), row_groups))
+        Ok(FileRangeBuilder::new(Arc::new(file_range_ctx), selection))
     }
 
     /// Scans the input source in another task and sends batches to the sender.
@@ -809,11 +954,21 @@ impl ScanInput {
     pub(crate) fn total_rows(&self) -> usize {
         let rows_in_files: usize = self.files.iter().map(|f| f.num_rows()).sum();
         let rows_in_memtables: usize = self.memtables.iter().map(|m| m.stats().num_rows()).sum();
-        rows_in_files + rows_in_memtables
+
+        let rows = rows_in_files + rows_in_memtables;
+        #[cfg(feature = "enterprise")]
+        let rows = rows
+            + self
+                .extension_ranges
+                .iter()
+                .map(|x| x.num_rows())
+                .sum::<u64>() as usize;
+        rows
     }
 
-    pub(crate) fn predicate(&self) -> Option<Predicate> {
-        self.predicate.clone()
+    /// Returns table predicate of all exprs.
+    pub(crate) fn predicate(&self) -> Option<&Predicate> {
+        self.predicate.predicate()
     }
 
     /// Returns number of memtables to scan.
@@ -825,21 +980,47 @@ impl ScanInput {
     pub(crate) fn num_files(&self) -> usize {
         self.files.len()
     }
+
+    pub fn region_metadata(&self) -> &RegionMetadataRef {
+        self.mapper.metadata()
+    }
+}
+
+#[cfg(feature = "enterprise")]
+impl ScanInput {
+    #[must_use]
+    pub(crate) fn with_extension_ranges(self, extension_ranges: Vec<BoxedExtensionRange>) -> Self {
+        Self {
+            extension_ranges,
+            ..self
+        }
+    }
+
+    #[cfg(feature = "enterprise")]
+    pub(crate) fn extension_ranges(&self) -> &[BoxedExtensionRange] {
+        &self.extension_ranges
+    }
+
+    /// Get a boxed [ExtensionRange] by the index in all ranges.
+    #[cfg(feature = "enterprise")]
+    pub(crate) fn extension_range(&self, i: usize) -> &BoxedExtensionRange {
+        &self.extension_ranges[i - self.num_memtables() - self.num_files()]
+    }
 }
 
 #[cfg(test)]
 impl ScanInput {
     /// Returns SST file ids to scan.
-    pub(crate) fn file_ids(&self) -> Vec<crate::sst::file::FileId> {
+    pub(crate) fn file_ids(&self) -> Vec<crate::sst::file::RegionFileId> {
         self.files.iter().map(|file| file.file_id()).collect()
     }
 }
 
 /// Context shared by different streams from a scanner.
 /// It contains the input and ranges to scan.
-pub(crate) struct StreamContext {
+pub struct StreamContext {
     /// Input memtables and files.
-    pub(crate) input: ScanInput,
+    pub input: ScanInput,
     /// Metadata for partition ranges.
     pub(crate) ranges: Vec<RangeMeta>,
 
@@ -880,6 +1061,11 @@ impl StreamContext {
         self.input.num_memtables() > index.index
     }
 
+    pub(crate) fn is_file_range_index(&self, index: RowGroupIndex) -> bool {
+        !self.is_mem_range_index(index)
+            && index.index < self.input.num_files() + self.input.num_memtables()
+    }
+
     /// Retrieves the partition ranges.
     pub(crate) fn partition_ranges(&self) -> Vec<PartitionRange> {
         self.ranges
@@ -890,28 +1076,196 @@ impl StreamContext {
     }
 
     /// Format the context for explain.
-    pub(crate) fn format_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let (mut num_mem_ranges, mut num_file_ranges) = (0, 0);
+    pub(crate) fn format_for_explain(&self, verbose: bool, f: &mut fmt::Formatter) -> fmt::Result {
+        let (mut num_mem_ranges, mut num_file_ranges, mut num_other_ranges) = (0, 0, 0);
         for range_meta in &self.ranges {
             for idx in &range_meta.row_group_indices {
                 if self.is_mem_range_index(*idx) {
                     num_mem_ranges += 1;
-                } else {
+                } else if self.is_file_range_index(*idx) {
                     num_file_ranges += 1;
+                } else {
+                    num_other_ranges += 1;
                 }
             }
         }
+        if verbose {
+            write!(f, "{{")?;
+        }
         write!(
             f,
-            "partition_count={} ({} memtable ranges, {} file {} ranges)",
+            r#""partition_count":{{"count":{}, "mem_ranges":{}, "files":{}, "file_ranges":{}"#,
             self.ranges.len(),
             num_mem_ranges,
             self.input.num_files(),
             num_file_ranges,
         )?;
-        if let Some(selector) = &self.input.series_row_selector {
-            write!(f, ", selector={}", selector)?;
+        if num_other_ranges > 0 {
+            write!(f, r#"", other_ranges":{}"#, num_other_ranges)?;
         }
+        write!(f, "}}")?;
+
+        if let Some(selector) = &self.input.series_row_selector {
+            write!(f, ", \"selector\":\"{}\"", selector)?;
+        }
+        if let Some(distribution) = &self.input.distribution {
+            write!(f, ", \"distribution\":\"{}\"", distribution)?;
+        }
+
+        if verbose {
+            self.format_verbose_content(f)?;
+        }
+
         Ok(())
+    }
+
+    fn format_verbose_content(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        struct FileWrapper<'a> {
+            file: &'a FileHandle,
+        }
+
+        impl fmt::Debug for FileWrapper<'_> {
+            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                let (start, end) = self.file.time_range();
+                write!(
+                    f,
+                    r#"{{"file_id":"{}","time_range_start":"{}::{}","time_range_end":"{}::{}","rows":{},"size":{},"index_size":{}}}"#,
+                    self.file.file_id(),
+                    start.value(),
+                    start.unit(),
+                    end.value(),
+                    end.unit(),
+                    self.file.num_rows(),
+                    self.file.size(),
+                    self.file.index_size()
+                )
+            }
+        }
+
+        struct InputWrapper<'a> {
+            input: &'a ScanInput,
+        }
+
+        #[cfg(feature = "enterprise")]
+        impl InputWrapper<'_> {
+            fn format_extension_ranges(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                if self.input.extension_ranges.is_empty() {
+                    return Ok(());
+                }
+
+                let mut delimiter = "";
+                write!(f, ", extension_ranges: [")?;
+                for range in self.input.extension_ranges() {
+                    write!(f, "{}{}", delimiter, range)?;
+                    delimiter = ", ";
+                }
+                write!(f, "]")?;
+                Ok(())
+            }
+        }
+
+        impl fmt::Debug for InputWrapper<'_> {
+            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                let output_schema = self.input.mapper.output_schema();
+                if !output_schema.is_empty() {
+                    let names: Vec<_> = output_schema
+                        .column_schemas()
+                        .iter()
+                        .map(|col| &col.name)
+                        .collect();
+                    write!(f, ", \"projection\": {:?}", names)?;
+                }
+                if let Some(predicate) = &self.input.predicate.predicate() {
+                    if !predicate.exprs().is_empty() {
+                        let exprs: Vec<_> =
+                            predicate.exprs().iter().map(|e| e.to_string()).collect();
+                        write!(f, ", \"filters\": {:?}", exprs)?;
+                    }
+                }
+                if !self.input.files.is_empty() {
+                    write!(f, ", \"files\": ")?;
+                    f.debug_list()
+                        .entries(self.input.files.iter().map(|file| FileWrapper { file }))
+                        .finish()?;
+                }
+
+                #[cfg(feature = "enterprise")]
+                self.format_extension_ranges(f)?;
+
+                Ok(())
+            }
+        }
+
+        write!(f, "{:?}", InputWrapper { input: &self.input })
+    }
+}
+
+/// Predicates to evaluate.
+/// It only keeps filters that [SimpleFilterEvaluator] supports.
+#[derive(Clone, Default)]
+pub struct PredicateGroup {
+    time_filters: Option<Arc<Vec<SimpleFilterEvaluator>>>,
+
+    /// Table predicate for all logical exprs to evaluate.
+    /// Parquet reader uses it to prune row groups.
+    predicate: Option<Predicate>,
+}
+
+impl PredicateGroup {
+    /// Creates a new `PredicateGroup` from exprs according to the metadata.
+    pub fn new(metadata: &RegionMetadata, exprs: &[Expr]) -> Self {
+        let mut time_filters = Vec::with_capacity(exprs.len());
+        // Columns in the expr.
+        let mut columns = HashSet::new();
+        for expr in exprs {
+            columns.clear();
+            let Some(filter) = Self::expr_to_filter(expr, metadata, &mut columns) else {
+                continue;
+            };
+            time_filters.push(filter);
+        }
+        let time_filters = if time_filters.is_empty() {
+            None
+        } else {
+            Some(Arc::new(time_filters))
+        };
+        let predicate = Predicate::new(exprs.to_vec());
+
+        Self {
+            time_filters,
+            predicate: Some(predicate),
+        }
+    }
+
+    /// Returns time filters.
+    pub(crate) fn time_filters(&self) -> Option<Arc<Vec<SimpleFilterEvaluator>>> {
+        self.time_filters.clone()
+    }
+
+    /// Returns predicate of all exprs.
+    pub(crate) fn predicate(&self) -> Option<&Predicate> {
+        self.predicate.as_ref()
+    }
+
+    fn expr_to_filter(
+        expr: &Expr,
+        metadata: &RegionMetadata,
+        columns: &mut HashSet<Column>,
+    ) -> Option<SimpleFilterEvaluator> {
+        columns.clear();
+        // `expr_to_columns` won't return error.
+        // We still ignore these expressions for safety.
+        expr_to_columns(expr, columns).ok()?;
+        if columns.len() > 1 {
+            // Simple filter doesn't support multiple columns.
+            return None;
+        }
+        let column = columns.iter().next()?;
+        let column_meta = metadata.column_by_name(&column.name)?;
+        if column_meta.semantic_type == SemanticType::Timestamp {
+            SimpleFilterEvaluator::try_new(expr)
+        } else {
+            None
+        }
     }
 }

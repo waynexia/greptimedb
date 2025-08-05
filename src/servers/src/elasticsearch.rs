@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -24,16 +25,23 @@ use common_error::ext::ErrorExt;
 use common_telemetry::{debug, error};
 use headers::ContentType;
 use once_cell::sync::Lazy;
-use pipeline::GREPTIME_INTERNAL_IDENTITY_PIPELINE_NAME;
+use pipeline::{
+    GreptimePipelineParams, PipelineDefinition, GREPTIME_INTERNAL_IDENTITY_PIPELINE_NAME,
+};
 use serde_json::{json, Deserializer, Value};
 use session::context::{Channel, QueryContext};
 use snafu::{ensure, ResultExt};
+use vrl::value::Value as VrlValue;
 
 use crate::error::{
     status_code_to_http_status, InvalidElasticsearchInputSnafu, ParseJsonSnafu,
     Result as ServersResult,
 };
-use crate::http::event::{ingest_logs_inner, LogIngestRequest, LogIngesterQueryParams, LogState};
+use crate::http::event::{
+    extract_pipeline_params_map_from_headers, ingest_logs_inner, LogIngesterQueryParams, LogState,
+    PipelineIngestRequest,
+};
+use crate::http::header::constants::GREPTIME_PIPELINE_NAME_HEADER_NAME;
 use crate::metrics::{
     METRIC_ELASTICSEARCH_LOGS_DOCS_COUNT, METRIC_ELASTICSEARCH_LOGS_INGESTION_ELAPSED,
 };
@@ -127,7 +135,7 @@ async fn do_handle_bulk_api(
     // The `schema` is already set in the query_ctx in auth process.
     query_ctx.set_channel(Channel::Elasticsearch);
 
-    let db = params.db.unwrap_or_else(|| "public".to_string());
+    let db = query_ctx.current_schema();
 
     // Record the ingestion time histogram.
     let _timer = METRIC_ELASTICSEARCH_LOGS_INGESTION_ELAPSED
@@ -135,11 +143,12 @@ async fn do_handle_bulk_api(
         .start_timer();
 
     // If pipeline_name is not provided, use the internal pipeline.
-    let pipeline = if let Some(pipeline) = params.pipeline_name {
-        pipeline
-    } else {
-        GREPTIME_INTERNAL_IDENTITY_PIPELINE_NAME.to_string()
-    };
+    let pipeline_name = params.pipeline_name.as_deref().unwrap_or_else(|| {
+        headers
+            .get(GREPTIME_PIPELINE_NAME_HEADER_NAME)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(GREPTIME_INTERNAL_IDENTITY_PIPELINE_NAME)
+    });
 
     // Read the ndjson payload and convert it to a vector of Value.
     let requests = match parse_bulk_request(&payload, &index, &params.msg_field) {
@@ -159,13 +168,31 @@ async fn do_handle_bulk_api(
     };
     let log_num = requests.len();
 
+    let pipeline = match PipelineDefinition::from_name(pipeline_name, None, None) {
+        Ok(pipeline) => pipeline,
+        Err(e) => {
+            // should be unreachable
+            error!(e; "Failed to ingest logs");
+            return (
+                status_code_to_http_status(&e.status_code()),
+                elasticsearch_headers(),
+                axum::Json(write_bulk_response(
+                    start.elapsed().as_millis() as i64,
+                    0,
+                    e.status_code() as u32,
+                    e.to_string().as_str(),
+                )),
+            );
+        }
+    };
+    let pipeline_params =
+        GreptimePipelineParams::from_map(extract_pipeline_params_map_from_headers(&headers));
     if let Err(e) = ingest_logs_inner(
         log_state.log_handler,
         pipeline,
-        None,
         requests,
         Arc::new(query_ctx),
-        headers,
+        pipeline_params,
     )
     .await
     {
@@ -260,10 +287,10 @@ fn parse_bulk_request(
     input: &str,
     index_from_url: &Option<String>,
     msg_field: &Option<String>,
-) -> ServersResult<Vec<LogIngestRequest>> {
+) -> ServersResult<Vec<PipelineIngestRequest>> {
     // Read the ndjson payload and convert it to `Vec<Value>`. Return error if the input is not a valid JSON.
-    let values: Vec<Value> = Deserializer::from_str(input)
-        .into_iter::<Value>()
+    let values: Vec<VrlValue> = Deserializer::from_str(input)
+        .into_iter::<VrlValue>()
         .collect::<Result<_, _>>()
         .context(ParseJsonSnafu)?;
 
@@ -275,19 +302,20 @@ fn parse_bulk_request(
         }
     );
 
-    let mut requests: Vec<LogIngestRequest> = Vec::with_capacity(values.len() / 2);
+    let mut requests: Vec<PipelineIngestRequest> = Vec::with_capacity(values.len() / 2);
     let mut values = values.into_iter();
 
     // Read the ndjson payload and convert it to a (index, value) vector.
     // For Elasticsearch post `_bulk` API, each chunk contains two objects:
     //   1. The first object is the command, it should be `create` or `index`.
     //   2. The second object is the document data.
-    while let Some(mut cmd) = values.next() {
+    while let Some(cmd) = values.next() {
         // NOTE: Although the native Elasticsearch API supports upsert in `index` command, we don't support change any data in `index` command and it's same as `create` command.
-        let index = if let Some(cmd) = cmd.get_mut("create") {
-            get_index_from_cmd(cmd.take())?
-        } else if let Some(cmd) = cmd.get_mut("index") {
-            get_index_from_cmd(cmd.take())?
+        let mut cmd = cmd.into_object();
+        let index = if let Some(cmd) = cmd.as_mut().and_then(|c| c.remove("create")) {
+            get_index_from_cmd(cmd)?
+        } else if let Some(cmd) = cmd.as_mut().and_then(|c| c.remove("index")) {
+            get_index_from_cmd(cmd)?
         } else {
             return InvalidElasticsearchInputSnafu {
                 reason: format!(
@@ -314,7 +342,7 @@ fn parse_bulk_request(
                 }
             );
 
-            requests.push(LogIngestRequest {
+            requests.push(PipelineIngestRequest {
                 table: index.unwrap_or_else(|| index_from_url.as_ref().unwrap().clone()),
                 values: vec![log_value],
             });
@@ -331,39 +359,50 @@ fn parse_bulk_request(
 }
 
 // Get the index from the command. We will take index as the table name in GreptimeDB.
-fn get_index_from_cmd(mut v: Value) -> ServersResult<Option<String>> {
-    if let Some(index) = v.get_mut("_index") {
-        if let Value::String(index) = index.take() {
-            Ok(Some(index))
-        } else {
-            // If the `_index` exists, it should be a string.
-            InvalidElasticsearchInputSnafu {
-                reason: "index is not a string in bulk request".to_string(),
-            }
-            .fail()
-        }
+fn get_index_from_cmd(v: VrlValue) -> ServersResult<Option<String>> {
+    let Some(index) = v.into_object().and_then(|mut m| m.remove("_index")) else {
+        return Ok(None);
+    };
+
+    if let VrlValue::Bytes(index) = index {
+        Ok(Some(String::from_utf8_lossy(&index).to_string()))
     } else {
-        Ok(None)
+        // If the `_index` exists, it should be a string.
+        InvalidElasticsearchInputSnafu {
+            reason: "index is not a string in bulk request",
+        }
+        .fail()
     }
 }
 
 // If the msg_field is provided, fetch the value of the field from the document data.
 // For example, if the `msg_field` is `message`, and the document data is `{"message":"hello"}`, the log value will be Value::String("hello").
-fn get_log_value_from_msg_field(mut v: Value, msg_field: &str) -> Value {
-    if let Some(message) = v.get_mut(msg_field) {
-        let message = message.take();
+fn get_log_value_from_msg_field(v: VrlValue, msg_field: &str) -> VrlValue {
+    let VrlValue::Object(mut m) = v else {
+        return v;
+    };
+
+    if let Some(message) = m.remove(msg_field) {
         match message {
-            Value::String(s) => match serde_json::from_str::<Value>(&s) {
-                Ok(s) => s,
-                // If the message is not a valid JSON, just use the original message as the log value.
-                Err(_) => Value::String(s),
-            },
+            VrlValue::Bytes(bytes) => {
+                match serde_json::from_slice::<VrlValue>(&bytes) {
+                    Ok(v) => v,
+                    // If the message is not a valid JSON, return a map with the original message key and value.
+                    Err(_) => {
+                        let map = BTreeMap::from([(
+                            msg_field.to_string().into(),
+                            VrlValue::Bytes(bytes),
+                        )]);
+                        VrlValue::Object(map)
+                    }
+                }
+            }
             // If the message is not a string, just use the original message as the log value.
             _ => message,
         }
     } else {
         // If the msg_field is not found, just use the original message as the log value.
-        v
+        VrlValue::Object(m)
     }
 }
 
@@ -385,15 +424,17 @@ mod tests {
                 None,
                 None,
                 Ok(vec![
-                    LogIngestRequest {
+                    PipelineIngestRequest {
                         table: "test".to_string(),
                         values: vec![
-                            json!({"foo1": "foo1_value", "bar1": "bar1_value"}),
+                            json!({"foo1": "foo1_value", "bar1": "bar1_value"}).into(),
                         ],
                     },
-                    LogIngestRequest {
+                    PipelineIngestRequest {
                         table: "test".to_string(),
-                        values: vec![json!({"foo2": "foo2_value", "bar2": "bar2_value"})],
+                        values: vec![
+                            json!({"foo2": "foo2_value", "bar2": "bar2_value"}).into(),
+                        ],
                     },
                 ]),
             ),
@@ -408,13 +449,17 @@ mod tests {
                 Some("logs".to_string()),
                 None,
                 Ok(vec![
-                    LogIngestRequest {
+                    PipelineIngestRequest {
                         table: "test".to_string(),
-                        values: vec![json!({"foo1": "foo1_value", "bar1": "bar1_value"})],
+                        values: vec![
+                            json!({"foo1": "foo1_value", "bar1": "bar1_value"}).into(),
+                        ],
                     },
-                    LogIngestRequest {
+                    PipelineIngestRequest {
                         table: "logs".to_string(),
-                        values: vec![json!({"foo2": "foo2_value", "bar2": "bar2_value"})],
+                        values: vec![
+                            json!({"foo2": "foo2_value", "bar2": "bar2_value"}).into(),
+                        ],
                     },
                 ]),
             ),
@@ -429,13 +474,17 @@ mod tests {
                 Some("logs".to_string()),
                 None,
                 Ok(vec![
-                    LogIngestRequest {
+                    PipelineIngestRequest {
                         table: "test".to_string(),
-                        values: vec![json!({"foo1": "foo1_value", "bar1": "bar1_value"})],
+                        values: vec![
+                            json!({"foo1": "foo1_value", "bar1": "bar1_value"}).into(),
+                        ],
                     },
-                    LogIngestRequest {
+                    PipelineIngestRequest {
                         table: "logs".to_string(),
-                        values: vec![json!({"foo2": "foo2_value", "bar2": "bar2_value"})],
+                        values: vec![
+                            json!({"foo2": "foo2_value", "bar2": "bar2_value"}).into(),
+                        ],
                     },
                 ]),
             ),
@@ -449,9 +498,11 @@ mod tests {
                 Some("logs".to_string()),
                 None,
                 Ok(vec![
-                    LogIngestRequest {
+                    PipelineIngestRequest {
                         table: "test".to_string(),
-                        values: vec![json!({"foo1": "foo1_value", "bar1": "bar1_value"})],
+                        values: vec![
+                            json!({"foo1": "foo1_value", "bar1": "bar1_value"}).into(),
+                        ],
                     },
                 ]),
             ),
@@ -466,13 +517,17 @@ mod tests {
                 None,
                 Some("data".to_string()),
                 Ok(vec![
-                    LogIngestRequest {
+                    PipelineIngestRequest {
                         table: "test".to_string(),
-                        values: vec![json!({"foo1": "foo1_value", "bar1": "bar1_value"})],
+                        values: vec![
+                            json!({"foo1": "foo1_value", "bar1": "bar1_value"}).into(),
+                        ],
                     },
-                    LogIngestRequest {
+                    PipelineIngestRequest {
                         table: "test".to_string(),
-                        values: vec![json!({"foo2": "foo2_value", "bar2": "bar2_value"})],
+                        values: vec![
+                            json!({"foo2": "foo2_value", "bar2": "bar2_value"}).into(),
+                        ],
                     },
                 ]),
             ),
@@ -487,16 +542,16 @@ mod tests {
                 None,
                 Some("message".to_string()),
                 Ok(vec![
-                    LogIngestRequest {
+                    PipelineIngestRequest {
                         table: "logs-generic-default".to_string(),
                         values: vec![
-                            json!("172.16.0.1 - - [25/May/2024:20:19:37 +0000] \"GET /contact HTTP/1.1\" 404 162 \"-\" \"Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1\""),
+                            json!({"message": "172.16.0.1 - - [25/May/2024:20:19:37 +0000] \"GET /contact HTTP/1.1\" 404 162 \"-\" \"Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1\""}).into(),
                         ],
                     },
-                    LogIngestRequest {
+                    PipelineIngestRequest {
                         table: "logs-generic-default".to_string(),
                         values: vec![
-                            json!("10.0.0.1 - - [25/May/2024:20:18:37 +0000] \"GET /images/logo.png HTTP/1.1\" 304 0 \"-\" \"Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:89.0) Gecko/20100101 Firefox/89.0\""),
+                            json!({"message": "10.0.0.1 - - [25/May/2024:20:18:37 +0000] \"GET /images/logo.png HTTP/1.1\" 304 0 \"-\" \"Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:89.0) Gecko/20100101 Firefox/89.0\""}).into(),
                         ],
                     },
                 ]),

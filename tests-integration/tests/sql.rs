@@ -84,8 +84,9 @@ pub async fn test_mysql_auth(store_type: StorageType) {
     )
     .unwrap();
 
-    let (addr, mut guard, fe_mysql_server) =
+    let (mut guard, fe_mysql_server) =
         setup_mysql_server_with_user_provider(store_type, "sql_crud", Some(user_provider)).await;
+    let addr = fe_mysql_server.bind_addr().unwrap().to_string();
 
     // 1. no auth
     let conn_re = MySqlPoolOptions::new()
@@ -138,7 +139,8 @@ pub async fn test_mysql_auth(store_type: StorageType) {
 pub async fn test_mysql_stmts(store_type: StorageType) {
     common_telemetry::init_default_ut_logging();
 
-    let (addr, mut guard, fe_mysql_server) = setup_mysql_server(store_type, "sql_crud").await;
+    let (mut guard, fe_mysql_server) = setup_mysql_server(store_type, "test_mysql_stmts").await;
+    let addr = fe_mysql_server.bind_addr().unwrap().to_string();
 
     let mut conn = MySqlConnection::connect(&format!("mysql://{addr}/public"))
         .await
@@ -150,6 +152,16 @@ pub async fn test_mysql_stmts(store_type: StorageType) {
 
     conn.execute("SET TRANSACTION READ ONLY").await.unwrap();
 
+    // empty statements
+    let err = conn.execute("      -------  ;").await.unwrap_err();
+    assert!(err.to_string().contains("empty statements"));
+    let err = conn.execute("----------\n;").await.unwrap_err();
+    assert!(err.to_string().contains("empty statements"));
+    let err = conn.execute("        ;").await.unwrap_err();
+    assert!(err.to_string().contains("empty statements"));
+    let err = conn.execute("    \n    ;").await.unwrap_err();
+    assert!(err.to_string().contains("empty statements"));
+
     let _ = fe_mysql_server.shutdown().await;
     guard.remove_all().await;
 }
@@ -157,7 +169,8 @@ pub async fn test_mysql_stmts(store_type: StorageType) {
 pub async fn test_mysql_crud(store_type: StorageType) {
     common_telemetry::init_default_ut_logging();
 
-    let (addr, mut guard, fe_mysql_server) = setup_mysql_server(store_type, "sql_crud").await;
+    let (mut guard, fe_mysql_server) = setup_mysql_server(store_type, "test_mysql_crud").await;
+    let addr = fe_mysql_server.bind_addr().unwrap().to_string();
 
     let pool = MySqlPoolOptions::new()
         .max_connections(2)
@@ -322,7 +335,9 @@ pub async fn test_mysql_crud(store_type: StorageType) {
 pub async fn test_mysql_timezone(store_type: StorageType) {
     common_telemetry::init_default_ut_logging();
 
-    let (addr, mut guard, fe_mysql_server) = setup_mysql_server(store_type, "mysql_timezone").await;
+    let (mut guard, fe_mysql_server) = setup_mysql_server(store_type, "test_mysql_timezone").await;
+    let addr = fe_mysql_server.bind_addr().unwrap().to_string();
+
     let mut conn = MySqlConnection::connect(&format!("mysql://{addr}/public"))
         .await
         .unwrap();
@@ -331,7 +346,10 @@ pub async fn test_mysql_timezone(store_type: StorageType) {
         .execute("SET time_zone = 'Asia/Shanghai'")
         .await
         .unwrap();
+
     let timezone = conn.fetch_all("SELECT @@time_zone").await.unwrap();
+    assert_eq!(timezone[0].get::<String, usize>(0), "Asia/Shanghai");
+    let timezone = conn.fetch_all("SELECT @@session.time_zone").await.unwrap();
     assert_eq!(timezone[0].get::<String, usize>(0), "Asia/Shanghai");
     let timezone = conn.fetch_all("SELECT @@system_time_zone").await.unwrap();
     assert_eq!(timezone[0].get::<String, usize>(0), "UTC");
@@ -359,6 +377,11 @@ pub async fn test_mysql_timezone(store_type: StorageType) {
     );
 
     let _ = conn.execute("SET time_zone = '+08:00'").await.unwrap();
+    let timezone = conn.fetch_all("SELECT @@time_zone").await.unwrap();
+    assert_eq!(timezone[0].get::<String, usize>(0), "+08:00");
+    let timezone = conn.fetch_all("SELECT @@session.time_zone").await.unwrap();
+    assert_eq!(timezone[0].get::<String, usize>(0), "+08:00");
+
     let rows2 = conn.fetch_all("select ts from demo").await.unwrap();
     // we use Utc here for format only
     assert_eq!(
@@ -367,6 +390,23 @@ pub async fn test_mysql_timezone(store_type: StorageType) {
             .to_rfc3339_opts(SecondsFormat::Millis, true),
         "2022-11-03T11:39:57.450Z"
     );
+
+    let _ = conn
+        .execute("SET @@SESSION.TIME_ZONE = '-7:00'")
+        .await
+        .unwrap();
+    let rows2 = conn.fetch_all("select ts from demo").await.unwrap();
+    // we use Utc here for format only
+    assert_eq!(
+        rows2[0]
+            .get::<chrono::DateTime<Utc>, usize>(0)
+            .to_rfc3339_opts(SecondsFormat::Millis, true),
+        "2022-11-02T20:39:57.450Z"
+    );
+    let timezone = conn.fetch_all("SELECT @@time_zone").await.unwrap();
+    assert_eq!(timezone[0].get::<String, usize>(0), "-07:00");
+    let timezone = conn.fetch_all("SELECT @@session.time_zone").await.unwrap();
+    assert_eq!(timezone[0].get::<String, usize>(0), "-07:00");
 
     let _ = fe_mysql_server.shutdown().await;
     guard.remove_all().await;
@@ -378,8 +418,9 @@ pub async fn test_postgres_auth(store_type: StorageType) {
     )
     .unwrap();
 
-    let (addr, mut guard, fe_pg_server) =
+    let (mut guard, fe_pg_server) =
         setup_pg_server_with_user_provider(store_type, "sql_crud", Some(user_provider)).await;
+    let addr = fe_pg_server.bind_addr().unwrap().to_string();
 
     // 1. no auth
     let conn_re = PgPoolOptions::new()
@@ -432,7 +473,8 @@ pub async fn test_postgres_auth(store_type: StorageType) {
 }
 
 pub async fn test_postgres_crud(store_type: StorageType) {
-    let (addr, mut guard, fe_pg_server) = setup_pg_server(store_type, "sql_crud").await;
+    let (mut guard, fe_pg_server) = setup_pg_server(store_type, "test_postgres_crud").await;
+    let addr = fe_pg_server.bind_addr().unwrap().to_string();
 
     let pool = PgPoolOptions::new()
         .max_connections(2)
@@ -539,7 +581,8 @@ pub async fn test_postgres_crud(store_type: StorageType) {
     guard.remove_all().await;
 }
 pub async fn test_postgres_bytea(store_type: StorageType) {
-    let (addr, mut guard, fe_pg_server) = setup_pg_server(store_type, "sql_bytea_output").await;
+    let (mut guard, fe_pg_server) = setup_pg_server(store_type, "test_postgres_bytea").await;
+    let addr = fe_pg_server.bind_addr().unwrap().to_string();
 
     let (client, connection) = tokio_postgres::connect(&format!("postgres://{addr}/public"), NoTls)
         .await
@@ -608,7 +651,8 @@ pub async fn test_postgres_bytea(store_type: StorageType) {
 }
 
 pub async fn test_postgres_datestyle(store_type: StorageType) {
-    let (addr, mut guard, fe_pg_server) = setup_pg_server(store_type, "various datestyle").await;
+    let (mut guard, fe_pg_server) = setup_pg_server(store_type, "test_postgres_datestyle").await;
+    let addr = fe_pg_server.bind_addr().unwrap().to_string();
 
     let (client, connection) = tokio_postgres::connect(&format!("postgres://{addr}/public"), NoTls)
         .await
@@ -835,7 +879,8 @@ pub async fn test_postgres_datestyle(store_type: StorageType) {
 }
 
 pub async fn test_postgres_timezone(store_type: StorageType) {
-    let (addr, mut guard, fe_pg_server) = setup_pg_server(store_type, "sql_inference").await;
+    let (mut guard, fe_pg_server) = setup_pg_server(store_type, "test_postgres_timezone").await;
+    let addr = fe_pg_server.bind_addr().unwrap().to_string();
 
     let (client, connection) = tokio_postgres::connect(&format!("postgres://{addr}/public"), NoTls)
         .await
@@ -896,7 +941,9 @@ pub async fn test_postgres_timezone(store_type: StorageType) {
 }
 
 pub async fn test_postgres_parameter_inference(store_type: StorageType) {
-    let (addr, mut guard, fe_pg_server) = setup_pg_server(store_type, "sql_inference").await;
+    let (mut guard, fe_pg_server) =
+        setup_pg_server(store_type, "test_postgres_parameter_inference").await;
+    let addr = fe_pg_server.bind_addr().unwrap().to_string();
 
     let (client, connection) = tokio_postgres::connect(&format!("postgres://{addr}/public"), NoTls)
         .await
@@ -974,7 +1021,10 @@ pub async fn test_mysql_async_timestamp(store_type: StorageType) {
     }
     common_telemetry::init_default_ut_logging();
 
-    let (addr, mut guard, fe_mysql_server) = setup_mysql_server(store_type, "sql_timestamp").await;
+    let (mut guard, fe_mysql_server) =
+        setup_mysql_server(store_type, "test_mysql_async_timestamp").await;
+    let addr = fe_mysql_server.bind_addr().unwrap().to_string();
+
     let url = format!("mysql://{addr}/public");
     let opts = mysql_async::Opts::from_url(&url).unwrap();
     let mut conn = mysql_async::Conn::new(opts)
@@ -1095,8 +1145,9 @@ pub async fn test_mysql_async_timestamp(store_type: StorageType) {
 }
 
 pub async fn test_mysql_prepare_stmt_insert_timestamp(store_type: StorageType) {
-    let (addr, mut guard, server) =
+    let (mut guard, server) =
         setup_mysql_server(store_type, "test_mysql_prepare_stmt_insert_timestamp").await;
+    let addr = server.bind_addr().unwrap().to_string();
 
     let pool = MySqlPoolOptions::new()
         .max_connections(2)
@@ -1170,7 +1221,8 @@ pub async fn test_mysql_prepare_stmt_insert_timestamp(store_type: StorageType) {
 }
 
 pub async fn test_postgres_array_types(store_type: StorageType) {
-    let (addr, mut guard, fe_pg_server) = setup_pg_server(store_type, "sql_inference").await;
+    let (mut guard, fe_pg_server) = setup_pg_server(store_type, "test_postgres_array_types").await;
+    let addr = fe_pg_server.bind_addr().unwrap().to_string();
 
     let (client, connection) = tokio_postgres::connect(&format!("postgres://{addr}/public"), NoTls)
         .await
@@ -1201,7 +1253,9 @@ pub async fn test_postgres_array_types(store_type: StorageType) {
 }
 
 pub async fn test_declare_fetch_close_cursor(store_type: StorageType) {
-    let (addr, mut guard, fe_pg_server) = setup_pg_server(store_type, "sql_inference").await;
+    let (mut guard, fe_pg_server) =
+        setup_pg_server(store_type, "test_declare_fetch_close_cursor").await;
+    let addr = fe_pg_server.bind_addr().unwrap().to_string();
 
     let (client, connection) = tokio_postgres::connect(&format!("postgres://{addr}/public"), NoTls)
         .await

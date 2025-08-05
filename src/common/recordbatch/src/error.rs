@@ -23,7 +23,7 @@ use datatypes::prelude::ConcreteDataType;
 use datatypes::schema::SchemaRef;
 use snafu::{Location, Snafu};
 
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Snafu)]
 #[snafu(visibility(pub))]
@@ -65,7 +65,7 @@ pub enum Error {
         location: Location,
     },
 
-    #[snafu(display(""))]
+    #[snafu(transparent)]
     PollStream {
         #[snafu(source)]
         error: datafusion::error::DataFusionError,
@@ -133,6 +133,18 @@ pub enum Error {
         source: datatypes::error::Error,
     },
 
+    #[snafu(display(
+        "Failed to downcast vector of type '{:?}' to type '{:?}'",
+        from_type,
+        to_type
+    ))]
+    DowncastVector {
+        from_type: ConcreteDataType,
+        to_type: ConcreteDataType,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("Error occurs when performing arrow computation"))]
     ArrowCompute {
         #[snafu(source)]
@@ -161,19 +173,25 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+
     #[snafu(display("Stream timeout"))]
     StreamTimeout {
         #[snafu(implicit)]
         location: Location,
-        #[snafu(source)]
-        error: tokio::time::error::Elapsed,
     },
+
     #[snafu(display("RecordBatch slice index overflow: {visit_index} > {size}"))]
     RecordBatchSliceIndexOverflow {
         #[snafu(implicit)]
         location: Location,
         size: usize,
         visit_index: usize,
+    },
+
+    #[snafu(display("Stream has been cancelled"))]
+    StreamCancelled {
+        #[snafu(implicit)]
+        location: Location,
     },
 }
 
@@ -192,6 +210,8 @@ impl ErrorExt for Error {
             | Error::PhysicalExpr { .. }
             | Error::RecordBatchSliceIndexOverflow { .. } => StatusCode::Internal,
 
+            Error::DowncastVector { .. } => StatusCode::Unexpected,
+
             Error::PollStream { .. } => StatusCode::EngineExecuteQuery,
 
             Error::ArrowCompute { .. } => StatusCode::IllegalState,
@@ -207,6 +227,8 @@ impl ErrorExt for Error {
             }
 
             Error::StreamTimeout { .. } => StatusCode::Cancelled,
+
+            Error::StreamCancelled { .. } => StatusCode::Cancelled,
         }
     }
 

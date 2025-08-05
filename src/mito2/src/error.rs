@@ -25,15 +25,15 @@ use common_time::Timestamp;
 use datatypes::arrow::error::ArrowError;
 use datatypes::prelude::ConcreteDataType;
 use object_store::ErrorKind;
-use prost::{DecodeError, EncodeError};
+use prost::DecodeError;
 use snafu::{Location, Snafu};
 use store_api::logstore::provider::Provider;
-use store_api::manifest::ManifestVersion;
 use store_api::storage::RegionId;
+use store_api::ManifestVersion;
 use tokio::time::error::Elapsed;
 
 use crate::cache::file_cache::FileType;
-use crate::region::{RegionLeaderState, RegionRoleState};
+use crate::region::RegionRoleState;
 use crate::schedule::remote_job_scheduler::JobId;
 use crate::sst::file::FileId;
 use crate::worker::WorkerId;
@@ -42,23 +42,26 @@ use crate::worker::WorkerId;
 #[snafu(visibility(pub))]
 #[stack_trace_debug]
 pub enum Error {
+    #[snafu(display("Unexpected data type"))]
+    DataTypeMismatch {
+        source: datatypes::error::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("External error, context: {}", context))]
+    External {
+        source: BoxedError,
+        context: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("Failed to encode sparse primary key, reason: {}", reason))]
     EncodeSparsePrimaryKey {
         reason: String,
         #[snafu(implicit)]
         location: Location,
-    },
-
-    #[snafu(display(
-    "Failed to set region {} to writable, it was expected to replayed to {}, but actually replayed to {}",
-    region_id, expected_last_entry_id, replayed_last_entry_id
-    ))]
-    UnexpectedReplay {
-        #[snafu(implicit)]
-        location: Location,
-        region_id: RegionId,
-        expected_last_entry_id: u64,
-        replayed_last_entry_id: u64,
     },
 
     #[snafu(display("OpenDAL operator failed"))]
@@ -91,6 +94,14 @@ pub enum Error {
         location: Location,
         #[snafu(source)]
         error: serde_json::Error,
+    },
+
+    #[snafu(display("Failed to serialize column metadata"))]
+    SerializeColumnMetadata {
+        #[snafu(source)]
+        error: serde_json::Error,
+        #[snafu(implicit)]
+        location: Location,
     },
 
     #[snafu(display("Invalid scan index, start: {}, end: {}", start, end))]
@@ -235,6 +246,8 @@ pub enum Error {
         region_id: RegionId,
         column: String,
         source: datatypes::Error,
+        #[snafu(implicit)]
+        location: Location,
     },
 
     #[snafu(display("Failed to build entry, region_id: {}", region_id))]
@@ -243,15 +256,6 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
         source: BoxedError,
-    },
-
-    #[snafu(display("Failed to encode WAL entry, region_id: {}", region_id))]
-    EncodeWal {
-        region_id: RegionId,
-        #[snafu(implicit)]
-        location: Location,
-        #[snafu(source)]
-        error: EncodeError,
     },
 
     #[snafu(display("Failed to write WAL"))]
@@ -289,35 +293,6 @@ pub enum Error {
     // Shared error for each writer in the write group.
     #[snafu(display("Failed to write region"))]
     WriteGroup { source: Arc<Error> },
-
-    #[snafu(display("Row value mismatches field data type"))]
-    FieldTypeMismatch { source: datatypes::error::Error },
-
-    #[snafu(display("Failed to serialize field"))]
-    SerializeField {
-        #[snafu(source)]
-        error: memcomparable::Error,
-        #[snafu(implicit)]
-        location: Location,
-    },
-
-    #[snafu(display(
-        "Data type: {} does not support serialization/deserialization",
-        data_type,
-    ))]
-    NotSupportedField {
-        data_type: ConcreteDataType,
-        #[snafu(implicit)]
-        location: Location,
-    },
-
-    #[snafu(display("Failed to deserialize field"))]
-    DeserializeField {
-        #[snafu(source)]
-        error: memcomparable::Error,
-        #[snafu(implicit)]
-        location: Location,
-    },
 
     #[snafu(display("Invalid parquet SST file {}, reason: {}", file, reason))]
     InvalidParquet {
@@ -482,19 +457,23 @@ pub enum Error {
         location: Location,
     },
 
-    #[snafu(display("Schema version doesn't match. Expect {} but gives {}", expect, actual))]
-    InvalidRegionRequestSchemaVersion {
-        expect: u64,
-        actual: u64,
+    #[snafu(display(
+        "Region {} is in {:?} state, which does not permit manifest updates.",
+        region_id,
+        state
+    ))]
+    UpdateManifest {
+        region_id: RegionId,
+        state: RegionRoleState,
         #[snafu(implicit)]
         location: Location,
     },
 
     #[snafu(display("Region {} is in {:?} state, expect: {:?}", region_id, state, expect))]
-    RegionLeaderState {
+    RegionState {
         region_id: RegionId,
         state: RegionRoleState,
-        expect: RegionLeaderState,
+        expect: RegionRoleState,
         #[snafu(implicit)]
         location: Location,
     },
@@ -652,13 +631,6 @@ pub enum Error {
         unexpected_entry_id: u64,
     },
 
-    #[snafu(display("Read the corrupted log entry, region_id: {}", region_id))]
-    CorruptedEntry {
-        region_id: RegionId,
-        #[snafu(implicit)]
-        location: Location,
-    },
-
     #[snafu(display(
         "Failed to download file, region_id: {}, file_id: {}, file_type: {:?}",
         region_id,
@@ -698,8 +670,8 @@ pub enum Error {
         error: std::io::Error,
     },
 
-    #[snafu(display("Failed to filter record batch"))]
-    FilterRecordBatch {
+    #[snafu(display("Record batch error"))]
+    RecordBatch {
         source: common_recordbatch::error::Error,
         #[snafu(implicit)]
         location: Location,
@@ -760,6 +732,50 @@ pub enum Error {
 
     #[snafu(display("checksum mismatch (actual: {}, expected: {})", actual, expected))]
     ChecksumMismatch { actual: u32, expected: u32 },
+
+    #[snafu(display(
+        "No checkpoint found, region: {}, last_version: {}",
+        region_id,
+        last_version
+    ))]
+    NoCheckpoint {
+        region_id: RegionId,
+        last_version: ManifestVersion,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display(
+        "No manifests found in range: [{}..{}), region: {}, last_version: {}",
+        start_version,
+        end_version,
+        region_id,
+        last_version
+    ))]
+    NoManifests {
+        region_id: RegionId,
+        start_version: ManifestVersion,
+        end_version: ManifestVersion,
+        last_version: ManifestVersion,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display(
+        "Failed to install manifest to {}, region: {}, available manifest version: {}, last version: {}",
+        target_version,
+        region_id,
+        available_version,
+        last_version
+    ))]
+    InstallManifestTo {
+        region_id: RegionId,
+        target_version: ManifestVersion,
+        available_version: ManifestVersion,
+        #[snafu(implicit)]
+        location: Location,
+        last_version: ManifestVersion,
+    },
 
     #[snafu(display("Region {} is stopped", region_id))]
     RegionStopped {
@@ -940,22 +956,91 @@ pub enum Error {
         location: Location,
     },
 
-    #[snafu(display(
-        "Unexpected impure default value with region_id: {}, column: {}, default_value: {}",
-        region_id,
-        column,
-        default_value
-    ))]
-    UnexpectedImpureDefault {
-        #[snafu(implicit)]
-        location: Location,
-        region_id: RegionId,
-        column: String,
-        default_value: String,
-    },
-
     #[snafu(display("Manual compaction is override by following operations."))]
     ManualCompactionOverride {},
+
+    #[snafu(display("Incompatible WAL provider change. This is typically caused by changing WAL provider in database config file without completely cleaning existing files. Global provider: {}, region provider: {}", global, region))]
+    IncompatibleWalProviderChange { global: String, region: String },
+
+    #[snafu(display("Expected mito manifest info"))]
+    MitoManifestInfo {
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Failed to scan series"))]
+    ScanSeries {
+        #[snafu(implicit)]
+        location: Location,
+        source: Arc<Error>,
+    },
+
+    #[snafu(display("Partition {} scan multiple times", partition))]
+    ScanMultiTimes {
+        partition: usize,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Failed to decode bulk wal entry"))]
+    ConvertBulkWalEntry {
+        #[snafu(implicit)]
+        location: Location,
+        source: common_grpc::Error,
+    },
+
+    #[snafu(display("Failed to encode"))]
+    Encode {
+        #[snafu(implicit)]
+        location: Location,
+        source: mito_codec::error::Error,
+    },
+
+    #[snafu(display("Failed to decode"))]
+    Decode {
+        #[snafu(implicit)]
+        location: Location,
+        source: mito_codec::error::Error,
+    },
+
+    #[snafu(display("Unexpected: {reason}"))]
+    Unexpected {
+        reason: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[cfg(feature = "enterprise")]
+    #[snafu(display("Failed to scan external range"))]
+    ScanExternalRange {
+        source: BoxedError,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display(
+        "Inconsistent timestamp column length, expect: {}, actual: {}",
+        expected,
+        actual
+    ))]
+    InconsistentTimestampLength {
+        expected: usize,
+        actual: usize,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display(
+        "Too many files to read concurrently: {}, max allowed: {}",
+        actual,
+        max
+    ))]
+    TooManyFilesToRead {
+        actual: usize,
+        max: usize,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -980,11 +1065,11 @@ impl ErrorExt for Error {
         use Error::*;
 
         match self {
-            OpenDal { .. }
-            | ReadParquet { .. }
-            | WriteWal { .. }
-            | ReadWal { .. }
-            | DeleteWal { .. } => StatusCode::StorageUnavailable,
+            DataTypeMismatch { source, .. } => source.status_code(),
+            OpenDal { .. } | ReadParquet { .. } => StatusCode::StorageUnavailable,
+            WriteWal { source, .. } | ReadWal { source, .. } | DeleteWal { source, .. } => {
+                source.status_code()
+            }
             CompressObject { .. }
             | DecompressObject { .. }
             | SerdeJson { .. }
@@ -994,9 +1079,13 @@ impl ErrorExt for Error {
             | CreateDefault { .. }
             | InvalidParquet { .. }
             | OperateAbortedIndex { .. }
-            | UnexpectedReplay { .. }
             | IndexEncodeNull { .. }
-            | UnexpectedImpureDefault { .. } => StatusCode::Unexpected,
+            | NoCheckpoint { .. }
+            | NoManifests { .. }
+            | InstallManifestTo { .. }
+            | Unexpected { .. }
+            | SerializeColumnMetadata { .. } => StatusCode::Unexpected,
+
             RegionNotFound { .. } => StatusCode::RegionNotFound,
             ObjectStoreNotFound { .. }
             | InvalidScanIndex { .. }
@@ -1011,34 +1100,28 @@ impl ErrorExt for Error {
             | PartitionOutOfRange { .. }
             | ParseJobId { .. } => StatusCode::InvalidArguments,
 
-            InvalidRegionRequestSchemaVersion { .. } => StatusCode::RequestOutdated,
-
             RegionMetadataNotFound { .. }
             | Join { .. }
             | WorkerStopped { .. }
             | Recv { .. }
-            | EncodeWal { .. }
             | ConvertMetaData { .. }
             | DecodeWal { .. }
             | ComputeArrow { .. }
             | BiErrors { .. }
             | StopScheduler { .. }
             | ComputeVector { .. }
-            | SerializeField { .. }
             | EncodeMemtable { .. }
             | CreateDir { .. }
             | ReadDataPart { .. }
-            | CorruptedEntry { .. }
             | BuildEntry { .. }
-            | Metadata { .. } => StatusCode::Internal,
+            | Metadata { .. }
+            | MitoManifestInfo { .. } => StatusCode::Internal,
 
             OpenRegion { source, .. } => source.status_code(),
 
             WriteParquet { .. } => StatusCode::StorageUnavailable,
             WriteGroup { source, .. } => source.status_code(),
-            FieldTypeMismatch { source, .. } => source.status_code(),
-            NotSupportedField { .. } => StatusCode::Unsupported,
-            DeserializeField { .. } | EncodeSparsePrimaryKey { .. } => StatusCode::Unexpected,
+            EncodeSparsePrimaryKey { .. } => StatusCode::Unexpected,
             InvalidBatch { .. } => StatusCode::InvalidArguments,
             InvalidRecordBatch { .. } => StatusCode::InvalidArguments,
             ConvertVector { source, .. } => source.status_code(),
@@ -1055,8 +1138,8 @@ impl ErrorExt for Error {
             CompactRegion { source, .. } => source.status_code(),
             CompatReader { .. } => StatusCode::Unexpected,
             InvalidRegionRequest { source, .. } => source.status_code(),
-            RegionLeaderState { .. } => StatusCode::RegionNotReady,
-            &FlushableRegionState { .. } => StatusCode::RegionNotReady,
+            RegionState { .. } | UpdateManifest { .. } => StatusCode::RegionNotReady,
+            FlushableRegionState { .. } => StatusCode::RegionNotReady,
             JsonOptions { .. } => StatusCode::InvalidArguments,
             EmptyRegionDir { .. } | EmptyManifestDir { .. } => StatusCode::RegionNotFound,
             ArrowReader { .. } => StatusCode::StorageUnavailable,
@@ -1075,7 +1158,9 @@ impl ErrorExt for Error {
             InvalidConfig { .. } => StatusCode::InvalidArguments,
             StaleLogEntry { .. } => StatusCode::Unexpected,
 
-            FilterRecordBatch { source, .. } => source.status_code(),
+            External { source, .. } => source.status_code(),
+
+            RecordBatch { source, .. } => source.status_code(),
 
             Download { .. } | Upload { .. } => StatusCode::StorageUnavailable,
             ChecksumMismatch { .. } => StatusCode::Unexpected,
@@ -1102,6 +1187,22 @@ impl ErrorExt for Error {
             }
 
             ManualCompactionOverride {} => StatusCode::Cancelled,
+
+            IncompatibleWalProviderChange { .. } => StatusCode::InvalidArguments,
+
+            ScanSeries { source, .. } => source.status_code(),
+
+            ScanMultiTimes { .. } => StatusCode::InvalidArguments,
+            ConvertBulkWalEntry { source, .. } => source.status_code(),
+
+            Encode { source, .. } | Decode { source, .. } => source.status_code(),
+
+            #[cfg(feature = "enterprise")]
+            ScanExternalRange { source, .. } => source.status_code(),
+
+            InconsistentTimestampLength { .. } => StatusCode::InvalidArguments,
+
+            TooManyFilesToRead { .. } => StatusCode::RateLimited,
         }
     }
 

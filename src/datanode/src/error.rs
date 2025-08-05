@@ -142,20 +142,6 @@ pub enum Error {
         source: Box<log_store::error::Error>,
     },
 
-    #[snafu(display("Failed to init backend"))]
-    InitBackend {
-        #[snafu(source)]
-        error: object_store::Error,
-        #[snafu(implicit)]
-        location: Location,
-    },
-
-    #[snafu(display("Expect KvBackend but not found"))]
-    MissingKvBackend {
-        #[snafu(implicit)]
-        location: Location,
-    },
-
     #[snafu(display("Invalid SQL, error: {}", msg))]
     InvalidSql { msg: String },
 
@@ -336,6 +322,13 @@ pub enum Error {
         location: Location,
     },
 
+    #[snafu(display("Failed to build metric engine"))]
+    BuildMetricEngine {
+        source: metric_engine::error::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("Failed to serialize options to TOML"))]
     TomlFormat {
         #[snafu(implicit)]
@@ -386,6 +379,32 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+
+    #[snafu(display("Failed to serialize json"))]
+    SerializeJson {
+        #[snafu(source)]
+        error: serde_json::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Failed object store operation"))]
+    ObjectStore {
+        source: object_store::error::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Failed to build cache store"))]
+    BuildCacheStore {
+        #[snafu(source)]
+        error: object_store::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Not yet implemented: {what}"))]
+    NotYetImplemented { what: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -419,7 +438,6 @@ impl ErrorExt for Error {
             | MissingRequiredField { .. }
             | RegionEngineNotFound { .. }
             | ParseAddr { .. }
-            | MissingKvBackend { .. }
             | TomlFormat { .. } => StatusCode::InvalidArguments,
 
             PayloadNotExist { .. }
@@ -439,11 +457,9 @@ impl ErrorExt for Error {
 
             StartServer { source, .. } | ShutdownServer { source, .. } => source.status_code(),
 
-            InitBackend { .. } => StatusCode::StorageUnavailable,
-
             OpenLogStore { source, .. } => source.status_code(),
             MetaClientInit { source, .. } => source.status_code(),
-            UnsupportedOutput { .. } => StatusCode::Unsupported,
+            UnsupportedOutput { .. } | NotYetImplemented { .. } => StatusCode::Unsupported,
             HandleRegionRequest { source, .. }
             | GetRegionMetadata { source, .. }
             | HandleBatchOpenRequest { source, .. }
@@ -452,10 +468,15 @@ impl ErrorExt for Error {
 
             FindLogicalRegions { source, .. } => source.status_code(),
             BuildMitoEngine { source, .. } => source.status_code(),
+            BuildMetricEngine { source, .. } => source.status_code(),
             ConcurrentQueryLimiterClosed { .. } | ConcurrentQueryLimiterTimeout { .. } => {
                 StatusCode::RegionBusy
             }
             MissingCache { .. } => StatusCode::Internal,
+            SerializeJson { .. } => StatusCode::Internal,
+
+            ObjectStore { source, .. } => source.status_code(),
+            BuildCacheStore { .. } => StatusCode::StorageUnavailable,
         }
     }
 

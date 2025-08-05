@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::assert_matches::assert_matches;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,21 +20,23 @@ use std::time::Duration;
 use api::v1::value::ValueData;
 use api::v1::{ColumnDataType, Row, Rows, SemanticType};
 use common_error::ext::ErrorExt;
-use common_error::status_code::StatusCode;
+use common_meta::ddl::utils::{parse_column_metadatas, parse_manifest_infos_from_extensions};
 use common_recordbatch::RecordBatches;
 use datatypes::prelude::ConcreteDataType;
-use datatypes::schema::{ColumnSchema, FulltextAnalyzer, FulltextOptions};
+use datatypes::schema::{ColumnSchema, FulltextAnalyzer, FulltextBackend, FulltextOptions};
 use store_api::metadata::ColumnMetadata;
-use store_api::region_engine::{RegionEngine, RegionRole};
+use store_api::metric_engine_consts::TABLE_COLUMN_METADATA_EXTENSION_KEY;
+use store_api::region_engine::{RegionEngine, RegionManifestInfo, RegionRole};
 use store_api::region_request::{
-    AddColumn, AddColumnLocation, AlterKind, ApiSetIndexOptions, RegionAlterRequest,
-    RegionOpenRequest, RegionRequest, SetRegionOption,
+    AddColumn, AddColumnLocation, AlterKind, PathType, RegionAlterRequest, RegionOpenRequest,
+    RegionRequest, SetIndexOption, SetRegionOption,
 };
-use store_api::storage::{RegionId, ScanRequest};
+use store_api::storage::{ColumnId, RegionId, ScanRequest};
 
 use crate::config::MitoConfig;
 use crate::engine::listener::{AlterFlushListener, NotifyRegionChangeResultListener};
 use crate::engine::MitoEngine;
+use crate::error;
 use crate::test_util::{
     build_rows, build_rows_for_key, flush_region, put_rows, rows_schema, CreateRequestBuilder,
     TestEnv,
@@ -41,7 +44,7 @@ use crate::test_util::{
 
 async fn scan_check_after_alter(engine: &MitoEngine, region_id: RegionId, expected: &str) {
     let request = ScanRequest::default();
-    let scanner = engine.scanner(region_id, request).unwrap();
+    let scanner = engine.scanner(region_id, request).await.unwrap();
     assert_eq!(0, scanner.num_memtables());
     assert_eq!(1, scanner.num_files());
     let stream = scanner.scan().await.unwrap();
@@ -51,7 +54,6 @@ async fn scan_check_after_alter(engine: &MitoEngine, region_id: RegionId, expect
 
 fn add_tag1() -> RegionAlterRequest {
     RegionAlterRequest {
-        schema_version: 0,
         kind: AlterKind::AddColumns {
             columns: vec![AddColumn {
                 column_metadata: ColumnMetadata {
@@ -71,27 +73,28 @@ fn add_tag1() -> RegionAlterRequest {
 
 fn alter_column_inverted_index() -> RegionAlterRequest {
     RegionAlterRequest {
-        schema_version: 0,
-        kind: AlterKind::SetIndex {
-            options: ApiSetIndexOptions::Inverted {
+        kind: AlterKind::SetIndexes {
+            options: vec![SetIndexOption::Inverted {
                 column_name: "tag_0".to_string(),
-            },
+            }],
         },
     }
 }
 
 fn alter_column_fulltext_options() -> RegionAlterRequest {
     RegionAlterRequest {
-        schema_version: 0,
-        kind: AlterKind::SetIndex {
-            options: ApiSetIndexOptions::Fulltext {
+        kind: AlterKind::SetIndexes {
+            options: vec![SetIndexOption::Fulltext {
                 column_name: "tag_0".to_string(),
-                options: FulltextOptions {
-                    enable: true,
-                    analyzer: FulltextAnalyzer::English,
-                    case_sensitive: false,
-                },
-            },
+                options: FulltextOptions::new_unchecked(
+                    true,
+                    FulltextAnalyzer::English,
+                    false,
+                    FulltextBackend::Bloom,
+                    1000,
+                    0.01,
+                ),
+            }],
         },
     }
 }
@@ -112,11 +115,22 @@ fn check_region_version(
     assert_eq!(flushed_sequence, version_data.version.flushed_sequence);
 }
 
+fn assert_column_metadatas(column_name: &[(&str, ColumnId)], column_metadatas: &[ColumnMetadata]) {
+    assert_eq!(column_name.len(), column_metadatas.len());
+    for (name, id) in column_name {
+        let column_metadata = column_metadatas
+            .iter()
+            .find(|c| c.column_id == *id)
+            .unwrap();
+        assert_eq!(column_metadata.column_schema.name, *name);
+    }
+}
+
 #[tokio::test]
 async fn test_alter_region() {
     common_telemetry::init_default_ut_logging();
 
-    let mut env = TestEnv::new();
+    let mut env = TestEnv::new().await;
     let engine = env.create_engine(MitoConfig::default()).await;
 
     let region_id = RegionId::new(1, 1);
@@ -134,11 +148,17 @@ async fn test_alter_region() {
         .await;
 
     let column_schemas = rows_schema(&request);
-    let region_dir = request.region_dir.clone();
-    engine
+    let table_dir = request.table_dir.clone();
+    let response = engine
         .handle_request(region_id, RegionRequest::Create(request))
         .await
         .unwrap();
+    let column_metadatas =
+        parse_column_metadatas(&response.extensions, TABLE_COLUMN_METADATA_EXTENSION_KEY).unwrap();
+    assert_column_metadatas(
+        &[("tag_0", 0), ("field_0", 1), ("ts", 2)],
+        &column_metadatas,
+    );
 
     let rows = Rows {
         schema: column_schemas,
@@ -147,7 +167,7 @@ async fn test_alter_region() {
     put_rows(&engine, region_id, rows).await;
 
     let request = add_tag1();
-    engine
+    let response = engine
         .handle_request(region_id, RegionRequest::Alter(request))
         .await
         .unwrap();
@@ -163,6 +183,18 @@ async fn test_alter_region() {
     scan_check_after_alter(&engine, region_id, expected).await;
     check_region_version(&engine, region_id, 1, 3, 1, 3);
 
+    let mut manifests = parse_manifest_infos_from_extensions(&response.extensions).unwrap();
+    assert_eq!(manifests.len(), 1);
+    let (return_region_id, manifest) = manifests.remove(0);
+    assert_eq!(return_region_id, region_id);
+    assert_eq!(manifest, RegionManifestInfo::mito(2, 1));
+    let column_metadatas =
+        parse_column_metadatas(&response.extensions, TABLE_COLUMN_METADATA_EXTENSION_KEY).unwrap();
+    assert_column_metadatas(
+        &[("tag_0", 0), ("field_0", 1), ("ts", 2), ("tag_1", 3)],
+        &column_metadatas,
+    );
+
     // Reopen region.
     let engine = env.reopen_engine(engine, MitoConfig::default()).await;
     engine
@@ -170,7 +202,8 @@ async fn test_alter_region() {
             region_id,
             RegionRequest::Open(RegionOpenRequest {
                 engine: String::new(),
-                region_dir,
+                table_dir,
+                path_type: PathType::Bare,
                 options: HashMap::default(),
                 skip_wal_replay: false,
             }),
@@ -212,7 +245,7 @@ fn build_rows_for_tags(
 
 #[tokio::test]
 async fn test_put_after_alter() {
-    let mut env = TestEnv::new();
+    let mut env = TestEnv::new().await;
     let engine = env.create_engine(MitoConfig::default()).await;
     let region_id = RegionId::new(1, 1);
     let request = CreateRequestBuilder::new().build();
@@ -229,7 +262,7 @@ async fn test_put_after_alter() {
         .await;
 
     let mut column_schemas = rows_schema(&request);
-    let region_dir = request.region_dir.clone();
+    let table_dir = request.table_dir.clone();
     engine
         .handle_request(region_id, RegionRequest::Create(request))
         .await
@@ -263,7 +296,8 @@ async fn test_put_after_alter() {
             region_id,
             RegionRequest::Open(RegionOpenRequest {
                 engine: String::new(),
-                region_dir,
+                table_dir,
+                path_type: PathType::Bare,
                 options: HashMap::default(),
                 skip_wal_replay: false,
             }),
@@ -317,7 +351,7 @@ async fn test_put_after_alter() {
 async fn test_alter_region_retry() {
     common_telemetry::init_default_ut_logging();
 
-    let mut env = TestEnv::new();
+    let mut env = TestEnv::new().await;
     let engine = env.create_engine(MitoConfig::default()).await;
 
     let region_id = RegionId::new(1, 1);
@@ -357,7 +391,8 @@ async fn test_alter_region_retry() {
         .handle_request(region_id, RegionRequest::Alter(request))
         .await
         .unwrap_err();
-    assert_eq!(err.status_code(), StatusCode::RequestOutdated);
+    let err = err.as_any().downcast_ref::<error::Error>().unwrap();
+    assert_matches!(err, &error::Error::InvalidRegionRequest { .. });
 
     let expected = "\
 +-------+-------+---------+---------------------+
@@ -374,7 +409,7 @@ async fn test_alter_region_retry() {
 async fn test_alter_on_flushing() {
     common_telemetry::init_default_ut_logging();
 
-    let mut env = TestEnv::new();
+    let mut env = TestEnv::new().await;
     let listener = Arc::new(AlterFlushListener::default());
     let engine = env
         .create_engine_with(MitoConfig::default(), None, Some(listener.clone()))
@@ -459,7 +494,7 @@ async fn test_alter_on_flushing() {
         .unwrap();
 
     let request = ScanRequest::default();
-    let scanner = engine.scanner(region_id, request).unwrap();
+    let scanner = engine.scanner(region_id, request).await.unwrap();
     assert_eq!(0, scanner.num_memtables());
     assert_eq!(1, scanner.num_files());
     let stream = scanner.scan().await.unwrap();
@@ -478,7 +513,7 @@ async fn test_alter_on_flushing() {
 async fn test_alter_column_fulltext_options() {
     common_telemetry::init_default_ut_logging();
 
-    let mut env = TestEnv::new();
+    let mut env = TestEnv::new().await;
     let listener = Arc::new(AlterFlushListener::default());
     let engine = env
         .create_engine_with(MitoConfig::default(), None, Some(listener.clone()))
@@ -499,7 +534,7 @@ async fn test_alter_column_fulltext_options() {
         .await;
 
     let column_schemas = rows_schema(&request);
-    let region_dir = request.region_dir.clone();
+    let table_dir = request.table_dir.clone();
     engine
         .handle_request(region_id, RegionRequest::Create(request))
         .await
@@ -553,11 +588,14 @@ async fn test_alter_column_fulltext_options() {
     // Wait for the write job.
     alter_job.await.unwrap();
 
-    let expect_fulltext_options = FulltextOptions {
-        enable: true,
-        analyzer: FulltextAnalyzer::English,
-        case_sensitive: false,
-    };
+    let expect_fulltext_options = FulltextOptions::new_unchecked(
+        true,
+        FulltextAnalyzer::English,
+        false,
+        FulltextBackend::Bloom,
+        1000,
+        0.01,
+    );
     let check_fulltext_options = |engine: &MitoEngine, expected: &FulltextOptions| {
         let current_fulltext_options = engine
             .get_region(region_id)
@@ -581,7 +619,8 @@ async fn test_alter_column_fulltext_options() {
             region_id,
             RegionRequest::Open(RegionOpenRequest {
                 engine: String::new(),
-                region_dir,
+                table_dir,
+                path_type: PathType::Bare,
                 options: HashMap::default(),
                 skip_wal_replay: false,
             }),
@@ -596,7 +635,7 @@ async fn test_alter_column_fulltext_options() {
 async fn test_alter_column_set_inverted_index() {
     common_telemetry::init_default_ut_logging();
 
-    let mut env = TestEnv::new();
+    let mut env = TestEnv::new().await;
     let listener = Arc::new(AlterFlushListener::default());
     let engine = env
         .create_engine_with(MitoConfig::default(), None, Some(listener.clone()))
@@ -617,7 +656,7 @@ async fn test_alter_column_set_inverted_index() {
         .await;
 
     let column_schemas = rows_schema(&request);
-    let region_dir = request.region_dir.clone();
+    let table_dir = request.table_dir.clone();
     engine
         .handle_request(region_id, RegionRequest::Create(request))
         .await
@@ -691,7 +730,8 @@ async fn test_alter_column_set_inverted_index() {
             region_id,
             RegionRequest::Open(RegionOpenRequest {
                 engine: String::new(),
-                region_dir,
+                table_dir,
+                path_type: PathType::Bare,
                 options: HashMap::default(),
                 skip_wal_replay: false,
             }),
@@ -706,7 +746,7 @@ async fn test_alter_column_set_inverted_index() {
 async fn test_alter_region_ttl_options() {
     common_telemetry::init_default_ut_logging();
 
-    let mut env = TestEnv::new();
+    let mut env = TestEnv::new().await;
     let listener = Arc::new(AlterFlushListener::default());
     let engine = env
         .create_engine_with(MitoConfig::default(), None, Some(listener.clone()))
@@ -731,7 +771,6 @@ async fn test_alter_region_ttl_options() {
         .unwrap();
     let engine_cloned = engine.clone();
     let alter_ttl_request = RegionAlterRequest {
-        schema_version: 0,
         kind: AlterKind::SetRegionOptions {
             options: vec![SetRegionOption::Ttl(Some(Duration::from_secs(500).into()))],
         },
@@ -757,7 +796,7 @@ async fn test_alter_region_ttl_options() {
 async fn test_write_stall_on_altering() {
     common_telemetry::init_default_ut_logging();
 
-    let mut env = TestEnv::new();
+    let mut env = TestEnv::new().await;
     let listener = Arc::new(NotifyRegionChangeResultListener::default());
     let engine = env
         .create_engine_with(MitoConfig::default(), None, Some(listener.clone()))
@@ -815,7 +854,7 @@ async fn test_write_stall_on_altering() {
 |       | 2     | 2.0     | 1970-01-01T00:00:02 |
 +-------+-------+---------+---------------------+";
     let request = ScanRequest::default();
-    let scanner = engine.scanner(region_id, request).unwrap();
+    let scanner = engine.scanner(region_id, request).await.unwrap();
     let stream = scanner.scan().await.unwrap();
     let batches = RecordBatches::try_collect(stream).await.unwrap();
     assert_eq!(expected, batches.pretty_print().unwrap());

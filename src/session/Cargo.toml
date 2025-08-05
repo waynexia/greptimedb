@@ -11,6 +11,7 @@ testing = []
 workspace = true
 
 [dependencies]
+ahash.workspace = true
 api.workspace = true
 arc-swap = "1.5"
 auth.workspace = true
@@ -18,6 +19,7 @@ common-catalog.workspace = true
 common-error.workspace = true
 common-macro.workspace = true
 common-recordbatch.workspace = true
+common-session.workspace = true
 common-telemetry.workspace = true
 common-time.workspace = true
 derive_builder.workspace = true

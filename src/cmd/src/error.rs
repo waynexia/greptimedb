@@ -17,7 +17,6 @@ use std::any::Any;
 use common_error::ext::{BoxedError, ErrorExt};
 use common_error::status_code::StatusCode;
 use common_macro::stack_trace_debug;
-use rustyline::error::ReadlineError;
 use snafu::{Location, Snafu};
 
 #[derive(Snafu)]
@@ -100,6 +99,13 @@ pub enum Error {
         source: flow::Error,
     },
 
+    #[snafu(display("Servers error"))]
+    Servers {
+        #[snafu(implicit)]
+        location: Location,
+        source: servers::error::Error,
+    },
+
     #[snafu(display("Failed to start frontend"))]
     StartFrontend {
         #[snafu(implicit)]
@@ -171,55 +177,6 @@ pub enum Error {
         source: meta_srv::error::Error,
     },
 
-    #[snafu(display("Invalid REPL command: {reason}"))]
-    InvalidReplCommand { reason: String },
-
-    #[snafu(display("Cannot create REPL"))]
-    ReplCreation {
-        #[snafu(source)]
-        error: ReadlineError,
-        #[snafu(implicit)]
-        location: Location,
-    },
-
-    #[snafu(display("Error reading command"))]
-    Readline {
-        #[snafu(source)]
-        error: ReadlineError,
-        #[snafu(implicit)]
-        location: Location,
-    },
-
-    #[snafu(display("Failed to request database, sql: {sql}"))]
-    RequestDatabase {
-        sql: String,
-        #[snafu(source)]
-        source: client::Error,
-        #[snafu(implicit)]
-        location: Location,
-    },
-
-    #[snafu(display("Failed to collect RecordBatches"))]
-    CollectRecordBatches {
-        #[snafu(implicit)]
-        location: Location,
-        source: common_recordbatch::error::Error,
-    },
-
-    #[snafu(display("Failed to pretty print Recordbatches"))]
-    PrettyPrintRecordBatches {
-        #[snafu(implicit)]
-        location: Location,
-        source: common_recordbatch::error::Error,
-    },
-
-    #[snafu(display("Failed to start Meta client"))]
-    StartMetaClient {
-        #[snafu(implicit)]
-        location: Location,
-        source: meta_client::error::Error,
-    },
-
     #[snafu(display("Failed to parse SQL: {}", sql))]
     ParseSql {
         sql: String,
@@ -233,13 +190,6 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
         source: query::error::Error,
-    },
-
-    #[snafu(display("Failed to encode logical plan in substrait"))]
-    SubstraitEncodeLogicalPlan {
-        #[snafu(implicit)]
-        location: Location,
-        source: substrait::error::Error,
     },
 
     #[snafu(display("Failed to load layered config"))]
@@ -365,6 +315,7 @@ impl ErrorExt for Error {
             Error::ShutdownFrontend { source, .. } => source.status_code(),
             Error::StartMetaServer { source, .. } => source.status_code(),
             Error::ShutdownMetaServer { source, .. } => source.status_code(),
+            Error::Servers { source, .. } => source.status_code(),
             Error::BuildMetaServer { source, .. } => source.status_code(),
             Error::UnsupportedSelectorType { source, .. } => source.status_code(),
             Error::BuildCli { source, .. } => source.status_code(),
@@ -377,7 +328,6 @@ impl ErrorExt for Error {
             Error::MissingConfig { .. }
             | Error::LoadLayeredConfig { .. }
             | Error::IllegalConfig { .. }
-            | Error::InvalidReplCommand { .. }
             | Error::InitTimezone { .. }
             | Error::ConnectEtcd { .. }
             | Error::CreateDir { .. }
@@ -387,17 +337,10 @@ impl ErrorExt for Error {
             | Error::StopProcedureManager { source, .. } => source.status_code(),
             Error::BuildWalOptionsAllocator { source, .. }
             | Error::StartWalOptionsAllocator { source, .. } => source.status_code(),
-            Error::ReplCreation { .. } | Error::Readline { .. } | Error::HttpQuerySql { .. } => {
-                StatusCode::Internal
-            }
-            Error::RequestDatabase { source, .. } => source.status_code(),
-            Error::CollectRecordBatches { source, .. }
-            | Error::PrettyPrintRecordBatches { source, .. } => source.status_code(),
-            Error::StartMetaClient { source, .. } => source.status_code(),
+            Error::HttpQuerySql { .. } => StatusCode::Internal,
             Error::ParseSql { source, .. } | Error::PlanStatement { source, .. } => {
                 source.status_code()
             }
-            Error::SubstraitEncodeLogicalPlan { source, .. } => source.status_code(),
 
             Error::SerdeJson { .. }
             | Error::FileIo { .. }

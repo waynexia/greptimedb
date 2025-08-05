@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(feature = "enterprise")]
+pub mod trigger;
+
 use std::collections::HashMap;
 
 use common_catalog::consts::default_engine;
@@ -25,10 +28,9 @@ use sqlparser::dialect::keywords::Keyword;
 use sqlparser::keywords::ALL_KEYWORDS;
 use sqlparser::parser::IsOptional::Mandatory;
 use sqlparser::parser::{Parser, ParserError};
-use sqlparser::tokenizer::{Token, TokenWithLocation, Word};
-use table::requests::validate_table_option;
+use sqlparser::tokenizer::{Token, TokenWithSpan, Word};
+use table::requests::{validate_database_option, validate_table_option};
 
-use super::utils;
 use crate::ast::{ColumnDef, Ident};
 use crate::error::{
     self, InvalidColumnOptionSnafu, InvalidDatabaseOptionSnafu, InvalidIntervalSnafu,
@@ -37,16 +39,16 @@ use crate::error::{
 };
 use crate::parser::{ParserContext, FLOW};
 use crate::parsers::utils::{
-    validate_column_fulltext_create_option, validate_column_skipping_index_create_option,
+    self, validate_column_fulltext_create_option, validate_column_skipping_index_create_option,
 };
 use crate::statements::create::{
     Column, ColumnExtensions, CreateDatabase, CreateExternalTable, CreateFlow, CreateTable,
-    CreateTableLike, CreateView, Partitions, TableConstraint, VECTOR_OPT_DIM,
+    CreateTableLike, CreateView, Partitions, SqlOrTql, TableConstraint, VECTOR_OPT_DIM,
 };
 use crate::statements::statement::Statement;
 use crate::statements::transform::type_alias::get_data_type_by_alias_name;
 use crate::statements::{sql_data_type_to_concrete_data_type, OptionMap};
-use crate::util::parse_option_string;
+use crate::util::{location_to_index, parse_option_string};
 
 pub const ENGINE: &str = "ENGINE";
 pub const MAXVALUE: &str = "MAXVALUE";
@@ -55,12 +57,6 @@ pub const EXPIRE: &str = "EXPIRE";
 pub const AFTER: &str = "AFTER";
 pub const INVERTED: &str = "INVERTED";
 pub const SKIPPING: &str = "SKIPPING";
-
-const DB_OPT_KEY_TTL: &str = "ttl";
-
-fn validate_database_option(key: &str) -> bool {
-    [DB_OPT_KEY_TTL].contains(&key)
-}
 
 /// Parses create [table] statement
 impl<'a> ParserContext<'a> {
@@ -97,6 +93,12 @@ impl<'a> ParserContext<'a> {
                 Keyword::VIEW => {
                     let _ = self.parser.next_token();
                     self.parse_create_view(false)
+                }
+
+                #[cfg(feature = "enterprise")]
+                Keyword::TRIGGER => {
+                    let _ = self.parser.next_token();
+                    self.parse_create_trigger()
                 }
 
                 Keyword::NoKeyword => {
@@ -207,6 +209,14 @@ impl<'a> ParserContext<'a> {
                 }
             );
         }
+        if let Some(append_mode) = options.get("append_mode") {
+            if append_mode == "true" && options.contains_key("merge_mode") {
+                return InvalidDatabaseOptionSnafu {
+                    key: "merge_mode".to_string(),
+                }
+                .fail();
+            }
+        }
 
         Ok(Statement::CreateDatabase(CreateDatabase {
             name: database_name,
@@ -282,25 +292,14 @@ impl<'a> ParserContext<'a> {
             .parser
             .consume_tokens(&[Token::make_keyword(EXPIRE), Token::make_keyword(AFTER)])
         {
-            let expire_after_expr = self.parser.parse_expr().context(error::SyntaxSnafu)?;
-            let expire_after_lit = utils::parser_expr_to_scalar_value(expire_after_expr.clone())?
-                .cast_to(&ArrowDataType::Interval(IntervalUnit::MonthDayNano))
-                .ok()
-                .with_context(|| InvalidIntervalSnafu {
-                    reason: format!("cannot cast {} to interval type", expire_after_expr),
-                })?;
-            if let ScalarValue::IntervalMonthDayNano(Some(nanoseconds)) = expire_after_lit {
-                Some(nanoseconds.nanoseconds / 1_000_000_000)
-            } else {
-                unreachable!()
-            }
+            Some(self.parse_interval()?)
         } else {
             None
         };
 
         let comment = if self.parser.parse_keyword(Keyword::COMMENT) {
             match self.parser.next_token() {
-                TokenWithLocation {
+                TokenWithSpan {
                     token: Token::SingleQuotedString(value, ..),
                     ..
                 } => Some(value),
@@ -319,7 +318,22 @@ impl<'a> ParserContext<'a> {
             .expect_keyword(Keyword::AS)
             .context(SyntaxSnafu)?;
 
-        let query = self.parser.parse_query().context(error::SyntaxSnafu)?;
+        let start_loc = self.parser.peek_token().span.start;
+        let start_index = location_to_index(self.sql, &start_loc);
+
+        let query = self.parse_statement()?;
+        let end_token = self.parser.peek_token();
+
+        let raw_query = if end_token == Token::EOF {
+            &self.sql[start_index..]
+        } else {
+            let end_loc = end_token.span.end;
+            let end_index = location_to_index(self.sql, &end_loc);
+            &self.sql[start_index..end_index.min(self.sql.len())]
+        };
+        let raw_query = raw_query.trim_end_matches(";");
+
+        let query = Box::new(SqlOrTql::try_from_statement(query, raw_query)?);
 
         Ok(Statement::CreateFlow(CreateFlow {
             flow_name,
@@ -330,6 +344,28 @@ impl<'a> ParserContext<'a> {
             comment,
             query,
         }))
+    }
+
+    /// Parse the interval expr to duration in seconds.
+    fn parse_interval(&mut self) -> Result<i64> {
+        let interval_expr = self.parser.parse_expr().context(error::SyntaxSnafu)?;
+        let interval = utils::parser_expr_to_scalar_value_literal(interval_expr.clone())?
+            .cast_to(&ArrowDataType::Interval(IntervalUnit::MonthDayNano))
+            .ok()
+            .with_context(|| InvalidIntervalSnafu {
+                reason: format!("cannot cast {} to interval type", interval_expr),
+            })?;
+        if let ScalarValue::IntervalMonthDayNano(Some(interval)) = interval {
+            Ok(
+                interval.nanoseconds / 1_000_000_000
+                    + interval.days as i64 * 60 * 60 * 24
+                    + interval.months as i64 * 60 * 60 * 24 * 3044 / 1000, // 1 month=365.25/12=30.44 days
+                                                                           // this is to keep the same as https://docs.rs/humantime/latest/humantime/fn.parse_duration.html
+                                                                           // which we use in database to parse i.e. ttl interval and many other intervals
+            )
+        } else {
+            unreachable!()
+        }
     }
 
     fn parse_if_not_exist(&mut self) -> Result<bool> {
@@ -497,10 +533,7 @@ impl<'a> ParserContext<'a> {
                     time_index_opt_idx = Some(index);
 
                     let constraint = TableConstraint::TimeIndex {
-                        column: Ident {
-                            value: column.name().value.clone(),
-                            quote_style: None,
-                        },
+                        column: Ident::new(column.name().value.clone()),
                     };
                     constraints.push(constraint);
                 }
@@ -548,7 +581,7 @@ impl<'a> ParserContext<'a> {
 
     /// Parse the column name and check if it's valid.
     fn parse_column_name(&mut self) -> std::result::Result<Ident, ParserError> {
-        let name = self.parser.parse_identifier(false)?;
+        let name = self.parser.parse_identifier()?;
         if name.quote_style.is_none() &&
         // "ALL_KEYWORDS" are sorted.
             ALL_KEYWORDS.binary_search(&name.value.to_uppercase().as_str()).is_ok()
@@ -588,7 +621,7 @@ impl<'a> ParserContext<'a> {
         let mut extensions = ColumnExtensions::default();
         loop {
             if parser.parse_keyword(Keyword::CONSTRAINT) {
-                let name = Some(parser.parse_identifier(false).context(SyntaxSnafu)?);
+                let name = Some(parser.parse_identifier().context(SyntaxSnafu)?);
                 if let Some(option) = Self::parse_optional_column_option(parser)? {
                     options.push(ColumnOptionDef { name, option });
                 } else {
@@ -626,7 +659,7 @@ impl<'a> ParserContext<'a> {
             Ok(Some(ColumnOption::NotNull))
         } else if parser.parse_keywords(&[Keyword::COMMENT]) {
             match parser.next_token() {
-                TokenWithLocation {
+                TokenWithSpan {
                     token: Token::SingleQuotedString(value, ..),
                     ..
                 } => Ok(Some(ColumnOption::Comment(value))),
@@ -699,8 +732,8 @@ impl<'a> ParserContext<'a> {
                         msg: "dimension should be a positive integer",
                     })?;
 
-            let options = HashMap::from_iter([(VECTOR_OPT_DIM.to_string(), dimension.to_string())]);
-            column_extensions.vector_options = Some(options.into());
+            let options = OptionMap::from([(VECTOR_OPT_DIM.to_string(), dimension.to_string())]);
+            column_extensions.vector_options = Some(options);
         }
 
         // parse index options in column definition
@@ -845,7 +878,7 @@ impl<'a> ParserContext<'a> {
 
     fn parse_optional_table_constraint(&mut self) -> Result<Option<TableConstraint>> {
         match self.parser.next_token() {
-            TokenWithLocation {
+            TokenWithSpan {
                 token: Token::Word(w),
                 ..
             } if w.keyword == Keyword::PRIMARY => {
@@ -865,7 +898,7 @@ impl<'a> ParserContext<'a> {
                     .collect();
                 Ok(Some(TableConstraint::PrimaryKey { columns }))
             }
-            TokenWithLocation {
+            TokenWithSpan {
                 token: Token::Word(w),
                 ..
             } if w.keyword == Keyword::TIME => {
@@ -1296,6 +1329,160 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_create_flow_more_testcases() {
+        use pretty_assertions::assert_eq;
+        fn parse_create_flow(sql: &str) -> CreateFlow {
+            let stmts = ParserContext::create_with_dialect(
+                sql,
+                &GreptimeDbDialect {},
+                ParseOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(1, stmts.len());
+            match &stmts[0] {
+                Statement::CreateFlow(c) => c.clone(),
+                _ => unreachable!(),
+            }
+        }
+        struct CreateFlowWoutQuery {
+            /// Flow name
+            pub flow_name: ObjectName,
+            /// Output (sink) table name
+            pub sink_table_name: ObjectName,
+            /// Whether to replace existing task
+            pub or_replace: bool,
+            /// Create if not exist
+            pub if_not_exists: bool,
+            /// `EXPIRE AFTER`
+            /// Duration in second as `i64`
+            pub expire_after: Option<i64>,
+            /// Comment string
+            pub comment: Option<String>,
+        }
+        let testcases = vec![
+            (
+                r"
+CREATE OR REPLACE FLOW IF NOT EXISTS task_1
+SINK TO schema_1.table_1
+EXPIRE AFTER INTERVAL '5 minutes'
+COMMENT 'test comment'
+AS
+SELECT max(c1), min(c2) FROM schema_2.table_2;",
+                CreateFlowWoutQuery {
+                    flow_name: ObjectName(vec![Ident::new("task_1")]),
+                    sink_table_name: ObjectName(vec![
+                        Ident::new("schema_1"),
+                        Ident::new("table_1"),
+                    ]),
+                    or_replace: true,
+                    if_not_exists: true,
+                    expire_after: Some(300),
+                    comment: Some("test comment".to_string()),
+                },
+            ),
+            (
+                r"
+CREATE OR REPLACE FLOW IF NOT EXISTS task_1
+SINK TO schema_1.table_1
+EXPIRE AFTER INTERVAL '300 s'
+COMMENT 'test comment'
+AS
+SELECT max(c1), min(c2) FROM schema_2.table_2;",
+                CreateFlowWoutQuery {
+                    flow_name: ObjectName(vec![Ident::new("task_1")]),
+                    sink_table_name: ObjectName(vec![
+                        Ident::new("schema_1"),
+                        Ident::new("table_1"),
+                    ]),
+                    or_replace: true,
+                    if_not_exists: true,
+                    expire_after: Some(300),
+                    comment: Some("test comment".to_string()),
+                },
+            ),
+            (
+                r"
+CREATE OR REPLACE FLOW IF NOT EXISTS task_1
+SINK TO schema_1.table_1
+EXPIRE AFTER '5 minutes'
+COMMENT 'test comment'
+AS
+SELECT max(c1), min(c2) FROM schema_2.table_2;",
+                CreateFlowWoutQuery {
+                    flow_name: ObjectName(vec![Ident::new("task_1")]),
+                    sink_table_name: ObjectName(vec![
+                        Ident::new("schema_1"),
+                        Ident::new("table_1"),
+                    ]),
+                    or_replace: true,
+                    if_not_exists: true,
+                    expire_after: Some(300),
+                    comment: Some("test comment".to_string()),
+                },
+            ),
+            (
+                r"
+CREATE OR REPLACE FLOW IF NOT EXISTS task_1
+SINK TO schema_1.table_1
+EXPIRE AFTER '300 s'
+COMMENT 'test comment'
+AS
+SELECT max(c1), min(c2) FROM schema_2.table_2;",
+                CreateFlowWoutQuery {
+                    flow_name: ObjectName(vec![Ident::new("task_1")]),
+                    sink_table_name: ObjectName(vec![
+                        Ident::new("schema_1"),
+                        Ident::new("table_1"),
+                    ]),
+                    or_replace: true,
+                    if_not_exists: true,
+                    expire_after: Some(300),
+                    comment: Some("test comment".to_string()),
+                },
+            ),
+            (
+                r"
+CREATE FLOW `task_2`
+SINK TO schema_1.table_1
+EXPIRE AFTER '1 month 2 days 1h 2 min'
+AS
+SELECT max(c1), min(c2) FROM schema_2.table_2;",
+                CreateFlowWoutQuery {
+                    flow_name: ObjectName(vec![Ident::with_quote('`', "task_2")]),
+                    sink_table_name: ObjectName(vec![
+                        Ident::new("schema_1"),
+                        Ident::new("table_1"),
+                    ]),
+                    or_replace: false,
+                    if_not_exists: false,
+                    expire_after: Some(86400 * 3044 / 1000 + 2 * 86400 + 3600 + 2 * 60),
+                    comment: None,
+                },
+            ),
+        ];
+
+        for (sql, expected) in testcases {
+            let create_task = parse_create_flow(sql);
+
+            let expected = CreateFlow {
+                flow_name: expected.flow_name,
+                sink_table_name: expected.sink_table_name,
+                or_replace: expected.or_replace,
+                if_not_exists: expected.if_not_exists,
+                expire_after: expected.expire_after,
+                comment: expected.comment,
+                // ignore query parse result
+                query: create_task.query.clone(),
+            };
+
+            assert_eq!(create_task, expected, "input sql is:\n{sql}");
+            let show_create = create_task.to_string();
+            let recreated = parse_create_flow(&show_create);
+            assert_eq!(recreated, expected, "input sql is:\n{show_create}");
+        }
+    }
+
+    #[test]
     fn test_parse_create_flow() {
         let sql = r"
 CREATE OR REPLACE FLOW IF NOT EXISTS task_1
@@ -1314,20 +1501,8 @@ SELECT max(c1), min(c2) FROM schema_2.table_2;";
         };
 
         let expected = CreateFlow {
-            flow_name: ObjectName(vec![Ident {
-                value: "task_1".to_string(),
-                quote_style: None,
-            }]),
-            sink_table_name: ObjectName(vec![
-                Ident {
-                    value: "schema_1".to_string(),
-                    quote_style: None,
-                },
-                Ident {
-                    value: "table_1".to_string(),
-                    quote_style: None,
-                },
-            ]),
+            flow_name: ObjectName(vec![Ident::new("task_1")]),
+            sink_table_name: ObjectName(vec![Ident::new("schema_1"), Ident::new("table_1")]),
             or_replace: true,
             if_not_exists: true,
             expire_after: Some(300),
@@ -1341,6 +1516,7 @@ SELECT max(c1), min(c2) FROM schema_2.table_2;";
         let sql = r"
 CREATE FLOW `task_2`
 SINK TO schema_1.table_1
+EXPIRE AFTER '1 month 2 days 1h 2 min'
 AS
 SELECT max(c1), min(c2) FROM schema_2.table_2;";
         let stmts =
@@ -1353,7 +1529,10 @@ SELECT max(c1), min(c2) FROM schema_2.table_2;";
         };
         assert!(!create_task.or_replace);
         assert!(!create_task.if_not_exists);
-        assert!(create_task.expire_after.is_none());
+        assert_eq!(
+            create_task.expire_after,
+            Some(86400 * 3044 / 1000 + 2 * 86400 + 3600 + 2 * 60)
+        );
         assert!(create_task.comment.is_none());
         assert_eq!(create_task.flow_name.to_string(), "`task_2`");
     }
@@ -1826,7 +2005,7 @@ ENGINE=mito";
             ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default());
         assert_eq!(
             result.unwrap_err().output_msg(),
-            "Invalid SQL, error: Partition rule expr Identifier(Ident { value: \"b\", quote_style: None }) is not a binary expr"
+            r#"Invalid SQL, error: Partition rule expr Identifier(Ident { value: "b", quote_style: None, span: Span(Location(4,5)..Location(4,6)) }) is not a binary expr"#
         );
     }
 
@@ -2474,5 +2653,14 @@ CREATE TABLE log (
             assert!(extensions.skipping_index_options.is_some());
             assert!(extensions.fulltext_index_options.is_some());
         }
+    }
+
+    #[test]
+    fn test_parse_interval_cast() {
+        let s = "select '10s'::INTERVAL";
+        let stmts =
+            ParserContext::create_with_dialect(s, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
+        assert_eq!("SELECT '10 seconds'::INTERVAL", &stmts[0].to_string());
     }
 }

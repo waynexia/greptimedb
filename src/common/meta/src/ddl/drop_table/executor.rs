@@ -15,12 +15,13 @@
 use std::collections::HashMap;
 
 use api::v1::region::{
-    region_request, DropRequest as PbDropRegionRequest, RegionRequest, RegionRequestHeader,
+    region_request, CloseRequest as PbCloseRegionRequest, DropRequest as PbDropRegionRequest,
+    RegionRequest, RegionRequestHeader,
 };
 use common_error::ext::ErrorExt;
 use common_error::status_code::StatusCode;
-use common_telemetry::debug;
 use common_telemetry::tracing_context::TracingContext;
+use common_telemetry::{debug, error};
 use common_wal::options::WalOptions;
 use futures::future::join_all;
 use snafu::ensure;
@@ -35,8 +36,10 @@ use crate::error::{self, Result};
 use crate::instruction::CacheIdent;
 use crate::key::table_name::TableNameKey;
 use crate::key::table_route::TableRouteValue;
-use crate::rpc::router::{find_leader_regions, find_leaders, RegionRoute};
-use crate::ClusterId;
+use crate::rpc::router::{
+    find_follower_regions, find_followers, find_leader_regions, find_leaders,
+    operating_leader_regions, RegionRoute,
+};
 
 /// [Control] indicated to the caller whether to go to the next step.
 #[derive(Debug)]
@@ -54,14 +57,8 @@ impl<T> Control<T> {
 
 impl DropTableExecutor {
     /// Returns the [DropTableExecutor].
-    pub fn new(
-        cluster_id: ClusterId,
-        table: TableName,
-        table_id: TableId,
-        drop_if_exists: bool,
-    ) -> Self {
+    pub fn new(table: TableName, table_id: TableId, drop_if_exists: bool) -> Self {
         Self {
-            cluster_id,
             table,
             table_id,
             drop_if_exists,
@@ -74,7 +71,6 @@ impl DropTableExecutor {
 /// - Invalidates the cache on the Frontend nodes.
 /// - Drops the regions on the Datanode nodes.
 pub struct DropTableExecutor {
-    cluster_id: ClusterId,
     table: TableName,
     table_id: TableId,
     drop_if_exists: bool,
@@ -164,7 +160,7 @@ impl DropTableExecutor {
         let detecting_regions = if table_route_value.is_physical() {
             // Safety: checked.
             let regions = table_route_value.region_routes().unwrap();
-            convert_region_routes_to_detecting_regions(self.cluster_id, regions)
+            convert_region_routes_to_detecting_regions(regions)
         } else {
             vec![]
         };
@@ -189,11 +185,15 @@ impl DropTableExecutor {
             .await
     }
 
-    /// Invalidates frontend caches
+    /// Invalidates caches for the table.
     pub async fn invalidate_table_cache(&self, ctx: &DdlContext) -> Result<()> {
         let cache_invalidator = &ctx.cache_invalidator;
         let ctx = Context {
-            subject: Some("Invalidate table cache by dropping table".to_string()),
+            subject: Some(format!(
+                "Invalidate table cache by dropping table {}, table_id: {}",
+                self.table.table_ref(),
+                self.table_id,
+            )),
         };
 
         cache_invalidator
@@ -216,10 +216,10 @@ impl DropTableExecutor {
         region_routes: &[RegionRoute],
         fast_path: bool,
     ) -> Result<()> {
+        // Drops leader regions on datanodes.
         let leaders = find_leaders(region_routes);
         let mut drop_region_tasks = Vec::with_capacity(leaders.len());
         let table_id = self.table_id;
-
         for datanode in leaders {
             let requester = ctx.node_manager.datanode(&datanode).await;
             let regions = find_leader_regions(region_routes, &datanode);
@@ -257,6 +257,58 @@ impl DropTableExecutor {
             .await
             .into_iter()
             .collect::<Result<Vec<_>>>()?;
+
+        // Drops follower regions on datanodes.
+        let followers = find_followers(region_routes);
+        let mut close_region_tasks = Vec::with_capacity(followers.len());
+        for datanode in followers {
+            let requester = ctx.node_manager.datanode(&datanode).await;
+            let regions = find_follower_regions(region_routes, &datanode);
+            let region_ids = regions
+                .iter()
+                .map(|region_number| RegionId::new(table_id, *region_number))
+                .collect::<Vec<_>>();
+
+            for region_id in region_ids {
+                debug!("Closing region {region_id} on Datanode {datanode:?}");
+                let request = RegionRequest {
+                    header: Some(RegionRequestHeader {
+                        tracing_context: TracingContext::from_current_span().to_w3c(),
+                        ..Default::default()
+                    }),
+                    body: Some(region_request::Body::Close(PbCloseRegionRequest {
+                        region_id: region_id.as_u64(),
+                    })),
+                };
+
+                let datanode = datanode.clone();
+                let requester = requester.clone();
+                close_region_tasks.push(async move {
+                    if let Err(err) = requester.handle(request).await {
+                        if err.status_code() != StatusCode::RegionNotFound {
+                            return Err(add_peer_context_if_needed(datanode)(err));
+                        }
+                    }
+                    Ok(())
+                });
+            }
+        }
+
+        // Failure to close follower regions is not critical.
+        // When a leader region is dropped, follower regions will be unable to renew their leases via metasrv.
+        // Eventually, these follower regions will be automatically closed by the region livekeeper.
+        if let Err(err) = join_all(close_region_tasks)
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+        {
+            error!(err; "Failed to close follower regions on datanodes, table_id: {}", table_id);
+        }
+
+        // Deletes the leader region from registry.
+        let region_ids = operating_leader_regions(region_routes);
+        ctx.leader_region_registry
+            .batch_delete(region_ids.into_iter().map(|(region_id, _)| region_id));
 
         Ok(())
     }
@@ -321,7 +373,6 @@ mod tests {
         let node_manager = Arc::new(MockDatanodeManager::new(()));
         let ctx = new_ddl_context(node_manager);
         let executor = DropTableExecutor::new(
-            0,
             TableName::new(DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, "my_table"),
             1024,
             true,
@@ -331,7 +382,6 @@ mod tests {
 
         // Drops a non-exists table
         let executor = DropTableExecutor::new(
-            0,
             TableName::new(DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, "my_table"),
             1024,
             false,
@@ -341,7 +391,6 @@ mod tests {
 
         // Drops a exists table
         let executor = DropTableExecutor::new(
-            0,
             TableName::new(DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, "my_table"),
             1024,
             false,

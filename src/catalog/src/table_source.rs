@@ -27,7 +27,7 @@ use session::context::QueryContextRef;
 use snafu::{ensure, OptionExt, ResultExt};
 use table::metadata::TableType;
 use table::table::adapter::DfTableProviderAdapter;
-mod dummy_catalog;
+pub mod dummy_catalog;
 use dummy_catalog::DummyCatalogList;
 use table::TableRef;
 
@@ -68,6 +68,11 @@ impl DfTableSourceProvider {
             plan_decoder,
             enable_ident_normalization,
         }
+    }
+
+    /// Returns the query context.
+    pub fn query_ctx(&self) -> &QueryContextRef {
+        &self.query_ctx
     }
 
     pub fn resolve_table_ref(&self, table_ref: TableReference) -> Result<ResolvedTableReference> {
@@ -207,6 +212,7 @@ mod tests {
     use session::context::QueryContext;
 
     use super::*;
+    use crate::kvbackend::KvBackendCatalogManagerBuilder;
     use crate::memory::MemoryCatalogManager;
 
     #[test]
@@ -323,12 +329,13 @@ mod tests {
             .build(),
         );
 
-        let catalog_manager = KvBackendCatalogManager::new(
+        let catalog_manager = KvBackendCatalogManagerBuilder::new(
             Arc::new(NoopInformationExtension),
             backend.clone(),
             layered_cache_registry,
-            None,
-        );
+        )
+        .build();
+
         let table_metadata_manager = TableMetadataManager::new(backend);
         let mut view_info = common_meta::key::test_utils::new_test_table_info(1024, vec![]);
         view_info.table_type = TableType::View;

@@ -20,6 +20,7 @@ use api::v1::CreateTableExpr;
 use catalog::{CatalogManagerRef, RegisterSystemTableRequest};
 use common_catalog::consts::{default_engine, DEFAULT_PRIVATE_SCHEMA_NAME};
 use common_telemetry::info;
+use datatypes::timestamp::TimestampNanosecond;
 use futures::FutureExt;
 use operator::insert::InserterRef;
 use operator::statement::StatementExecutorRef;
@@ -35,7 +36,7 @@ use crate::metrics::{
     METRIC_PIPELINE_RETRIEVE_HISTOGRAM,
 };
 use crate::table::{PipelineTable, PIPELINE_TABLE_NAME};
-use crate::{GreptimeTransformer, Pipeline};
+use crate::Pipeline;
 
 /// PipelineOperator is responsible for managing pipelines.
 /// It provides the ability to:
@@ -181,7 +182,7 @@ impl PipelineOperator {
         query_ctx: QueryContextRef,
         name: &str,
         version: PipelineVersion,
-    ) -> Result<Arc<Pipeline<GreptimeTransformer>>> {
+    ) -> Result<Arc<Pipeline>> {
         let schema = query_ctx.current_schema();
         self.create_pipeline_table_if_not_exists(query_ctx.clone())
             .await?;
@@ -190,6 +191,29 @@ impl PipelineOperator {
         self.get_pipeline_table_from_cache(query_ctx.current_catalog())
             .context(PipelineTableNotFoundSnafu)?
             .get_pipeline(&schema, name, version)
+            .inspect(|re| {
+                METRIC_PIPELINE_RETRIEVE_HISTOGRAM
+                    .with_label_values(&[&re.is_ok().to_string()])
+                    .observe(timer.elapsed().as_secs_f64())
+            })
+            .await
+    }
+
+    /// Get a original pipeline by name.
+    pub async fn get_pipeline_str(
+        &self,
+        name: &str,
+        version: PipelineVersion,
+        query_ctx: QueryContextRef,
+    ) -> Result<(String, TimestampNanosecond)> {
+        let schema = query_ctx.current_schema();
+        self.create_pipeline_table_if_not_exists(query_ctx.clone())
+            .await?;
+
+        let timer = Instant::now();
+        self.get_pipeline_table_from_cache(query_ctx.current_catalog())
+            .context(PipelineTableNotFoundSnafu)?
+            .get_pipeline_str(&schema, name, version)
             .inspect(|re| {
                 METRIC_PIPELINE_RETRIEVE_HISTOGRAM
                     .with_label_values(&[&re.is_ok().to_string()])
@@ -212,7 +236,7 @@ impl PipelineOperator {
         let timer = Instant::now();
         self.get_pipeline_table_from_cache(query_ctx.current_catalog())
             .context(PipelineTableNotFoundSnafu)?
-            .insert_and_compile(&query_ctx.current_schema(), name, content_type, pipeline)
+            .insert_and_compile(name, content_type, pipeline)
             .inspect(|re| {
                 METRIC_PIPELINE_CREATE_HISTOGRAM
                     .with_label_values(&[&re.is_ok().to_string()])
@@ -235,7 +259,7 @@ impl PipelineOperator {
         let timer = Instant::now();
         self.get_pipeline_table_from_cache(query_ctx.current_catalog())
             .context(PipelineTableNotFoundSnafu)?
-            .delete_pipeline(&query_ctx.current_schema(), name, version)
+            .delete_pipeline(name, version)
             .inspect(|re| {
                 METRIC_PIPELINE_DELETE_HISTOGRAM
                     .with_label_values(&[&re.is_ok().to_string()])
@@ -245,7 +269,7 @@ impl PipelineOperator {
     }
 
     /// Compile a pipeline.
-    pub fn build_pipeline(pipeline: &str) -> Result<Pipeline<GreptimeTransformer>> {
+    pub fn build_pipeline(pipeline: &str) -> Result<Pipeline> {
         PipelineTable::compile_pipeline(pipeline)
     }
 }

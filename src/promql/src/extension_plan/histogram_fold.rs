@@ -30,6 +30,7 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNodeCore};
 use datafusion::physical_expr::{EquivalenceProperties, LexRequirement, PhysicalSortRequirement};
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::expressions::{CastExpr as PhyCast, Column as PhyColumn};
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{
@@ -182,7 +183,8 @@ impl HistogramFold {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(output_schema.clone()),
             Partitioning::UnknownPartitioning(1),
-            exec_input.properties().execution_mode(),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
         );
         Arc::new(HistogramFoldExec {
             le_column_index,
@@ -301,7 +303,7 @@ impl ExecutionPlan for HistogramFoldExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::SinglePartition; self.children().len()]
+        self.input.required_input_distribution()
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
@@ -583,7 +585,8 @@ impl HistogramFoldStream {
                     .expect("field column should not be nullable");
                 counters.push(counter);
             }
-            let result = Self::evaluate_row(self.quantile, &bucket, &counters)?;
+            // ignore invalid data
+            let result = Self::evaluate_row(self.quantile, &bucket, &counters).unwrap_or(f64::NAN);
             self.output_buffer[self.field_column_index].push_value_ref(ValueRef::from(result));
             cursor += bucket_num;
             remaining_rows -= bucket_num;
@@ -672,7 +675,7 @@ impl HistogramFoldStream {
         if bucket.len() <= 1 {
             return Ok(f64::NAN);
         }
-        if *bucket.last().unwrap() != f64::INFINITY {
+        if bucket.last().unwrap().is_finite() {
             return Err(DataFusionError::Execution(
                 "last bucket should be +Inf".to_string(),
             ));
@@ -692,8 +695,8 @@ impl HistogramFoldStream {
         }
 
         // check input value
-        debug_assert!(bucket.windows(2).all(|w| w[0] <= w[1]));
-        debug_assert!(counter.windows(2).all(|w| w[0] <= w[1]));
+        debug_assert!(bucket.windows(2).all(|w| w[0] <= w[1]), "{bucket:?}");
+        debug_assert!(counter.windows(2).all(|w| w[0] <= w[1]), "{counter:?}");
 
         let total = *counter.last().unwrap();
         let expected_pos = total * quantile;
@@ -727,7 +730,6 @@ mod test {
     use datafusion::arrow::datatypes::{Field, Schema};
     use datafusion::common::ToDFSchema;
     use datafusion::physical_plan::memory::MemoryExec;
-    use datafusion::physical_plan::ExecutionMode;
     use datafusion::prelude::SessionContext;
     use datatypes::arrow_array::StringArray;
 
@@ -805,7 +807,8 @@ mod test {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(output_schema.clone()),
             Partitioning::UnknownPartitioning(1),
-            ExecutionMode::Bounded,
+            EmissionType::Incremental,
+            Boundedness::Bounded,
         );
         let fold_exec = Arc::new(HistogramFoldExec {
             le_column_index: 1,

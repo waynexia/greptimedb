@@ -14,7 +14,7 @@
 
 use std::any::Any;
 use std::collections::hash_map::Entry;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock, Weak};
 
 use async_stream::{stream, try_stream};
@@ -28,6 +28,7 @@ use common_meta::kv_backend::memory::MemoryKvBackend;
 use futures_util::stream::BoxStream;
 use session::context::QueryContext;
 use snafu::OptionExt;
+use table::metadata::TableId;
 use table::TableRef;
 
 use crate::error::{CatalogNotFoundSnafu, Result, SchemaNotFoundSnafu, TableExistsSnafu};
@@ -141,6 +142,33 @@ impl CatalogManager for MemoryCatalogManager {
                 .cloned()?
         };
         Ok(result)
+    }
+
+    async fn tables_by_ids(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table_ids: &[TableId],
+    ) -> Result<Vec<TableRef>> {
+        let catalogs = self.catalogs.read().unwrap();
+
+        let schemas = catalogs.get(catalog).context(CatalogNotFoundSnafu {
+            catalog_name: catalog,
+        })?;
+
+        let tables = schemas
+            .get(schema)
+            .context(SchemaNotFoundSnafu { catalog, schema })?;
+
+        let filter_ids: HashSet<_> = table_ids.iter().collect();
+        // It is very inefficient, but we do not need to optimize it since it will not be called in `MemoryCatalogManager`.
+        let tables = tables
+            .values()
+            .filter(|t| filter_ids.contains(&t.table_info().table_id()))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        Ok(tables)
     }
 
     fn tables<'a>(
@@ -324,10 +352,13 @@ impl MemoryCatalogManager {
     }
 
     fn create_catalog_entry(self: &Arc<Self>, catalog: String) -> SchemaEntries {
+        let backend = Arc::new(MemoryKvBackend::new());
         let information_schema_provider = InformationSchemaProvider::new(
             catalog,
             Arc::downgrade(self) as Weak<dyn CatalogManager>,
-            Arc::new(FlowMetadataManager::new(Arc::new(MemoryKvBackend::new()))),
+            Arc::new(FlowMetadataManager::new(backend.clone())),
+            None, // we don't need ProcessManager on regions server.
+            backend,
         );
         let information_schema = information_schema_provider.tables().clone();
 

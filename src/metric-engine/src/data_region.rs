@@ -103,7 +103,6 @@ impl DataRegion {
             .get_metadata(region_id)
             .await
             .context(MitoReadOperationSnafu)?;
-        let version = region_metadata.schema_version;
 
         // find the max column id
         let new_column_id_start = 1 + region_metadata
@@ -146,12 +145,19 @@ impl DataRegion {
                     IndexOptions::Inverted => {
                         c.column_schema.set_inverted_index(true);
                     }
-                    IndexOptions::Skipping { granularity } => {
+                    IndexOptions::Skipping {
+                        granularity,
+                        false_positive_rate,
+                    } => {
                         c.column_schema
-                            .set_skipping_options(&SkippingIndexOptions {
-                                granularity,
-                                index_type: SkippingIndexType::BloomFilter,
-                            })
+                            .set_skipping_options(
+                                &SkippingIndexOptions::new(
+                                    granularity,
+                                    false_positive_rate,
+                                    SkippingIndexType::BloomFilter,
+                                )
+                                .context(SetSkippingIndexOptionSnafu)?,
+                            )
                             .context(SetSkippingIndexOptionSnafu)?;
                     }
                 }
@@ -166,7 +172,6 @@ impl DataRegion {
         debug!("Adding (Column id assigned) columns {new_columns:?} to region {region_id:?}");
         // assemble alter request
         let alter_request = RegionRequest::Alter(RegionAlterRequest {
-            schema_version: version,
             kind: AlterKind::AddColumns {
                 columns: new_columns,
             },
@@ -208,7 +213,12 @@ impl DataRegion {
     ) -> Result<AffectedRows> {
         match request.kind {
             AlterKind::SetRegionOptions { options: _ }
-            | AlterKind::UnsetRegionOptions { keys: _ } => {
+            | AlterKind::UnsetRegionOptions { keys: _ }
+            | AlterKind::SetIndexes { options: _ }
+            | AlterKind::UnsetIndexes { options: _ }
+            | AlterKind::SyncColumns {
+                column_metadatas: _,
+            } => {
                 let region_id = utils::to_data_region_id(region_id);
                 self.mito
                     .handle_request(region_id, RegionRequest::Alter(request))

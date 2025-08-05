@@ -13,7 +13,8 @@
 // limitations under the License.
 
 //! prom supply the prometheus HTTP API Server compliance
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashMap};
 
 use axum::http::HeaderValue;
 use axum::response::{IntoResponse, Response};
@@ -117,7 +118,7 @@ impl PrometheusJsonResponse {
     /// Convert from `Result<Output>`
     pub async fn from_query_result(
         result: Result<Output>,
-        metric_name: String,
+        metric_name: Option<String>,
         result_type: ValueType,
     ) -> Self {
         let response: Result<Self> = try {
@@ -181,7 +182,7 @@ impl PrometheusJsonResponse {
     /// Convert [RecordBatches] to [PromData]
     fn record_batches_to_data(
         batches: RecordBatches,
-        metric_name: String,
+        metric_name: Option<String>,
         result_type: ValueType,
     ) -> Result<PrometheusResponse> {
         // infer semantic type of each column from schema.
@@ -229,7 +230,6 @@ impl PrometheusJsonResponse {
             reason: "no value column found".to_string(),
         })?;
 
-        let metric_name = (METRIC_NAME, metric_name.as_str());
         // Preserves the order of output tags.
         // Tag order matters, e.g., after sorc and sort_desc, the output order must be kept.
         let mut buffer = IndexMap::<Vec<(&str, &str)>, Vec<(f64, String)>>::new();
@@ -275,9 +275,10 @@ impl PrometheusJsonResponse {
                     }
 
                     // retrieve tags
-                    // TODO(ruihang): push table name `__metric__`
                     let mut tags = Vec::with_capacity(num_label_columns + 1);
-                    tags.push(metric_name);
+                    if let Some(metric_name) = &metric_name {
+                        tags.push((METRIC_NAME, metric_name.as_str()));
+                    }
                     for (tag_column, tag_name) in tag_columns.iter().zip(tag_names.iter()) {
                         // TODO(ruihang): add test for NULL tag
                         if let Some(tag_value) = tag_column.get_data(row_index) {
@@ -311,7 +312,7 @@ impl PrometheusJsonResponse {
             let metric = tags
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect::<HashMap<_, _>>();
+                .collect::<BTreeMap<_, _>>();
             match result {
                 PromQueryResult::Vector(ref mut v) => {
                     v.push(PromSeriesVector {
@@ -320,6 +321,11 @@ impl PrometheusJsonResponse {
                     });
                 }
                 PromQueryResult::Matrix(ref mut v) => {
+                    // sort values by timestamp
+                    if !values.is_sorted_by(|a, b| a.0 <= b.0) {
+                        values.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+                    }
+
                     v.push(PromSeriesMatrix { metric, values });
                 }
                 PromQueryResult::Scalar(ref mut v) => {
@@ -330,6 +336,12 @@ impl PrometheusJsonResponse {
                 }
             }
         });
+
+        // sort matrix by metric
+        // see: https://prometheus.io/docs/prometheus/3.5/querying/api/#range-vectors
+        if let PromQueryResult::Matrix(ref mut v) = result {
+            v.sort_by(|a, b| a.metric.cmp(&b.metric));
+        }
 
         let result_type_string = result_type.to_string();
         let data = PrometheusResponse::PromData(PromData {

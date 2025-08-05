@@ -13,7 +13,6 @@
 // limitations under the License.
 
 mod extract_new_columns;
-mod validate;
 
 use std::collections::{HashMap, HashSet};
 
@@ -24,7 +23,6 @@ use datatypes::data_type::ConcreteDataType;
 use datatypes::schema::{ColumnSchema, SkippingIndexOptions};
 use datatypes::value::Value;
 use mito2::engine::MITO_ENGINE_NAME;
-use object_store::util::join_dir;
 use snafu::{ensure, OptionExt, ResultExt};
 use store_api::metadata::ColumnMetadata;
 use store_api::metric_engine_consts::{
@@ -34,14 +32,11 @@ use store_api::metric_engine_consts::{
     METADATA_SCHEMA_TIMESTAMP_COLUMN_INDEX, METADATA_SCHEMA_TIMESTAMP_COLUMN_NAME,
     METADATA_SCHEMA_VALUE_COLUMN_INDEX, METADATA_SCHEMA_VALUE_COLUMN_NAME,
 };
-use store_api::mito_engine_options::{
-    APPEND_MODE_KEY, MEMTABLE_PARTITION_TREE_PRIMARY_KEY_ENCODING, TTL_KEY,
-};
+use store_api::mito_engine_options::{TTL_KEY, WAL_OPTIONS_KEY};
 use store_api::region_engine::RegionEngine;
-use store_api::region_request::{AffectedRows, RegionCreateRequest, RegionRequest};
+use store_api::region_request::{AffectedRows, PathType, RegionCreateRequest, RegionRequest};
 use store_api::storage::consts::ReservedColumnId;
 use store_api::storage::RegionId;
-use validate::validate_create_logical_regions;
 
 use crate::engine::create::extract_new_columns::extract_new_columns;
 use crate::engine::options::{set_data_region_options, PhysicalRegionOptions};
@@ -49,13 +44,17 @@ use crate::engine::MetricEngineInner;
 use crate::error::{
     ColumnTypeMismatchSnafu, ConflictRegionOptionSnafu, CreateMitoRegionSnafu,
     InternalColumnOccupiedSnafu, InvalidMetadataSnafu, MissingRegionOptionSnafu,
-    MultipleFieldColumnSnafu, NoFieldColumnSnafu, PhysicalRegionNotFoundSnafu, Result,
-    SerializeColumnMetadataSnafu, UnexpectedRequestSnafu,
+    MultipleFieldColumnSnafu, NoFieldColumnSnafu, ParseRegionIdSnafu, PhysicalRegionNotFoundSnafu,
+    Result, SerializeColumnMetadataSnafu, UnexpectedRequestSnafu,
 };
 use crate::metrics::PHYSICAL_REGION_COUNT;
-use crate::utils::{self, to_data_region_id, to_metadata_region_id};
+use crate::utils::{
+    self, append_manifest_info, encode_manifest_info_to_extensions, to_data_region_id,
+    to_metadata_region_id,
+};
 
 const DEFAULT_TABLE_ID_SKIPPING_INDEX_GRANULARITY: u32 = 1024;
+const DEFAULT_TABLE_ID_SKIPPING_INDEX_FALSE_POSITIVE_RATE: f64 = 0.01;
 
 impl MetricEngineInner {
     pub async fn create_regions(
@@ -80,15 +79,37 @@ impl MetricEngineInner {
                 }
             );
             let (region_id, request) = requests.pop().unwrap();
-            self.create_physical_region(region_id, request).await?;
+            self.create_physical_region(region_id, request, extension_return_value)
+                .await?;
 
             return Ok(0);
         } else if first_request
             .options
             .contains_key(LOGICAL_TABLE_METADATA_KEY)
         {
-            self.create_logical_regions(requests, extension_return_value)
-                .await?;
+            if requests.len() == 1 {
+                let request = &requests.first().unwrap().1;
+                let physical_region_id = parse_physical_region_id(request)?;
+                let mut manifest_infos = Vec::with_capacity(1);
+                self.create_logical_regions(physical_region_id, requests, extension_return_value)
+                    .await?;
+                append_manifest_info(&self.mito, physical_region_id, &mut manifest_infos);
+                encode_manifest_info_to_extensions(&manifest_infos, extension_return_value)?;
+            } else {
+                let grouped_requests =
+                    group_create_logical_region_requests_by_physical_region_id(requests)?;
+                let mut manifest_infos = Vec::with_capacity(grouped_requests.len());
+                for (physical_region_id, requests) in grouped_requests {
+                    self.create_logical_regions(
+                        physical_region_id,
+                        requests,
+                        extension_return_value,
+                    )
+                    .await?;
+                    append_manifest_info(&self.mito, physical_region_id, &mut manifest_infos);
+                }
+                encode_manifest_info_to_extensions(&manifest_infos, extension_return_value)?;
+            }
         } else {
             return MissingRegionOptionSnafu {}.fail();
         }
@@ -101,6 +122,7 @@ impl MetricEngineInner {
         &self,
         region_id: RegionId,
         request: RegionCreateRequest,
+        extension_return_value: &mut HashMap<String, Vec<u8>>,
     ) -> Result<()> {
         let physical_region_options = PhysicalRegionOptions::try_from(&request.options)?;
         let (data_region_id, metadata_region_id) = Self::transform_region_id(region_id);
@@ -124,7 +146,25 @@ impl MetricEngineInner {
             .iter()
             .map(|metadata| (metadata.column_schema.name.clone(), metadata.column_id))
             .collect::<HashMap<_, _>>();
-        self.mito
+        let time_index_unit = create_data_region_request
+            .column_metadatas
+            .iter()
+            .find_map(|metadata| {
+                if metadata.semantic_type == SemanticType::Timestamp {
+                    metadata
+                        .column_schema
+                        .data_type
+                        .as_timestamp()
+                        .map(|data_type| data_type.unit())
+                } else {
+                    None
+                }
+            })
+            .context(UnexpectedRequestSnafu {
+                reason: "No time index column found",
+            })?;
+        let response = self
+            .mito
             .handle_request(
                 data_region_id,
                 RegionRequest::Create(create_data_region_request),
@@ -138,6 +178,7 @@ impl MetricEngineInner {
                 region_id: data_region_id,
             },
         )?;
+        extension_return_value.extend(response.extensions);
 
         info!("Created physical metric region {region_id}, primary key encoding={primary_key_encoding}, physical_region_options={physical_region_options:?}");
         PHYSICAL_REGION_COUNT.inc();
@@ -148,6 +189,7 @@ impl MetricEngineInner {
             physical_columns,
             primary_key_encoding,
             physical_region_options,
+            time_index_unit,
         );
 
         Ok(())
@@ -156,21 +198,67 @@ impl MetricEngineInner {
     /// Create multiple logical regions on the same physical region.
     async fn create_logical_regions(
         &self,
+        physical_region_id: RegionId,
         requests: Vec<(RegionId, RegionCreateRequest)>,
         extension_return_value: &mut HashMap<String, Vec<u8>>,
     ) -> Result<()> {
-        let physical_region_id = validate_create_logical_regions(&requests)?;
         let data_region_id = utils::to_data_region_id(physical_region_id);
+
+        let unit = self
+            .state
+            .read()
+            .unwrap()
+            .physical_region_time_index_unit(physical_region_id)
+            .context(PhysicalRegionNotFoundSnafu {
+                region_id: data_region_id,
+            })?;
+        // Checks the time index unit of each request.
+        for (_, request) in &requests {
+            // Safety: verify_region_create_request() ensures that the request is valid.
+            let time_index_column = request
+                .column_metadatas
+                .iter()
+                .find(|col| col.semantic_type == SemanticType::Timestamp)
+                .unwrap();
+            let request_unit = time_index_column
+                .column_schema
+                .data_type
+                .as_timestamp()
+                .unwrap()
+                .unit();
+            ensure!(
+                request_unit == unit,
+                UnexpectedRequestSnafu {
+                    reason: format!(
+                        "Metric has differenttime unit ({:?}) than the physical region ({:?})",
+                        request_unit, unit
+                    ),
+                }
+            );
+        }
 
         // Filters out the requests that the logical region already exists
         let requests = {
             let state = self.state.read().unwrap();
-            let logical_region_exists = state.logical_region_exists_filter(data_region_id);
-            // TODO(weny): log the skipped logical regions
-            requests
-                .into_iter()
-                .filter(|(region_id, _)| !logical_region_exists(region_id))
-                .collect::<Vec<_>>()
+            let mut skipped = Vec::with_capacity(requests.len());
+            let mut kept_requests = Vec::with_capacity(requests.len());
+
+            for (region_id, request) in requests {
+                if state.is_logical_region_exist(region_id) {
+                    skipped.push(region_id);
+                } else {
+                    kept_requests.push((region_id, request));
+                }
+            }
+
+            // log skipped regions
+            if !skipped.is_empty() {
+                info!(
+                    "Skipped creating logical regions {skipped:?} because they already exist",
+                    skipped = skipped
+                );
+            }
+            kept_requests
         };
 
         // Finds new columns to add to physical region
@@ -243,9 +331,16 @@ impl MetricEngineInner {
             .add_logical_regions(physical_region_id, true, logical_region_columns)
             .await?;
 
-        let mut state = self.state.write().unwrap();
-        state.add_physical_columns(data_region_id, new_add_columns);
-        state.add_logical_regions(physical_region_id, logical_regions);
+        {
+            let mut state = self.state.write().unwrap();
+            state.add_physical_columns(data_region_id, new_add_columns);
+            state.add_logical_regions(physical_region_id, logical_regions.clone());
+        }
+        for logical_region_id in logical_regions {
+            self.metadata_region
+                .open_logical_region(logical_region_id)
+                .await;
+        }
 
         Ok(())
     }
@@ -379,10 +474,7 @@ impl MetricEngineInner {
             ),
         };
 
-        // concat region dir
-        let metadata_region_dir = join_dir(&request.region_dir, METADATA_REGION_SUBDIR);
-
-        let options = region_options_for_metadata_region(request.options.clone());
+        let options = region_options_for_metadata_region(&request.options);
         RegionCreateRequest {
             engine: MITO_ENGINE_NAME.to_string(),
             column_metadatas: vec![
@@ -392,7 +484,8 @@ impl MetricEngineInner {
             ],
             primary_key: vec![METADATA_SCHEMA_KEY_COLUMN_INDEX as _],
             options,
-            region_dir: metadata_region_dir,
+            table_dir: request.table_dir.clone(),
+            path_type: PathType::Metadata,
         }
     }
 
@@ -409,8 +502,8 @@ impl MetricEngineInner {
         let mut data_region_request = request.clone();
         let mut primary_key = vec![ReservedColumnId::table_id(), ReservedColumnId::tsid()];
 
-        // concat region dir
-        data_region_request.region_dir = join_dir(&request.region_dir, DATA_REGION_SUBDIR);
+        data_region_request.table_dir = request.table_dir.clone();
+        data_region_request.path_type = PathType::Data;
 
         // change nullability for tag columns
         data_region_request
@@ -451,10 +544,11 @@ impl MetricEngineInner {
                 ConcreteDataType::uint32_datatype(),
                 false,
             )
-            .with_skipping_options(SkippingIndexOptions {
-                granularity: DEFAULT_TABLE_ID_SKIPPING_INDEX_GRANULARITY,
-                index_type: datatypes::schema::SkippingIndexType::BloomFilter,
-            })
+            .with_skipping_options(SkippingIndexOptions::new_unchecked(
+                DEFAULT_TABLE_ID_SKIPPING_INDEX_GRANULARITY,
+                DEFAULT_TABLE_ID_SKIPPING_INDEX_FALSE_POSITIVE_RATE,
+                datatypes::schema::SkippingIndexType::BloomFilter,
+            ))
             .unwrap(),
         };
         let tsid_col = ColumnMetadata {
@@ -471,26 +565,64 @@ impl MetricEngineInner {
     }
 }
 
+/// Groups the create logical region requests by physical region id.
+fn group_create_logical_region_requests_by_physical_region_id(
+    requests: Vec<(RegionId, RegionCreateRequest)>,
+) -> Result<HashMap<RegionId, Vec<(RegionId, RegionCreateRequest)>>> {
+    let mut result = HashMap::with_capacity(requests.len());
+    for (region_id, request) in requests {
+        let physical_region_id = parse_physical_region_id(&request)?;
+        result
+            .entry(physical_region_id)
+            .or_insert_with(Vec::new)
+            .push((region_id, request));
+    }
+
+    Ok(result)
+}
+
+/// Parses the physical region id from the request.
+fn parse_physical_region_id(request: &RegionCreateRequest) -> Result<RegionId> {
+    let physical_region_id_raw = request
+        .options
+        .get(LOGICAL_TABLE_METADATA_KEY)
+        .ok_or(MissingRegionOptionSnafu {}.build())?;
+
+    let physical_region_id: RegionId = physical_region_id_raw
+        .parse::<u64>()
+        .with_context(|_| ParseRegionIdSnafu {
+            raw: physical_region_id_raw,
+        })?
+        .into();
+
+    Ok(physical_region_id)
+}
+
 /// Creates the region options for metadata region in metric engine.
 pub(crate) fn region_options_for_metadata_region(
-    mut original: HashMap<String, String>,
+    original: &HashMap<String, String>,
 ) -> HashMap<String, String> {
-    // TODO(ruihang, weny): add whitelist for metric engine options.
-    original.remove(APPEND_MODE_KEY);
-    // Don't allow to set primary key encoding for metadata region.
-    original.remove(MEMTABLE_PARTITION_TREE_PRIMARY_KEY_ENCODING);
-    original.insert(TTL_KEY.to_string(), FOREVER.to_string());
-    original
+    let mut metadata_region_options = HashMap::new();
+    metadata_region_options.insert(TTL_KEY.to_string(), FOREVER.to_string());
+
+    if let Some(wal_options) = original.get(WAL_OPTIONS_KEY) {
+        metadata_region_options.insert(WAL_OPTIONS_KEY.to_string(), wal_options.to_string());
+    }
+
+    metadata_region_options
 }
 
 #[cfg(test)]
 mod test {
+    use common_meta::ddl::test_util::assert_column_name_and_id;
+    use common_meta::ddl::utils::{parse_column_metadatas, parse_manifest_infos_from_extensions};
     use store_api::metric_engine_consts::{METRIC_ENGINE_NAME, PHYSICAL_TABLE_METADATA_KEY};
+    use store_api::region_request::BatchRegionDdlRequest;
 
     use super::*;
     use crate::config::EngineConfig;
     use crate::engine::MetricEngine;
-    use crate::test_util::TestEnv;
+    use crate::test_util::{create_logical_region_request, TestEnv};
 
     #[test]
     fn test_verify_region_create_request() {
@@ -516,7 +648,8 @@ mod test {
                     ),
                 },
             ],
-            region_dir: "test_dir".to_string(),
+            table_dir: "test_dir".to_string(),
+            path_type: PathType::Bare,
             engine: METRIC_ENGINE_NAME.to_string(),
             primary_key: vec![],
             options: HashMap::new(),
@@ -559,7 +692,8 @@ mod test {
                     ),
                 },
             ],
-            region_dir: "test_dir".to_string(),
+            table_dir: "test_dir".to_string(),
+            path_type: PathType::Bare,
             engine: METRIC_ENGINE_NAME.to_string(),
             primary_key: vec![],
             options: [(PHYSICAL_TABLE_METADATA_KEY.to_string(), String::new())]
@@ -592,7 +726,8 @@ mod test {
                     ),
                 },
             ],
-            region_dir: "test_dir".to_string(),
+            table_dir: "test_dir".to_string(),
+            path_type: PathType::Bare,
             engine: METRIC_ENGINE_NAME.to_string(),
             primary_key: vec![],
             options: HashMap::new(),
@@ -616,8 +751,12 @@ mod test {
     #[tokio::test]
     async fn test_create_request_for_physical_regions() {
         // original request
-        let mut ttl_options = HashMap::new();
-        ttl_options.insert("ttl".to_string(), "60m".to_string());
+        let options: HashMap<_, _> = [
+            ("ttl".to_string(), "60m".to_string()),
+            ("skip_wal".to_string(), "true".to_string()),
+        ]
+        .into_iter()
+        .collect();
         let request = RegionCreateRequest {
             engine: METRIC_ENGINE_NAME.to_string(),
             column_metadatas: vec![
@@ -641,21 +780,20 @@ mod test {
                 },
             ],
             primary_key: vec![0],
-            options: ttl_options,
-            region_dir: "/test_dir".to_string(),
+            options,
+            table_dir: "/test_dir".to_string(),
+            path_type: PathType::Bare,
         };
 
         // set up
         let env = TestEnv::new().await;
-        let engine = MetricEngine::new(env.mito(), EngineConfig::default());
+        let engine = MetricEngine::try_new(env.mito(), EngineConfig::default()).unwrap();
         let engine_inner = engine.inner;
 
         // check create data region request
         let data_region_request = engine_inner.create_request_for_data_region(&request);
-        assert_eq!(
-            data_region_request.region_dir,
-            "/test_dir/data/".to_string()
-        );
+        assert_eq!(data_region_request.table_dir, "/test_dir".to_string());
+        assert_eq!(data_region_request.path_type, PathType::Data);
         assert_eq!(data_region_request.column_metadatas.len(), 4);
         assert_eq!(
             data_region_request.primary_key,
@@ -665,13 +803,58 @@ mod test {
 
         // check create metadata region request
         let metadata_region_request = engine_inner.create_request_for_metadata_region(&request);
-        assert_eq!(
-            metadata_region_request.region_dir,
-            "/test_dir/metadata/".to_string()
-        );
+        assert_eq!(metadata_region_request.table_dir, "/test_dir".to_string());
+        assert_eq!(metadata_region_request.path_type, PathType::Metadata);
         assert_eq!(
             metadata_region_request.options.get("ttl").unwrap(),
             "forever"
+        );
+        assert!(!metadata_region_request.options.contains_key("skip_wal"));
+    }
+
+    #[tokio::test]
+    async fn test_create_logical_regions() {
+        let env = TestEnv::new().await;
+        let engine = env.metric();
+        let physical_region_id1 = RegionId::new(1024, 0);
+        let physical_region_id2 = RegionId::new(1024, 1);
+        let logical_region_id1 = RegionId::new(1025, 0);
+        let logical_region_id2 = RegionId::new(1025, 1);
+        env.create_physical_region(physical_region_id1, "/test_dir1")
+            .await;
+        env.create_physical_region(physical_region_id2, "/test_dir2")
+            .await;
+
+        let region_create_request1 =
+            create_logical_region_request(&["job"], physical_region_id1, "logical1");
+        let region_create_request2 =
+            create_logical_region_request(&["job"], physical_region_id2, "logical2");
+
+        let response = engine
+            .handle_batch_ddl_requests(BatchRegionDdlRequest::Create(vec![
+                (logical_region_id1, region_create_request1),
+                (logical_region_id2, region_create_request2),
+            ]))
+            .await
+            .unwrap();
+
+        let manifest_infos = parse_manifest_infos_from_extensions(&response.extensions).unwrap();
+        assert_eq!(manifest_infos.len(), 2);
+        let region_ids = manifest_infos.into_iter().map(|i| i.0).collect::<Vec<_>>();
+        assert!(region_ids.contains(&physical_region_id1));
+        assert!(region_ids.contains(&physical_region_id2));
+
+        let column_metadatas =
+            parse_column_metadatas(&response.extensions, ALTER_PHYSICAL_EXTENSION_KEY).unwrap();
+        assert_column_name_and_id(
+            &column_metadatas,
+            &[
+                ("greptime_timestamp", 0),
+                ("greptime_value", 1),
+                ("__table_id", ReservedColumnId::table_id()),
+                ("__tsid", ReservedColumnId::tsid()),
+                ("job", 2),
+            ],
         );
     }
 }

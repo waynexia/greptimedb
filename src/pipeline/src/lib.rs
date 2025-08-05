@@ -12,23 +12,46 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![feature(string_from_utf8_lossy_owned)]
+
 mod dispatcher;
+pub mod error;
 mod etl;
 mod manager;
 mod metrics;
+mod tablesuffix;
 
-pub use etl::error::Result;
+pub use etl::ctx_req::{ContextOpt, ContextReq};
 pub use etl::processor::Processor;
 pub use etl::transform::transformer::greptime::{GreptimePipelineParams, SchemaInfo};
 pub use etl::transform::transformer::identity_pipeline;
-pub use etl::transform::{GreptimeTransformer, Transformer};
-pub use etl::value::{Array, Map, Value};
+pub use etl::transform::GreptimeTransformer;
 pub use etl::{
-    error as etl_error, json_array_to_intermediate_state, json_to_intermediate_state, parse,
-    Content, DispatchedTo, Pipeline, PipelineDefinition, PipelineExecOutput, PipelineMap,
-    PipelineWay, SelectInfo, GREPTIME_INTERNAL_IDENTITY_PIPELINE_NAME,
+    parse, Content, DispatchedTo, Pipeline, PipelineExecOutput, TransformedOutput, TransformerMode,
 };
 pub use manager::{
-    error, pipeline_operator, table, util, PipelineInfo, PipelineRef, PipelineTableRef,
-    PipelineVersion,
+    pipeline_operator, table, util, IdentityTimeIndex, PipelineContext, PipelineDefinition,
+    PipelineInfo, PipelineRef, PipelineTableRef, PipelineVersion, PipelineWay, SelectInfo,
+    GREPTIME_INTERNAL_IDENTITY_PIPELINE_NAME, GREPTIME_INTERNAL_TRACE_PIPELINE_V1_NAME,
 };
+
+#[macro_export]
+macro_rules! unwrap_or_continue_if_err {
+    ($result:expr, $condition:expr) => {{
+        match $result {
+            Ok(value) => value,
+            Err(e) => {
+                if $condition {
+                    continue;
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    }};
+}
+
+pub fn truthy<V: AsRef<str>>(v: V) -> bool {
+    let v = v.as_ref().to_lowercase();
+    v == "true" || v == "1" || v == "yes" || v == "on" || v == "t"
+}

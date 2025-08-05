@@ -131,6 +131,7 @@ impl HeartbeatHandler for CollectDatanodeClusterInfoHandler {
                 wcus: stat.wcus,
                 leader_regions,
                 follower_regions,
+                workloads: stat.datanode_workloads.clone(),
             }),
             version: info.version,
             git_commit: info.git_commit,
@@ -153,11 +154,11 @@ fn extract_base_info(request: &HeartbeatRequest) -> Option<(NodeInfoKey, Peer, P
         return None;
     };
 
-    Some((key, Peer::from(peer.clone()), info.clone()))
+    Some((key, peer.clone(), info.clone()))
 }
 
 async fn put_into_memory_store(ctx: &mut Context, key: NodeInfoKey, value: NodeInfo) -> Result<()> {
-    let key = key.into();
+    let key = (&key).into();
     let value = value.try_into().context(InvalidClusterInfoFormatSnafu)?;
     let put_req = PutRequest {
         key,

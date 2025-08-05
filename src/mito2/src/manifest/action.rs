@@ -19,9 +19,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt};
-use store_api::manifest::ManifestVersion;
 use store_api::metadata::RegionMetadataRef;
 use store_api::storage::{RegionId, SequenceNumber};
+use store_api::ManifestVersion;
 use strum::Display;
 
 use crate::error::{RegionMetadataNotFoundSnafu, Result, SerdeJsonSnafu, Utf8Snafu};
@@ -66,10 +66,21 @@ pub struct RegionRemove {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct RegionTruncate {
     pub region_id: RegionId,
-    /// Last WAL entry id of truncated data.
-    pub truncated_entry_id: EntryId,
-    // Last sequence number of truncated data.
-    pub truncated_sequence: SequenceNumber,
+    pub kind: TruncateKind,
+}
+
+/// The kind of truncate operation.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum TruncateKind {
+    /// Truncate all data in the region, marked by all data before the given entry id&sequence.
+    All {
+        /// Last WAL entry id of truncated data.
+        truncated_entry_id: EntryId,
+        // Last sequence number of truncated data.
+        truncated_sequence: SequenceNumber,
+    },
+    /// Only remove certain files in the region.
+    Partial { files_to_remove: Vec<FileMeta> },
 }
 
 /// The region manifest data.
@@ -147,10 +158,22 @@ impl RegionManifestBuilder {
 
     pub fn apply_truncate(&mut self, manifest_version: ManifestVersion, truncate: RegionTruncate) {
         self.manifest_version = manifest_version;
-        self.flushed_entry_id = truncate.truncated_entry_id;
-        self.flushed_sequence = truncate.truncated_sequence;
-        self.truncated_entry_id = Some(truncate.truncated_entry_id);
-        self.files.clear();
+        match truncate.kind {
+            TruncateKind::All {
+                truncated_entry_id,
+                truncated_sequence,
+            } => {
+                self.flushed_entry_id = truncated_entry_id;
+                self.flushed_sequence = truncated_sequence;
+                self.truncated_entry_id = Some(truncated_entry_id);
+                self.files.clear();
+            }
+            TruncateKind::Partial { files_to_remove } => {
+                for file in files_to_remove {
+                    self.files.remove(&file.file_id);
+                }
+            }
+        }
     }
 
     /// Check if the builder keeps a [RegionMetadata](store_api::metadata::RegionMetadata).
@@ -238,16 +261,11 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn test_encode_decode_action_list() {
-        // TODO(ruihang): port this test case
-    }
-
     // These tests are used to ensure backward compatibility of manifest files.
     // DO NOT modify the serialized string when they fail, check if your
     // modification to manifest-related structs is compatible with older manifests.
     #[test]
-    fn test_region_manifest_compatibility() {
+    fn test_region_action_compatibility() {
         let region_edit = r#"{
             "flushed_entry_id":null,
             "compaction_time_window":null,
@@ -297,5 +315,108 @@ mod tests {
     #[test]
     fn test_encode_decode_region_checkpoint() {
         // TODO(ruihang): port this test case
+    }
+
+    #[test]
+    fn test_region_manifest_compatibility() {
+        // Test deserializing RegionManifest from old schema where FileId is a UUID string
+        let region_manifest_json = r#"{
+            "metadata": {
+                "column_metadatas": [
+                    {
+                        "column_schema": {
+                            "name": "a",
+                            "data_type": {"Int64": {}},
+                            "is_nullable": false,
+                            "is_time_index": false,
+                            "default_constraint": null,
+                            "metadata": {}
+                        },
+                        "semantic_type": "Tag",
+                        "column_id": 1
+                    },
+                    {
+                        "column_schema": {
+                            "name": "b",
+                            "data_type": {"Float64": {}},
+                            "is_nullable": false,
+                            "is_time_index": false,
+                            "default_constraint": null,
+                            "metadata": {}
+                        },
+                        "semantic_type": "Field",
+                        "column_id": 2
+                    },
+                    {
+                        "column_schema": {
+                            "name": "c",
+                            "data_type": {"Timestamp": {"Millisecond": null}},
+                            "is_nullable": false,
+                            "is_time_index": false,
+                            "default_constraint": null,
+                            "metadata": {}
+                        },
+                        "semantic_type": "Timestamp",
+                        "column_id": 3
+                    }
+                ],
+                "primary_key": [1],
+                "region_id": 4402341478400,
+                "schema_version": 0
+            },
+            "files": {
+                "4b220a70-2b03-4641-9687-b65d94641208": {
+                    "region_id": 4402341478400,
+                    "file_id": "4b220a70-2b03-4641-9687-b65d94641208",
+                    "time_range": [
+                        {"value": 1451609210000, "unit": "Millisecond"},
+                        {"value": 1451609520000, "unit": "Millisecond"}
+                    ],
+                    "level": 1,
+                    "file_size": 100
+                },
+                "34b6ebb9-b8a5-4a4b-b744-56f67defad02": {
+                    "region_id": 4402341478400,
+                    "file_id": "34b6ebb9-b8a5-4a4b-b744-56f67defad02",
+                    "time_range": [
+                        {"value": 1451609210000, "unit": "Millisecond"},
+                        {"value": 1451609520000, "unit": "Millisecond"}
+                    ],
+                    "level": 0,
+                    "file_size": 100
+                }
+            },
+            "flushed_entry_id": 10,
+            "flushed_sequence": 20,
+            "manifest_version": 1,
+            "truncated_entry_id": null,
+            "compaction_time_window": null
+        }"#;
+
+        let manifest = serde_json::from_str::<RegionManifest>(region_manifest_json).unwrap();
+
+        // Verify that the files were correctly deserialized
+        assert_eq!(manifest.files.len(), 2);
+        assert_eq!(manifest.flushed_entry_id, 10);
+        assert_eq!(manifest.flushed_sequence, 20);
+        assert_eq!(manifest.manifest_version, 1);
+
+        // Verify that FileIds were correctly parsed from UUID strings
+        let mut file_ids: Vec<String> = manifest.files.keys().map(|id| id.to_string()).collect();
+        file_ids.sort_unstable();
+        assert_eq!(
+            file_ids,
+            vec![
+                "34b6ebb9-b8a5-4a4b-b744-56f67defad02",
+                "4b220a70-2b03-4641-9687-b65d94641208",
+            ]
+        );
+
+        // Roundtrip test with current FileId format
+        let serialized_manifest = serde_json::to_string(&manifest).unwrap();
+        let deserialized_manifest: RegionManifest =
+            serde_json::from_str(&serialized_manifest).unwrap();
+        assert_eq!(manifest, deserialized_manifest);
+        assert_ne!(serialized_manifest, region_manifest_json);
     }
 }

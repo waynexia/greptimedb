@@ -19,13 +19,14 @@ use common_time::interval::IntervalUnit;
 use crate::data_type::DataType;
 use crate::types::{DurationType, TimeType, TimestampType};
 use crate::vectors::constant::ConstantVector;
+use crate::vectors::struct_vector::StructVector;
 use crate::vectors::{
-    BinaryVector, BooleanVector, DateTimeVector, DateVector, Decimal128Vector,
-    DurationMicrosecondVector, DurationMillisecondVector, DurationNanosecondVector,
-    DurationSecondVector, IntervalDayTimeVector, IntervalMonthDayNanoVector,
-    IntervalYearMonthVector, ListVector, PrimitiveVector, StringVector, TimeMicrosecondVector,
-    TimeMillisecondVector, TimeNanosecondVector, TimeSecondVector, TimestampMicrosecondVector,
-    TimestampMillisecondVector, TimestampNanosecondVector, TimestampSecondVector, Vector,
+    BinaryVector, BooleanVector, DateVector, Decimal128Vector, DurationMicrosecondVector,
+    DurationMillisecondVector, DurationNanosecondVector, DurationSecondVector,
+    IntervalDayTimeVector, IntervalMonthDayNanoVector, IntervalYearMonthVector, ListVector,
+    PrimitiveVector, StringVector, TimeMicrosecondVector, TimeMillisecondVector,
+    TimeNanosecondVector, TimeSecondVector, TimestampMicrosecondVector, TimestampMillisecondVector,
+    TimestampNanosecondVector, TimestampSecondVector, Vector,
 };
 use crate::with_match_primitive_type_id;
 
@@ -83,7 +84,6 @@ fn equal(lhs: &dyn Vector, rhs: &dyn Vector) -> bool {
         Binary(_) | Json(_) | Vector(_) => is_vector_eq!(BinaryVector, lhs, rhs),
         String(_) => is_vector_eq!(StringVector, lhs, rhs),
         Date(_) => is_vector_eq!(DateVector, lhs, rhs),
-        DateTime(_) => is_vector_eq!(DateTimeVector, lhs, rhs),
         Timestamp(t) => match t {
             TimestampType::Second(_) => {
                 is_vector_eq!(TimestampSecondVector, lhs, rhs)
@@ -110,6 +110,7 @@ fn equal(lhs: &dyn Vector, rhs: &dyn Vector) -> bool {
             }
         },
         List(_) => is_vector_eq!(ListVector, lhs, rhs),
+        Struct(_) => is_vector_eq!(StructVector, lhs, rhs),
         UInt8(_) | UInt16(_) | UInt32(_) | UInt64(_) | Int8(_) | Int16(_) | Int32(_) | Int64(_)
         | Float32(_) | Float64(_) | Dictionary(_) => {
             with_match_primitive_type_id!(lhs_type.logical_type_id(), |$T| {
@@ -195,7 +196,6 @@ mod tests {
         )));
         assert_vector_ref_eq(Arc::new(BooleanVector::from(vec![true, false])));
         assert_vector_ref_eq(Arc::new(DateVector::from(vec![Some(100), Some(120)])));
-        assert_vector_ref_eq(Arc::new(DateTimeVector::from(vec![Some(100), Some(120)])));
         assert_vector_ref_eq(Arc::new(TimestampSecondVector::from_values([100, 120])));
         assert_vector_ref_eq(Arc::new(TimestampMillisecondVector::from_values([
             100, 120,

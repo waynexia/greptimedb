@@ -24,6 +24,8 @@ use std::sync::Arc;
 
 use api::v1::WalEntry;
 use common_error::ext::BoxedError;
+use common_telemetry::debug;
+use entry_reader::NoopEntryReader;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use prost::Message;
@@ -33,7 +35,7 @@ use store_api::logstore::provider::Provider;
 use store_api::logstore::{AppendBatchResponse, LogStore, WalIndex};
 use store_api::storage::RegionId;
 
-use crate::error::{BuildEntrySnafu, DeleteWalSnafu, EncodeWalSnafu, Result, WriteWalSnafu};
+use crate::error::{BuildEntrySnafu, DeleteWalSnafu, Result, WriteWalSnafu};
 use crate::wal::entry_reader::{LogStoreEntryReader, WalEntryReader};
 use crate::wal::raw_entry_reader::{LogStoreRawEntryReader, RegionRawEntryReader};
 
@@ -76,7 +78,6 @@ impl<S: LogStore> Wal<S> {
         WalWriter {
             store: self.store.clone(),
             entries: Vec::new(),
-            entry_encode_buf: Vec::new(),
             providers: HashMap::new(),
         }
     }
@@ -87,6 +88,10 @@ impl<S: LogStore> Wal<S> {
     ) -> impl FnOnce(RegionId, EntryId, &Provider) -> BoxFuture<Result<()>> {
         let store = self.store.clone();
         move |region_id, last_entry_id, provider| -> BoxFuture<'_, Result<()>> {
+            if let Provider::Noop = provider {
+                debug!("Skip obsolete for region: {}", region_id);
+                return Box::pin(async move { Ok(()) });
+            }
             Box::pin(async move {
                 store
                     .obsolete(provider, region_id, last_entry_id)
@@ -120,26 +125,29 @@ impl<S: LogStore> Wal<S> {
                     reader, region_id,
                 )))
             }
+            Provider::Noop => Box::new(NoopEntryReader),
         }
     }
 
     /// Scan entries of specific region starting from `start_id` (inclusive).
+    /// Currently only used in tests.
     pub fn scan<'a>(
         &'a self,
         region_id: RegionId,
         start_id: EntryId,
-        namespace: &'a Provider,
+        provider: &'a Provider,
     ) -> Result<WalEntryStream<'a>> {
-        match namespace {
+        match provider {
             Provider::RaftEngine(_) => {
                 LogStoreEntryReader::new(LogStoreRawEntryReader::new(self.store.clone()))
-                    .read(namespace, start_id)
+                    .read(provider, start_id)
             }
             Provider::Kafka(_) => LogStoreEntryReader::new(RegionRawEntryReader::new(
                 LogStoreRawEntryReader::new(self.store.clone()),
                 region_id,
             ))
-            .read(namespace, start_id),
+            .read(provider, start_id),
+            Provider::Noop => Ok(Box::pin(futures::stream::empty())),
         }
     }
 
@@ -150,6 +158,9 @@ impl<S: LogStore> Wal<S> {
         last_id: EntryId,
         provider: &Provider,
     ) -> Result<()> {
+        if let Provider::Noop = provider {
+            return Ok(());
+        }
         self.store
             .obsolete(provider, region_id, last_id)
             .await
@@ -164,8 +175,6 @@ pub struct WalWriter<S: LogStore> {
     store: Arc<S>,
     /// Entries to write.
     entries: Vec<Entry>,
-    /// Buffer to encode WAL entry.
-    entry_encode_buf: Vec<u8>,
     /// Providers of regions being written into.
     providers: HashMap<RegionId, Provider>,
 }
@@ -185,14 +194,10 @@ impl<S: LogStore> WalWriter<S> {
             .entry(region_id)
             .or_insert_with(|| provider.clone());
 
-        // Encode wal entry to log store entry.
-        self.entry_encode_buf.clear();
-        wal_entry
-            .encode(&mut self.entry_encode_buf)
-            .context(EncodeWalSnafu { region_id })?;
+        let data = wal_entry.encode_to_vec();
         let entry = self
             .store
-            .entry(&mut self.entry_encode_buf, entry_id, region_id, provider)
+            .entry(data, entry_id, region_id, provider)
             .map_err(BoxedError::new)
             .context(BuildEntrySnafu { region_id })?;
 
@@ -217,9 +222,16 @@ impl<S: LogStore> WalWriter<S> {
 #[cfg(test)]
 mod tests {
     use api::v1::{
-        value, ColumnDataType, ColumnSchema, Mutation, OpType, Row, Rows, SemanticType, Value,
+        bulk_wal_entry, value, ArrowIpc, BulkWalEntry, ColumnDataType, ColumnSchema, Mutation,
+        OpType, Row, Rows, SemanticType, Value,
     };
+    use common_recordbatch::DfRecordBatch;
+    use common_test_util::flight::encode_to_flight_data;
     use common_test_util::temp_dir::{create_temp_dir, TempDir};
+    use datatypes::arrow;
+    use datatypes::arrow::array::{ArrayRef, TimestampMillisecondArray};
+    use datatypes::arrow::datatypes::Field;
+    use datatypes::arrow_array::StringArray;
     use futures::TryStreamExt;
     use log_store::raft_engine::log_store::RaftEngineLogStore;
     use log_store::test_util::log_store_util;
@@ -301,6 +313,7 @@ mod tests {
                 new_mutation(OpType::Put, 1, &[("k1", 1), ("k2", 2)]),
                 new_mutation(OpType::Put, 2, &[("k3", 3), ("k4", 4)]),
             ],
+            bulk_entries: vec![],
         };
         let mut writer = wal.writer();
         // Region 1 entry 1.
@@ -338,6 +351,46 @@ mod tests {
         writer.write_to_wal().await.unwrap();
     }
 
+    fn build_record_batch(rows: &[(&str, i64)]) -> DfRecordBatch {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            Field::new("tag", arrow::datatypes::DataType::Utf8, false),
+            Field::new(
+                "ts",
+                arrow::datatypes::DataType::Timestamp(
+                    arrow::datatypes::TimeUnit::Millisecond,
+                    None,
+                ),
+                false,
+            ),
+        ]));
+
+        let tag = Arc::new(StringArray::from_iter_values(
+            rows.iter().map(|r| r.0.to_string()),
+        )) as ArrayRef;
+        let ts = Arc::new(TimestampMillisecondArray::from_iter_values(
+            rows.iter().map(|r| r.1),
+        )) as ArrayRef;
+        DfRecordBatch::try_new(schema, vec![tag, ts]).unwrap()
+    }
+
+    fn build_bulk_wal_entry(sequence_number: SequenceNumber, rows: &[(&str, i64)]) -> BulkWalEntry {
+        let rb = build_record_batch(rows);
+        let (schema, rb) = encode_to_flight_data(rb);
+        let max_ts = rows.iter().map(|r| r.1).max().unwrap();
+        let min_ts = rows.iter().map(|r| r.1).min().unwrap();
+        BulkWalEntry {
+            sequence: sequence_number,
+            max_ts,
+            min_ts,
+            timestamp_index: 1,
+            body: Some(bulk_wal_entry::Body::ArrowIpc(ArrowIpc {
+                schema: schema.data_header,
+                data_header: rb.data_header,
+                payload: rb.data_body,
+            })),
+        }
+    }
+
     fn sample_entries() -> Vec<WalEntry> {
         vec![
             WalEntry {
@@ -345,18 +398,22 @@ mod tests {
                     new_mutation(OpType::Put, 1, &[("k1", 1), ("k2", 2)]),
                     new_mutation(OpType::Put, 2, &[("k3", 3), ("k4", 4)]),
                 ],
+                bulk_entries: vec![],
             },
             WalEntry {
                 mutations: vec![new_mutation(OpType::Put, 3, &[("k1", 1), ("k2", 2)])],
+                bulk_entries: vec![],
             },
             WalEntry {
                 mutations: vec![
                     new_mutation(OpType::Put, 4, &[("k1", 1), ("k2", 2)]),
                     new_mutation(OpType::Put, 5, &[("k3", 3), ("k4", 4)]),
                 ],
+                bulk_entries: vec![],
             },
             WalEntry {
                 mutations: vec![new_mutation(OpType::Put, 6, &[("k1", 1), ("k2", 2)])],
+                bulk_entries: vec![build_bulk_wal_entry(7, &[("k1", 8), ("k2", 9)])],
             },
         ]
     }

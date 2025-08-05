@@ -8,7 +8,7 @@ CARGO_BUILD_OPTS := --locked
 IMAGE_REGISTRY ?= docker.io
 IMAGE_NAMESPACE ?= greptime
 IMAGE_TAG ?= latest
-DEV_BUILDER_IMAGE_TAG ?= 2024-12-25-9d0fa5d5-20250124085746
+DEV_BUILDER_IMAGE_TAG ?= 2025-05-19-b2377d4b-20250520045554
 BUILDX_MULTI_PLATFORM_BUILD ?= false
 BUILDX_BUILDER_NAME ?= gtbuilder
 BASE_IMAGE ?= ubuntu
@@ -30,6 +30,10 @@ endif
 
 ifneq ($(strip $(BUILD_JOBS)),)
 	NEXTEST_OPTS += --build-jobs=${BUILD_JOBS}
+endif
+
+ifneq ($(strip $(BUILD_JOBS)),)
+	SQLNESS_OPTS += --jobs ${BUILD_JOBS}
 endif
 
 ifneq ($(strip $(CARGO_PROFILE)),)
@@ -60,6 +64,8 @@ ifeq ($(BUILDX_MULTI_PLATFORM_BUILD), all)
 	BUILDX_MULTI_PLATFORM_BUILD_OPTS := --platform linux/amd64,linux/arm64 --push
 else ifeq ($(BUILDX_MULTI_PLATFORM_BUILD), amd64)
 	BUILDX_MULTI_PLATFORM_BUILD_OPTS := --platform linux/amd64 --push
+else ifeq ($(BUILDX_MULTI_PLATFORM_BUILD), arm64)
+	BUILDX_MULTI_PLATFORM_BUILD_OPTS := --platform linux/arm64 --push
 else
 	BUILDX_MULTI_PLATFORM_BUILD_OPTS := -o type=docker
 endif
@@ -191,6 +197,7 @@ fix-clippy: ## Fix clippy violations.
 fmt-check: ## Check code format.
 	cargo fmt --all -- --check
 	python3 scripts/check-snafu.py
+	python3 scripts/check-super-imports.py
 
 .PHONY: start-etcd
 start-etcd: ## Start single node etcd for testing purpose.
@@ -214,6 +221,16 @@ start-cluster: ## Start the greptimedb cluster with etcd by using docker compose
 .PHONY: stop-cluster
 stop-cluster: ## Stop the greptimedb cluster that created by docker compose.
 	docker compose -f ./docker/docker-compose/cluster-with-etcd.yaml stop
+
+##@ Grafana
+
+.PHONY: check-dashboards
+check-dashboards: ## Check the Grafana dashboards.
+	@./grafana/scripts/check.sh
+
+.PHONY: dashboards
+dashboards: ## Generate the Grafana dashboards for standalone mode and intermediate dashboards.
+	@./grafana/scripts/gen-dashboards.sh
 
 ##@ Docs
 config-docs: ## Generate configuration documentation from toml files.

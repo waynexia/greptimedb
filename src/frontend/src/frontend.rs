@@ -12,23 +12,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
+
 use common_base::readable_size::ReadableSize;
 use common_config::config::Configurable;
 use common_options::datanode::DatanodeClientOptions;
-use common_telemetry::logging::{LoggingOptions, TracingOptions};
+use common_options::memory::MemoryOptions;
+use common_telemetry::logging::{LoggingOptions, SlowQueryOptions, TracingOptions};
 use meta_client::MetaClientOptions;
+use query::options::QueryOptions;
 use serde::{Deserialize, Serialize};
-use servers::export_metrics::ExportMetricsOption;
+use servers::export_metrics::{ExportMetricsOption, ExportMetricsTask};
 use servers::grpc::GrpcOptions;
 use servers::heartbeat_options::HeartbeatOptions;
 use servers::http::HttpOptions;
+use servers::server::ServerHandlers;
+use snafu::ResultExt;
 
+use crate::error;
+use crate::error::Result;
+use crate::heartbeat::HeartbeatTask;
+use crate::instance::prom_store::ExportMetricHandler;
+use crate::instance::Instance;
 use crate::service_config::{
     InfluxdbOptions, JaegerOptions, MysqlOptions, OpentsdbOptions, OtlpOptions, PostgresOptions,
     PromStoreOptions,
 };
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct FrontendOptions {
     pub node_id: Option<String>,
@@ -49,7 +60,10 @@ pub struct FrontendOptions {
     pub user_provider: Option<String>,
     pub export_metrics: ExportMetricsOption,
     pub tracing: TracingOptions,
+    pub query: QueryOptions,
     pub max_in_flight_write_bytes: Option<ReadableSize>,
+    pub slow_query: Option<SlowQueryOptions>,
+    pub memory: MemoryOptions,
 }
 
 impl Default for FrontendOptions {
@@ -73,7 +87,10 @@ impl Default for FrontendOptions {
             user_provider: None,
             export_metrics: ExportMetricsOption::default(),
             tracing: TracingOptions::default(),
+            query: QueryOptions::default(),
             max_in_flight_write_bytes: None,
+            slow_query: Some(SlowQueryOptions::default()),
+            memory: MemoryOptions::default(),
         }
     }
 }
@@ -81,6 +98,50 @@ impl Default for FrontendOptions {
 impl Configurable for FrontendOptions {
     fn env_list_keys() -> Option<&'static [&'static str]> {
         Some(&["meta_client.metasrv_addrs"])
+    }
+}
+
+/// The [`Frontend`] struct is the main entry point for the frontend service
+/// which contains server handlers, frontend instance and some background tasks.
+pub struct Frontend {
+    pub instance: Arc<Instance>,
+    pub servers: ServerHandlers,
+    pub heartbeat_task: Option<HeartbeatTask>,
+    pub export_metrics_task: Option<ExportMetricsTask>,
+}
+
+impl Frontend {
+    pub async fn start(&mut self) -> Result<()> {
+        if let Some(t) = &self.heartbeat_task {
+            t.start().await?;
+        }
+
+        if let Some(t) = self.export_metrics_task.as_ref() {
+            if t.send_by_handler {
+                let inserter = self.instance.inserter().clone();
+                let statement_executor = self.instance.statement_executor().clone();
+                let handler = ExportMetricHandler::new_handler(inserter, statement_executor);
+                t.start(Some(handler)).context(error::StartServerSnafu)?
+            } else {
+                t.start(None).context(error::StartServerSnafu)?;
+            }
+        }
+
+        self.servers
+            .start_all()
+            .await
+            .context(error::StartServerSnafu)
+    }
+
+    pub async fn shutdown(&mut self) -> Result<()> {
+        self.servers
+            .shutdown_all()
+            .await
+            .context(error::ShutdownServerSnafu)
+    }
+
+    pub fn server_handlers(&self) -> &ServerHandlers {
+        &self.servers
     }
 }
 

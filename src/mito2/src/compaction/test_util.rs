@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::num::NonZeroU64;
+
 use common_time::Timestamp;
 
 use crate::sst::file::{FileHandle, FileId, FileMeta, Level};
@@ -23,6 +25,23 @@ pub fn new_file_handle(
     start_ts_millis: i64,
     end_ts_millis: i64,
     level: Level,
+) -> FileHandle {
+    new_file_handle_with_sequence(
+        file_id,
+        start_ts_millis,
+        end_ts_millis,
+        level,
+        start_ts_millis as u64,
+    )
+}
+
+/// Test util to create file handles.
+pub fn new_file_handle_with_sequence(
+    file_id: FileId,
+    start_ts_millis: i64,
+    end_ts_millis: i64,
+    level: Level,
+    sequence: u64,
 ) -> FileHandle {
     let file_purger = new_noop_file_purger();
     FileHandle::new(
@@ -39,35 +58,8 @@ pub fn new_file_handle(
             index_file_size: 0,
             num_rows: 0,
             num_row_groups: 0,
-            sequence: None,
+            sequence: NonZeroU64::new(sequence),
         },
         file_purger,
     )
-}
-
-pub(crate) fn new_file_handles(file_specs: &[(i64, i64, u64)]) -> Vec<FileHandle> {
-    let file_purger = new_noop_file_purger();
-    file_specs
-        .iter()
-        .map(|(start, end, size)| {
-            FileHandle::new(
-                FileMeta {
-                    region_id: 0.into(),
-                    file_id: FileId::random(),
-                    time_range: (
-                        Timestamp::new_millisecond(*start),
-                        Timestamp::new_millisecond(*end),
-                    ),
-                    level: 0,
-                    file_size: *size,
-                    available_indexes: Default::default(),
-                    index_file_size: 0,
-                    num_rows: 0,
-                    num_row_groups: 0,
-                    sequence: None,
-                },
-                file_purger.clone(),
-            )
-        })
-        .collect()
 }

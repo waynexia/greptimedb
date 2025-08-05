@@ -35,15 +35,15 @@ use table::metadata::TableId;
 use table::table_reference::TableReference;
 
 use self::executor::DropTableExecutor;
-use crate::ddl::utils::handle_retry_error;
+use crate::ddl::utils::map_to_procedure_error;
 use crate::ddl::DdlContext;
 use crate::error::{self, Result};
 use crate::key::table_route::TableRouteValue;
 use crate::lock_key::{CatalogLock, SchemaLock, TableLock};
+use crate::metrics;
 use crate::region_keeper::OperatingRegionGuard;
 use crate::rpc::ddl::DropTableTask;
 use crate::rpc::router::{operating_leader_regions, RegionRoute};
-use crate::{metrics, ClusterId};
 
 pub struct DropTableProcedure {
     /// The context of procedure runtime.
@@ -59,8 +59,8 @@ pub struct DropTableProcedure {
 impl DropTableProcedure {
     pub const TYPE_NAME: &'static str = "metasrv-procedure::DropTable";
 
-    pub fn new(cluster_id: ClusterId, task: DropTableTask, context: DdlContext) -> Self {
-        let data = DropTableData::new(cluster_id, task);
+    pub fn new(task: DropTableTask, context: DdlContext) -> Self {
+        let data = DropTableData::new(task);
         let executor = data.build_executor();
         Self {
             context,
@@ -200,7 +200,9 @@ impl Procedure for DropTableProcedure {
         if register_operating_regions {
             self.register_dropping_regions()
                 .map_err(BoxedError::new)
-                .context(ExternalSnafu)?;
+                .context(ExternalSnafu {
+                    clean_poisons: false,
+                })?;
         }
 
         Ok(())
@@ -219,7 +221,7 @@ impl Procedure for DropTableProcedure {
             DropTableState::DatanodeDropRegions => self.on_datanode_drop_regions().await,
             DropTableState::DeleteTombstone => self.on_delete_metadata_tombstone().await,
         }
-        .map_err(handle_retry_error)
+        .map_err(map_to_procedure_error)
     }
 
     fn dump(&self) -> ProcedureResult<String> {
@@ -268,7 +270,6 @@ impl Procedure for DropTableProcedure {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DropTableData {
     pub state: DropTableState,
-    pub cluster_id: ClusterId,
     pub task: DropTableTask,
     pub physical_region_routes: Vec<RegionRoute>,
     pub physical_table_id: Option<TableId>,
@@ -279,10 +280,9 @@ pub struct DropTableData {
 }
 
 impl DropTableData {
-    pub fn new(cluster_id: ClusterId, task: DropTableTask) -> Self {
+    pub fn new(task: DropTableTask) -> Self {
         Self {
             state: DropTableState::Prepare,
-            cluster_id,
             task,
             physical_region_routes: vec![],
             physical_table_id: None,
@@ -301,7 +301,6 @@ impl DropTableData {
 
     fn build_executor(&self) -> DropTableExecutor {
         DropTableExecutor::new(
-            self.cluster_id,
             self.task.table_name(),
             self.task.table_id,
             self.task.drop_if_exists,

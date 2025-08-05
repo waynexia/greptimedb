@@ -22,7 +22,6 @@ use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
 use common_runtime::runtime::BuilderBuild;
 use common_runtime::Builder as RuntimeBuilder;
 use pgwire::api::Type;
-use rand::rngs::StdRng;
 use rand::Rng;
 use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
 use rustls::{Error, SignatureScheme};
@@ -72,6 +71,7 @@ fn create_postgres_server(
         0,
         io_runtime,
         user_provider,
+        None,
     )))
 }
 
@@ -79,10 +79,9 @@ fn create_postgres_server(
 pub async fn test_start_postgres_server() -> Result<()> {
     let table = MemTable::default_numbers_table();
 
-    let pg_server = create_postgres_server(table, false, Default::default(), None)?;
+    let mut pg_server = create_postgres_server(table, false, Default::default(), None)?;
     let listening = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
-    let result = pg_server.start(listening).await;
-    let _ = result.unwrap();
+    pg_server.start(listening).await.unwrap();
 
     let result = pg_server.start(listening).await;
     assert!(result
@@ -103,10 +102,11 @@ async fn test_shutdown_pg_server_range() -> Result<()> {
 async fn test_schema_validating() -> Result<()> {
     async fn generate_server(auth_info: DatabaseAuthInfo<'_>) -> Result<(Box<dyn Server>, u16)> {
         let table = MemTable::default_numbers_table();
-        let postgres_server =
+        let mut postgres_server =
             create_postgres_server(table, true, Default::default(), Some(auth_info))?;
         let listening = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
-        let server_addr = postgres_server.start(listening).await.unwrap();
+        postgres_server.start(listening).await.unwrap();
+        let server_addr = postgres_server.bind_addr().unwrap();
         let server_port = server_addr.port();
         Ok((postgres_server, server_port))
     }
@@ -141,7 +141,7 @@ async fn test_shutdown_pg_server(with_pwd: bool) -> Result<()> {
     common_telemetry::init_default_ut_logging();
 
     let table = MemTable::default_numbers_table();
-    let postgres_server = create_postgres_server(table, with_pwd, Default::default(), None)?;
+    let mut postgres_server = create_postgres_server(table, with_pwd, Default::default(), None)?;
     let result = postgres_server.shutdown().await;
     assert!(result
         .unwrap_err()
@@ -149,7 +149,8 @@ async fn test_shutdown_pg_server(with_pwd: bool) -> Result<()> {
         .contains("Postgres server is not started."));
 
     let listening = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
-    let server_addr = postgres_server.start(listening).await.unwrap();
+    postgres_server.start(listening).await.unwrap();
+    let server_addr = postgres_server.bind_addr().unwrap();
     let server_port = server_addr.port();
 
     let mut join_handles = vec![];
@@ -202,12 +203,10 @@ async fn test_query_pg_concurrently() -> Result<()> {
     let mut join_handles = vec![];
     for _i in 0..threads {
         join_handles.push(tokio::spawn(async move {
-            let mut rand: StdRng = rand::SeedableRng::from_entropy();
-
             let mut client = create_plain_connection(server_port, false).await.unwrap();
 
             for _k in 0..expect_executed_queries_per_worker {
-                let expected: u32 = rand.gen_range(0..100);
+                let expected: u32 = rand::rng().random_range(0..100);
                 let result: u32 = unwrap_results(
                     client
                         .simple_query(&format!(
@@ -274,6 +273,7 @@ async fn test_server_secure_require_client_plain() -> Result<()> {
         mode: servers::tls::TlsMode::Require,
         cert_path: "tests/ssl/server.crt".to_owned(),
         key_path: "tests/ssl/server-rsa.key".to_owned(),
+        ca_cert_path: String::new(),
         watch: false,
     };
     let server_port = start_test_server(server_tls).await?;
@@ -290,6 +290,7 @@ async fn test_server_secure_require_client_plain_with_pkcs8_priv_key() -> Result
         mode: servers::tls::TlsMode::Require,
         cert_path: "tests/ssl/server.crt".to_owned(),
         key_path: "tests/ssl/server-pkcs8.key".to_owned(),
+        ca_cert_path: String::new(),
         watch: false,
     };
     let server_port = start_test_server(server_tls).await?;
@@ -363,9 +364,10 @@ async fn start_test_server(server_tls: TlsOption) -> Result<u16> {
     let _ = install_ring_crypto_provider();
 
     let table = MemTable::default_numbers_table();
-    let pg_server = create_postgres_server(table, false, server_tls, None)?;
+    let mut pg_server = create_postgres_server(table, false, server_tls, None)?;
     let listening = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
-    let server_addr = pg_server.start(listening).await.unwrap();
+    pg_server.start(listening).await.unwrap();
+    let server_addr = pg_server.bind_addr().unwrap();
     Ok(server_addr.port())
 }
 
@@ -525,6 +527,7 @@ async fn do_simple_query_with_secure_server(
                 "tests/ssl/server-rsa.key".to_owned()
             }
         },
+        ca_cert_path: String::new(),
         watch: false,
     };
 

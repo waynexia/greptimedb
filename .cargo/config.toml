@@ -3,3 +3,15 @@ linker = "aarch64-linux-gnu-gcc"
 
 [alias]
 sqlness = "run --bin sqlness-runner --"
+
+[unstable.git]
+shallow_index = true
+shallow_deps = true
+[unstable.gitoxide]
+fetch = true
+checkout = true
+list_files = true
+internal_use_git2 = false
+
+[env]
+CARGO_WORKSPACE_DIR = { value = "", relative = true }

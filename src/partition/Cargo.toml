@@ -16,12 +16,22 @@ common-meta.workspace = true
 common-query.workspace = true
 datafusion-common.workspace = true
 datafusion-expr.workspace = true
+datafusion-physical-expr.workspace = true
 datatypes.workspace = true
 itertools.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+session.workspace = true
 snafu.workspace = true
 sql.workspace = true
 sqlparser.workspace = true
 store-api.workspace = true
 table.workspace = true
+
+[dev-dependencies]
+criterion = "0.5"
+rand = "0.8"
+
+[[bench]]
+name = "bench_split_record_batch"
+harness = false

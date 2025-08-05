@@ -15,15 +15,17 @@
 use std::sync::Arc;
 
 use cache::{TABLE_FLOWNODE_SET_CACHE_NAME, TABLE_ROUTE_CACHE_NAME};
+use catalog::process_manager::ProcessManagerRef;
 use catalog::CatalogManagerRef;
 use common_base::Plugins;
 use common_meta::cache::{LayeredCacheRegistryRef, TableRouteCacheRef};
 use common_meta::cache_invalidator::{CacheInvalidatorRef, DummyCacheInvalidator};
-use common_meta::ddl::ProcedureExecutorRef;
 use common_meta::key::flow::FlowMetadataManager;
 use common_meta::key::TableMetadataManager;
 use common_meta::kv_backend::KvBackendRef;
 use common_meta::node_manager::NodeManagerRef;
+use common_meta::procedure_executor::ProcedureExecutorRef;
+use dashmap::DashMap;
 use operator::delete::Deleter;
 use operator::flow::FlowServiceOperator;
 use operator::insert::Inserter;
@@ -33,17 +35,16 @@ use operator::statement::{StatementExecutor, StatementExecutorRef};
 use operator::table::TableMutationOperator;
 use partition::manager::PartitionRuleManager;
 use pipeline::pipeline_operator::PipelineOperator;
-use query::stats::StatementStatistics;
+use query::region_query::RegionQueryHandlerFactoryRef;
 use query::QueryEngineFactory;
-use servers::server::ServerHandlers;
 use snafu::OptionExt;
 
 use crate::error::{self, Result};
 use crate::frontend::FrontendOptions;
-use crate::heartbeat::HeartbeatTask;
 use crate::instance::region_query::FrontendRegionQueryHandler;
 use crate::instance::Instance;
 use crate::limiter::Limiter;
+use crate::slow_query_recorder::SlowQueryRecorder;
 
 /// The frontend [`Instance`] builder.
 pub struct FrontendBuilder {
@@ -55,11 +56,11 @@ pub struct FrontendBuilder {
     node_manager: NodeManagerRef,
     plugins: Option<Plugins>,
     procedure_executor: ProcedureExecutorRef,
-    heartbeat_task: Option<HeartbeatTask>,
-    stats: StatementStatistics,
+    process_manager: ProcessManagerRef,
 }
 
 impl FrontendBuilder {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         options: FrontendOptions,
         kv_backend: KvBackendRef,
@@ -67,7 +68,7 @@ impl FrontendBuilder {
         catalog_manager: CatalogManagerRef,
         node_manager: NodeManagerRef,
         procedure_executor: ProcedureExecutorRef,
-        stats: StatementStatistics,
+        process_manager: ProcessManagerRef,
     ) -> Self {
         Self {
             options,
@@ -78,8 +79,7 @@ impl FrontendBuilder {
             node_manager,
             plugins: None,
             procedure_executor,
-            heartbeat_task: None,
-            stats,
+            process_manager,
         }
     }
 
@@ -97,18 +97,11 @@ impl FrontendBuilder {
         }
     }
 
-    pub fn with_heartbeat_task(self, heartbeat_task: HeartbeatTask) -> Self {
-        Self {
-            heartbeat_task: Some(heartbeat_task),
-            ..self
-        }
-    }
-
     pub async fn try_build(self) -> Result<Instance> {
         let kv_backend = self.kv_backend;
         let node_manager = self.node_manager;
         let plugins = self.plugins.unwrap_or_default();
-
+        let process_manager = self.process_manager;
         let table_route_cache: TableRouteCacheRef =
             self.layered_cache_registry
                 .get()
@@ -125,7 +118,11 @@ impl FrontendBuilder {
             .unwrap_or_else(|| Arc::new(DummyCacheInvalidator));
 
         let region_query_handler =
-            FrontendRegionQueryHandler::arc(partition_manager.clone(), node_manager.clone());
+            if let Some(factory) = plugins.get::<RegionQueryHandlerFactoryRef>() {
+                factory.build(partition_manager.clone(), node_manager.clone())
+            } else {
+                FrontendRegionQueryHandler::arc(partition_manager.clone(), node_manager.clone())
+            };
 
         let table_flownode_cache =
             self.layered_cache_registry
@@ -133,6 +130,7 @@ impl FrontendBuilder {
                 .context(error::CacheRequiredSnafu {
                     name: TABLE_FLOWNODE_SET_CACHE_NAME,
                 })?;
+
         let inserter = Arc::new(Inserter::new(
             self.catalog_manager.clone(),
             partition_manager.clone(),
@@ -157,9 +155,11 @@ impl FrontendBuilder {
 
         let procedure_service_handler = Arc::new(ProcedureServiceOperator::new(
             self.procedure_executor.clone(),
+            self.catalog_manager.clone(),
         ));
 
-        let flow_metadata_manager = Arc::new(FlowMetadataManager::new(kv_backend.clone()));
+        let flow_metadata_manager: Arc<FlowMetadataManager> =
+            Arc::new(FlowMetadataManager::new(kv_backend.clone()));
         let flow_service = FlowServiceOperator::new(flow_metadata_manager, node_manager.clone());
 
         let query_engine = QueryEngineFactory::new_with_plugins(
@@ -170,6 +170,7 @@ impl FrontendBuilder {
             Some(Arc::new(flow_service)),
             true,
             plugins.clone(),
+            self.options.query.clone(),
         )
         .query_engine();
 
@@ -181,6 +182,7 @@ impl FrontendBuilder {
             local_cache_invalidator,
             inserter.clone(),
             table_route_cache,
+            Some(process_manager.clone()),
         ));
 
         let pipeline_operator = Arc::new(PipelineOperator::new(
@@ -192,6 +194,17 @@ impl FrontendBuilder {
 
         plugins.insert::<StatementExecutorRef>(statement_executor.clone());
 
+        let slow_query_recorder = self.options.slow_query.and_then(|opts| {
+            opts.enable.then(|| {
+                SlowQueryRecorder::new(
+                    opts.clone(),
+                    inserter.clone(),
+                    statement_executor.clone(),
+                    self.catalog_manager.clone(),
+                )
+            })
+        });
+
         // Create the limiter if the max_in_flight_write_bytes is set.
         let limiter = self
             .options
@@ -201,20 +214,18 @@ impl FrontendBuilder {
             });
 
         Ok(Instance {
-            options: self.options,
             catalog_manager: self.catalog_manager,
             pipeline_operator,
             statement_executor,
             query_engine,
             plugins,
-            servers: ServerHandlers::default(),
-            heartbeat_task: self.heartbeat_task,
             inserter,
             deleter,
-            export_metrics_task: None,
             table_metadata_manager: Arc::new(TableMetadataManager::new(kv_backend)),
-            stats: self.stats,
+            slow_query_recorder,
             limiter,
+            process_manager,
+            otlp_metrics_table_legacy_cache: DashMap::new(),
         })
     }
 }

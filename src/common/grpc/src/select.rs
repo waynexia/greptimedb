@@ -17,8 +17,8 @@ use api::v1::column::Values;
 use common_base::BitVec;
 use datatypes::types::{IntervalType, TimeType, TimestampType, WrapperType};
 use datatypes::vectors::{
-    BinaryVector, BooleanVector, DateTimeVector, DateVector, Decimal128Vector, Float32Vector,
-    Float64Vector, Int16Vector, Int32Vector, Int64Vector, Int8Vector, IntervalDayTimeVector,
+    BinaryVector, BooleanVector, DateVector, Decimal128Vector, Float32Vector, Float64Vector,
+    Int16Vector, Int32Vector, Int64Vector, Int8Vector, IntervalDayTimeVector,
     IntervalMonthDayNanoVector, IntervalYearMonthVector, StringVector, TimeMicrosecondVector,
     TimeMillisecondVector, TimeNanosecondVector, TimeSecondVector, TimestampMicrosecondVector,
     TimestampMillisecondVector, TimestampNanosecondVector, TimestampSecondVector, UInt16Vector,
@@ -70,7 +70,7 @@ macro_rules! convert_arrow_array_to_grpc_vals {
                     return Ok(vals);
                 },
             )+
-            ConcreteDataType::Null(_) | ConcreteDataType::List(_) | ConcreteDataType::Dictionary(_) | ConcreteDataType::Duration(_) | ConcreteDataType::Json(_) => unreachable!("Should not send {:?} in gRPC", $data_type),
+            ConcreteDataType::Null(_) | ConcreteDataType::List(_) | ConcreteDataType::Struct(_) | ConcreteDataType::Dictionary(_) | ConcreteDataType::Duration(_) | ConcreteDataType::Json(_) => unreachable!("Should not send {:?} in gRPC", $data_type),
         }
     }};
 }
@@ -141,12 +141,6 @@ pub fn values(arrays: &[VectorRef]) -> Result<Values> {
         (ConcreteDataType::Date(_), DateVector, date_values, |x| {
             x.val()
         }),
-        (
-            ConcreteDataType::DateTime(_),
-            DateTimeVector,
-            datetime_values,
-            |x| { x.val() }
-        ),
         (
             ConcreteDataType::Timestamp(TimestampType::Second(_)),
             TimestampSecondVector,

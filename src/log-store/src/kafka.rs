@@ -14,12 +14,16 @@
 
 pub(crate) mod client_manager;
 pub(crate) mod consumer;
+mod high_watermark_manager;
 pub(crate) mod index;
 pub mod log_store;
 pub(crate) mod producer;
+#[cfg(test)]
+pub(crate) mod test_util;
 pub(crate) mod util;
 pub(crate) mod worker;
 
+pub use client_manager::DEFAULT_PARTITION;
 pub use index::{default_index_file, GlobalIndexCollector};
 use serde::{Deserialize, Serialize};
 use store_api::logstore::entry::Id as EntryId;

@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use api::v1::SemanticType;
-use common_telemetry::{error, info, tracing};
+use common_telemetry::{debug, error, tracing};
 use datafusion::logical_expr::{self, Expr};
 use snafu::{OptionExt, ResultExt};
 use store_api::metadata::{RegionMetadataBuilder, RegionMetadataRef};
@@ -40,7 +40,7 @@ impl MetricEngineInner {
         let is_reading_physical_region = self.is_physical_region(region_id);
 
         if is_reading_physical_region {
-            info!(
+            debug!(
                 "Metric region received read request {request:?} on physical region {region_id:?}"
             );
             self.read_physical_region(region_id, request).await
@@ -79,10 +79,14 @@ impl MetricEngineInner {
         let request = self
             .transform_request(physical_region_id, logical_region_id, request)
             .await?;
-        self.mito
+        let mut scanner = self
+            .mito
             .handle_query(data_region_id, request)
             .await
-            .context(MitoReadOperationSnafu)
+            .context(MitoReadOperationSnafu)?;
+        scanner.set_logical_region(true);
+
+        Ok(scanner)
     }
 
     pub async fn get_last_seq_num(&self, region_id: RegionId) -> Result<Option<SequenceNumber>> {

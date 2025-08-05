@@ -25,9 +25,7 @@ use async_trait::async_trait;
 use common_base::Plugins;
 use common_catalog::consts::is_readonly_schema;
 use common_error::ext::BoxedError;
-use common_function::function::FunctionRef;
-use common_function::scalars::aggregate::AggregateFunctionMetaRef;
-use common_query::prelude::ScalarUdf;
+use common_function::function_factory::ScalarFunctionFactory;
 use common_query::{Output, OutputData, OutputMeta};
 use common_recordbatch::adapter::RecordBatchStreamAdapter;
 use common_recordbatch::{EmptyRecordBatchStream, SendableRecordBatchStream};
@@ -36,7 +34,9 @@ use datafusion::physical_plan::analyze::AnalyzeExec;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_common::ResolvedTableReference;
-use datafusion_expr::{DmlStatement, LogicalPlan as DfLogicalPlan, LogicalPlan, WriteOp};
+use datafusion_expr::{
+    AggregateUDF, DmlStatement, LogicalPlan as DfLogicalPlan, LogicalPlan, WriteOp,
+};
 use datatypes::prelude::VectorRef;
 use datatypes::schema::Schema;
 use futures_util::StreamExt;
@@ -49,7 +49,7 @@ use table::TableRef;
 use crate::analyze::DistAnalyzeExec;
 use crate::dataframe::DataFrame;
 pub use crate::datafusion::planner::DfContextProviderAdapter;
-use crate::dist_plan::MergeScanLogicalPlan;
+use crate::dist_plan::{DistPlannerOptions, MergeScanLogicalPlan};
 use crate::error::{
     CatalogSnafu, ConvertSchemaSnafu, CreateRecordBatchSnafu, MissingTableMutationHandlerSnafu,
     MissingTimestampColumnSnafu, QueryExecutionSnafu, Result, TableMutationSnafu,
@@ -61,6 +61,13 @@ use crate::physical_wrapper::PhysicalPlanWrapperRef;
 use crate::planner::{DfLogicalPlanner, LogicalPlanner};
 use crate::query_engine::{DescribeResult, QueryEngineContext, QueryEngineState};
 use crate::{metrics, QueryEngine};
+
+/// Query parallelism hint key.
+/// This hint can be set in the query context to control the parallelism of the query execution.
+pub const QUERY_PARALLELISM_HINT: &str = "query_parallelism";
+
+/// Whether to fallback to the original plan when failed to push down.
+pub const QUERY_FALLBACK_HINT: &str = "query_fallback";
 
 pub struct DatafusionQueryEngine {
     state: Arc<QueryEngineState>,
@@ -265,6 +272,37 @@ impl DatafusionQueryEngine {
         ctx: &mut QueryEngineContext,
         logical_plan: &LogicalPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        /// Only print context on panic, to avoid cluttering logs.
+        ///
+        /// TODO(discord9): remove this once we catch the bug
+        #[derive(Debug)]
+        struct PanicLogger<'a> {
+            input_logical_plan: &'a LogicalPlan,
+            after_analyze: Option<LogicalPlan>,
+            after_optimize: Option<LogicalPlan>,
+            phy_plan: Option<Arc<dyn ExecutionPlan>>,
+        }
+        impl Drop for PanicLogger<'_> {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    common_telemetry::error!(
+                        "Panic while creating physical plan, input logical plan: {:?}, after analyze: {:?}, after optimize: {:?}, final physical plan: {:?}",
+                        self.input_logical_plan,
+                        self.after_analyze,
+                        self.after_optimize,
+                        self.phy_plan
+                    );
+                }
+            }
+        }
+
+        let mut logger = PanicLogger {
+            input_logical_plan: logical_plan,
+            after_analyze: None,
+            after_optimize: None,
+            phy_plan: None,
+        };
+
         let _timer = metrics::CREATE_PHYSICAL_ELAPSED.start_timer();
         let state = ctx.state();
 
@@ -288,6 +326,8 @@ impl DatafusionQueryEngine {
             .map_err(BoxedError::new)
             .context(QueryExecutionSnafu)?;
 
+        logger.after_analyze = Some(analyzed_plan.clone());
+
         common_telemetry::debug!("Create physical plan, analyzed plan: {analyzed_plan}");
 
         // skip optimize for MergeScan
@@ -305,15 +345,15 @@ impl DatafusionQueryEngine {
         };
 
         common_telemetry::debug!("Create physical plan, optimized plan: {optimized_plan}");
+        logger.after_optimize = Some(optimized_plan.clone());
 
         let physical_plan = state
             .query_planner()
             .create_physical_plan(&optimized_plan, state)
-            .await
-            .context(error::DatafusionSnafu)
-            .map_err(BoxedError::new)
-            .context(QueryExecutionSnafu)?;
+            .await?;
 
+        logger.phy_plan = Some(physical_plan.clone());
+        drop(logger);
         Ok(physical_plan)
     }
 
@@ -368,8 +408,15 @@ impl DatafusionQueryEngine {
             } else {
                 AnalyzeFormat::TEXT
             };
+            // Sets the verbose flag of the query context.
+            // The MergeScanExec plan uses the verbose flag to determine whether to print the plan in verbose mode.
+            ctx.query_ctx().set_explain_verbose(analyze_plan.verbose());
 
-            Arc::new(DistAnalyzeExec::new(analyze_plan.input().clone(), format))
+            Arc::new(DistAnalyzeExec::new(
+                analyze_plan.input().clone(),
+                analyze_plan.verbose(),
+                format,
+            ))
             // let mut new_plan = analyze_plan.input().clone();
             // for optimizer in state.physical_optimizers() {
             //     new_plan = optimizer
@@ -451,19 +498,14 @@ impl QueryEngine for DatafusionQueryEngine {
     /// `SELECT "my_UDAF"(x)` will look for an aggregate named `"my_UDAF"`
     ///
     /// So it's better to make UDAF name lowercase when creating one.
-    fn register_aggregate_function(&self, func: AggregateFunctionMetaRef) {
-        self.state.register_aggregate_function(func);
+    fn register_aggregate_function(&self, func: AggregateUDF) {
+        self.state.register_aggr_function(func);
     }
 
-    /// Register a [`ScalarUdf`].
-    fn register_udf(&self, udf: ScalarUdf) {
-        self.state.register_udf(udf);
-    }
-
-    /// Register an UDF function.
+    /// Register an scalar function.
     /// Will override if the function with same name is already registered.
-    fn register_function(&self, func: FunctionRef) {
-        self.state.register_function(func);
+    fn register_scalar_function(&self, func: ScalarFunctionFactory) {
+        self.state.register_scalar_function(func);
     }
 
     fn read_table(&self, table: TableRef) -> Result<DataFrame> {
@@ -479,6 +521,45 @@ impl QueryEngine for DatafusionQueryEngine {
     fn engine_context(&self, query_ctx: QueryContextRef) -> QueryEngineContext {
         let mut state = self.state.session_state();
         state.config_mut().set_extension(query_ctx.clone());
+        // note that hints in "x-greptime-hints" is automatically parsed
+        // and set to query context's extension, so we can get it from query context.
+        if let Some(parallelism) = query_ctx.extension(QUERY_PARALLELISM_HINT) {
+            if let Ok(n) = parallelism.parse::<u64>() {
+                if n > 0 {
+                    let new_cfg = state.config().clone().with_target_partitions(n as usize);
+                    *state.config_mut() = new_cfg;
+                }
+            } else {
+                common_telemetry::warn!(
+                    "Failed to parse query_parallelism: {}, using default value",
+                    parallelism
+                );
+            }
+        }
+
+        // usually it's impossible to have both `set variable` set by sql client and
+        // hint in header by grpc client, so only need to deal with them separately
+        if query_ctx.configuration_parameter().allow_query_fallback() {
+            state
+                .config_mut()
+                .options_mut()
+                .extensions
+                .insert(DistPlannerOptions {
+                    allow_query_fallback: true,
+                });
+        } else if let Some(fallback) = query_ctx.extension(QUERY_FALLBACK_HINT) {
+            // also check the query context for fallback hint
+            // if it is set, we will enable the fallback
+            if fallback.to_lowercase().parse::<bool>().unwrap_or(false) {
+                state
+                    .config_mut()
+                    .options_mut()
+                    .extensions
+                    .insert(DistPlannerOptions {
+                        allow_query_fallback: true,
+                    });
+            }
+        }
         QueryEngineContext::new(state, query_ctx)
     }
 
@@ -494,6 +575,12 @@ impl QueryExecutor for DatafusionQueryEngine {
         ctx: &QueryEngineContext,
         plan: &Arc<dyn ExecutionPlan>,
     ) -> Result<SendableRecordBatchStream> {
+        let explain_verbose = ctx.query_ctx().explain_verbose();
+        let output_partitions = plan.properties().output_partitioning().partition_count();
+        if explain_verbose {
+            common_telemetry::info!("Executing query plan, output_partitions: {output_partitions}");
+        }
+
         let exec_timer = metrics::EXEC_PLAN_ELAPSED.start_timer();
         let task_ctx = ctx.build_task_ctx();
 
@@ -517,8 +604,15 @@ impl QueryExecutor for DatafusionQueryEngine {
                     .map_err(BoxedError::new)
                     .context(QueryExecutionSnafu)?;
                 stream.set_metrics2(plan.clone());
+                stream.set_explain_verbose(explain_verbose);
                 let stream = OnDone::new(Box::pin(stream), move || {
-                    exec_timer.observe_duration();
+                    let exec_cost = exec_timer.stop_and_record();
+                    if explain_verbose {
+                        common_telemetry::info!(
+                            "DatafusionQueryEngine execute 1 stream, cost: {:?}s",
+                            exec_cost,
+                        );
+                    }
                 });
                 Ok(Box::pin(stream))
             }
@@ -543,8 +637,15 @@ impl QueryExecutor for DatafusionQueryEngine {
                     .map_err(BoxedError::new)
                     .context(QueryExecutionSnafu)?;
                 stream.set_metrics2(plan.clone());
+                stream.set_explain_verbose(ctx.query_ctx().explain_verbose());
                 let stream = OnDone::new(Box::pin(stream), move || {
-                    exec_timer.observe_duration();
+                    let exec_cost = exec_timer.stop_and_record();
+                    if explain_verbose {
+                        common_telemetry::info!(
+                            "DatafusionQueryEngine execute {output_partitions} stream, cost: {:?}s",
+                            exec_cost
+                        );
+                    }
                 });
                 Ok(Box::pin(stream))
             }
@@ -567,6 +668,7 @@ mod tests {
     use table::table::numbers::{NumbersTable, NUMBERS_TABLE_NAME};
 
     use super::*;
+    use crate::options::QueryOptions;
     use crate::parser::QueryLanguageParser;
     use crate::query_engine::{QueryEngineFactory, QueryEngineRef};
 
@@ -581,7 +683,16 @@ mod tests {
         };
         catalog_manager.register_table_sync(req).unwrap();
 
-        QueryEngineFactory::new(catalog_manager, None, None, None, None, false).query_engine()
+        QueryEngineFactory::new(
+            catalog_manager,
+            None,
+            None,
+            None,
+            None,
+            false,
+            QueryOptions::default(),
+        )
+        .query_engine()
     }
 
     #[tokio::test]

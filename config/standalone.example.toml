@@ -1,6 +1,3 @@
-## The running mode of the datanode. It can be `standalone` or `distributed`.
-mode = "standalone"
-
 ## The default timezone of the server.
 ## @toml2docs:none-default
 default_timezone = "UTC"
@@ -34,7 +31,7 @@ max_concurrent_queries = 0
 ## The address to bind the HTTP server.
 addr = "127.0.0.1:4000"
 ## HTTP request timeout. Set to 0 to disable timeout.
-timeout = "30s"
+timeout = "0s"
 ## HTTP request body limit.
 ## The following units are supported: `B`, `KB`, `KiB`, `MB`, `MiB`, `GB`, `GiB`, `TB`, `TiB`, `PB`, `PiB`.
 ## Set to 0 to disable limit.
@@ -45,6 +42,13 @@ enable_cors = true
 ## Customize allowed origins for HTTP CORS.
 ## @toml2docs:none-default
 cors_allowed_origins = ["https://example.com"]
+
+## Whether to enable validation for Prometheus remote write requests.
+## Available options:
+## - strict: deny invalid UTF-8 strings (default).
+## - lossy: allow invalid UTF-8 strings, replace invalid characters with REPLACEMENT_CHARACTER(U+FFFD).
+## - unchecked: do not valid strings.
+prom_validation_mode = "strict"
 
 ## The gRPC server options.
 [grpc]
@@ -164,7 +168,7 @@ provider = "raft_engine"
 ## The directory to store the WAL files.
 ## **It's only used when the provider is `raft_engine`**.
 ## @toml2docs:none-default
-dir = "/tmp/greptimedb/wal"
+dir = "./greptimedb_data/wal"
 
 ## The size of the WAL segment file.
 ## **It's only used when the provider is `raft_engine`**.
@@ -242,22 +246,6 @@ max_batch_bytes = "1MB"
 ## **It's only used when the provider is `kafka`**.
 consumer_wait_timeout = "100ms"
 
-## The initial backoff delay.
-## **It's only used when the provider is `kafka`**.
-backoff_init = "500ms"
-
-## The maximum backoff delay.
-## **It's only used when the provider is `kafka`**.
-backoff_max = "10s"
-
-## The exponential backoff rate, i.e. next backoff = base * current backoff.
-## **It's only used when the provider is `kafka`**.
-backoff_base = 2
-
-## The deadline of retries.
-## **It's only used when the provider is `kafka`**.
-backoff_deadline = "5mins"
-
 ## Ignore missing entries during read WAL.
 ## **It's only used when the provider is `kafka`**.
 ##
@@ -302,6 +290,10 @@ purge_interval = "1m"
 max_retry_times = 3
 ## Initial retry delay of procedures, increases exponentially
 retry_delay = "500ms"
+## Max running procedures.
+## The maximum number of procedures that can be running at the same time.
+## If the number of running procedures exceeds this limit, the procedure will be rejected.
+max_running_procedures = 128
 
 ## flow engine options.
 [flow]
@@ -318,6 +310,7 @@ retry_delay = "500ms"
 # secret_access_key = "123456"
 # endpoint = "https://s3.amazonaws.com"
 # region = "us-west-2"
+# enable_virtual_host_style = false
 
 # Example of using Oss as the storage.
 # [storage]
@@ -348,10 +341,16 @@ retry_delay = "500ms"
 # credential = "base64-credential"
 # endpoint = "https://storage.googleapis.com"
 
+## The query engine options.
+[query]
+## Parallelism of the query engine.
+## Default to 0, which means the number of CPU cores.
+parallelism = 0
+
 ## The data storage options.
 [storage]
 ## The working home directory.
-data_home = "/tmp/greptimedb/"
+data_home = "./greptimedb_data"
 
 ## The storage type used to store the data.
 ## - `File`: the data is stored in the local file system.
@@ -459,6 +458,10 @@ timeout = "30s"
 ## The timeout for idle sockets being kept-alive.
 pool_idle_timeout = "90s"
 
+## To skip the ssl verification
+## **Security Notice**: Setting `skip_ssl_validation = true` disables certificate verification, making connections vulnerable to man-in-the-middle attacks. Only use this in development or trusted private networks.
+skip_ssl_validation = false
+
 # Custom storage options
 # [[storage.providers]]
 # name = "S3"
@@ -562,6 +565,9 @@ sst_write_buffer_size = "8MB"
 ## Capacity of the channel to send data from parallel scan tasks to the main task.
 parallel_scan_channel_size = 32
 
+## Maximum number of SST files to scan concurrently.
+max_concurrent_scan_files = 128
+
 ## Whether to allow stale WAL entries read during replay.
 allow_stale_entries = false
 
@@ -597,6 +603,9 @@ content_cache_size = "128MiB"
 
 ## Page size for inverted index content cache.
 content_cache_page_size = "64KiB"
+
+## Cache size for index result.
+result_cache_size = "128MiB"
 
 ## The options for inverted index in Mito engine.
 [region_engine.mito.inverted_index]
@@ -704,7 +713,7 @@ experimental_sparse_primary_key_encoding = false
 ## The logging options.
 [logging]
 ## The directory to store the log files. If set to empty, logs will not be written to files.
-dir = "/tmp/greptimedb/logs"
+dir = "./greptimedb_data/logs"
 
 ## The log level. Can be `info`/`debug`/`warn`/`error`.
 ## @toml2docs:none-default
@@ -714,7 +723,7 @@ level = "info"
 enable_otlp_tracing = false
 
 ## The OTLP tracing endpoint.
-otlp_endpoint = "http://localhost:4317"
+otlp_endpoint = "http://localhost:4318"
 
 ## Whether to append logs to stdout.
 append_stdout = true
@@ -725,6 +734,9 @@ log_format = "text"
 ## The maximum amount of log files.
 max_log_files = 720
 
+## The OTLP tracing export protocol. Can be `grpc`/`http`.
+otlp_export_protocol = "http"
+
 ## The percentage of tracing will be sampled and exported.
 ## Valid range `[0, 1]`, 1 means all traces are sampled, 0 means all traces are not sampled, the default value is 1.
 ## ratio > 1 are treated as 1. Fractions < 0 are treated as 0
@@ -732,25 +744,27 @@ max_log_files = 720
 default_ratio = 1.0
 
 ## The slow query log options.
-[logging.slow_query]
+[slow_query]
 ## Whether to enable slow query log.
-enable = false
+#+ enable = false
+
+## The record type of slow queries. It can be `system_table` or `log`.
+## @toml2docs:none-default
+#+ record_type = "system_table"
 
 ## The threshold of slow query.
 ## @toml2docs:none-default
-threshold = "10s"
+#+ threshold = "10s"
 
 ## The sampling ratio of slow query log. The value should be in the range of (0, 1].
 ## @toml2docs:none-default
-sample_ratio = 1.0
+#+ sample_ratio = 1.0
 
-## The datanode can export its metrics and send to Prometheus compatible service (e.g. send to `greptimedb` itself) from remote-write API.
+## The standalone can export its metrics and send to Prometheus compatible service (e.g. `greptimedb`) from remote-write API.
 ## This is only used for `greptimedb` to export its own metrics internally. It's different from prometheus scrape.
 [export_metrics]
-
 ## whether enable export metrics.
 enable = false
-
 ## The interval of export metrics.
 write_interval = "30s"
 
@@ -761,7 +775,7 @@ write_interval = "30s"
 db = "greptime_metrics"
 
 [export_metrics.remote_write]
-## The url the metrics send to. The url example can be: `http://127.0.0.1:4000/v1/prometheus/write?db=greptime_metrics`.
+## The prometheus remote write endpoint that the metrics send to. The url example can be: `http://127.0.0.1:4000/v1/prometheus/write?db=greptime_metrics`.
 url = ""
 
 ## HTTP headers of Prometheus remote-write carry.
@@ -772,3 +786,11 @@ headers = { }
 ## The tokio console address.
 ## @toml2docs:none-default
 #+ tokio_console_addr = "127.0.0.1"
+
+## The memory options.
+[memory]
+## Whether to enable heap profiling activation during startup.
+## When enabled, heap profiling will be activated if the `MALLOC_CONF` environment variable
+## is set to "prof:true,prof_active:false". The official image adds this env variable.
+## Default is true.
+enable_heap_profiling = true

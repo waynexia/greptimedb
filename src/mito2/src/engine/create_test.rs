@@ -26,7 +26,7 @@ use crate::test_util::{build_rows, put_rows, rows_schema, CreateRequestBuilder, 
 
 #[tokio::test]
 async fn test_engine_create_new_region() {
-    let mut env = TestEnv::with_prefix("new-region");
+    let mut env = TestEnv::with_prefix("new-region").await;
     let engine = env.create_engine(MitoConfig::default()).await;
 
     let region_id = RegionId::new(1, 1);
@@ -41,7 +41,7 @@ async fn test_engine_create_new_region() {
 
 #[tokio::test]
 async fn test_engine_create_existing_region() {
-    let mut env = TestEnv::with_prefix("create-existing");
+    let mut env = TestEnv::with_prefix("create-existing").await;
     let engine = env.create_engine(MitoConfig::default()).await;
 
     let region_id = RegionId::new(1, 1);
@@ -61,7 +61,7 @@ async fn test_engine_create_existing_region() {
 #[tokio::test]
 async fn test_engine_create_close_create_region() {
     // This test will trigger create_or_open function.
-    let mut env = TestEnv::with_prefix("create-close-create");
+    let mut env = TestEnv::with_prefix("create-close-create").await;
     let engine = env.create_engine(MitoConfig::default()).await;
 
     let region_id = RegionId::new(1, 1);
@@ -91,7 +91,7 @@ async fn test_engine_create_close_create_region() {
 
 #[tokio::test]
 async fn test_engine_create_with_different_id() {
-    let mut env = TestEnv::new();
+    let mut env = TestEnv::new().await;
     let engine = env.create_engine(MitoConfig::default()).await;
 
     let region_id = RegionId::new(1, 1);
@@ -105,12 +105,12 @@ async fn test_engine_create_with_different_id() {
     engine
         .handle_request(RegionId::new(2, 1), RegionRequest::Create(builder.build()))
         .await
-        .unwrap_err();
+        .unwrap();
 }
 
 #[tokio::test]
 async fn test_engine_create_with_different_schema() {
-    let mut env = TestEnv::new();
+    let mut env = TestEnv::new().await;
     let engine = env.create_engine(MitoConfig::default()).await;
 
     let region_id = RegionId::new(1, 1);
@@ -130,7 +130,7 @@ async fn test_engine_create_with_different_schema() {
 
 #[tokio::test]
 async fn test_engine_create_with_different_primary_key() {
-    let mut env = TestEnv::new();
+    let mut env = TestEnv::new().await;
     let engine = env.create_engine(MitoConfig::default()).await;
 
     let region_id = RegionId::new(1, 1);
@@ -150,7 +150,7 @@ async fn test_engine_create_with_different_primary_key() {
 
 #[tokio::test]
 async fn test_engine_create_with_options() {
-    let mut env = TestEnv::new();
+    let mut env = TestEnv::new().await;
     let engine = env.create_engine(MitoConfig::default()).await;
 
     let region_id = RegionId::new(1, 1);
@@ -172,7 +172,7 @@ async fn test_engine_create_with_options() {
 
 #[tokio::test]
 async fn test_engine_create_with_custom_store() {
-    let mut env = TestEnv::new();
+    let mut env = TestEnv::new().await;
     let engine = env
         .create_engine_with_multiple_object_stores(MitoConfig::default(), None, None, &["Gcs"])
         .await;
@@ -186,25 +186,25 @@ async fn test_engine_create_with_custom_store() {
         .unwrap();
     assert!(engine.is_region_exists(region_id));
     let region = engine.get_region(region_id).unwrap();
-    let region_dir = region.access_layer.region_dir();
+    let region_dir = region.access_layer.build_region_dir(region_id);
 
     let object_store_manager = env.get_object_store_manager().unwrap();
     assert!(object_store_manager
         .find("Gcs")
         .unwrap()
-        .exists(region_dir)
+        .exists(&region_dir)
         .await
         .unwrap());
     assert!(!object_store_manager
         .default_object_store()
-        .exists(region_dir)
+        .exists(&region_dir)
         .await
         .unwrap());
 }
 
 #[tokio::test]
 async fn test_engine_create_with_memtable_opts() {
-    let mut env = TestEnv::new();
+    let mut env = TestEnv::new().await;
     let engine = env.create_engine(MitoConfig::default()).await;
 
     let region_id = RegionId::new(1, 1);

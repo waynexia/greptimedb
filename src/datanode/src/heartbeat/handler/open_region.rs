@@ -15,8 +15,8 @@
 use common_meta::instruction::{InstructionReply, OpenRegion, SimpleReply};
 use common_meta::wal_options_allocator::prepare_wal_options;
 use futures_util::future::BoxFuture;
-use store_api::path_utils::region_dir;
-use store_api::region_request::{RegionOpenRequest, RegionRequest};
+use store_api::path_utils::table_dir;
+use store_api::region_request::{PathType, RegionOpenRequest, RegionRequest};
 
 use crate::heartbeat::handler::HandlerContext;
 
@@ -30,23 +30,24 @@ impl HandlerContext {
             region_wal_options,
             skip_wal_replay,
         }: OpenRegion,
-    ) -> BoxFuture<'static, InstructionReply> {
+    ) -> BoxFuture<'static, Option<InstructionReply>> {
         Box::pin(async move {
             let region_id = Self::region_ident_to_region_id(&region_ident);
             prepare_wal_options(&mut region_options, region_id, &region_wal_options);
             let request = RegionRequest::Open(RegionOpenRequest {
                 engine: region_ident.engine,
-                region_dir: region_dir(&region_storage_path, region_id),
+                table_dir: table_dir(&region_storage_path, region_id.table_id()),
+                path_type: PathType::Bare,
                 options: region_options,
                 skip_wal_replay,
             });
             let result = self.region_server.handle_request(region_id, request).await;
             let success = result.is_ok();
             let error = result.as_ref().map_err(|e| format!("{e:?}")).err();
-            InstructionReply::OpenRegion(SimpleReply {
+            Some(InstructionReply::OpenRegion(SimpleReply {
                 result: success,
                 error,
-            })
+            }))
         })
     }
 }

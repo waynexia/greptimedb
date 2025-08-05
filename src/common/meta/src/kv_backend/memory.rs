@@ -14,17 +14,14 @@
 
 use std::any::Any;
 use std::collections::BTreeMap;
-use std::fmt::{Display, Formatter};
 use std::marker::PhantomData;
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use common_error::ext::ErrorExt;
-use serde::Serializer;
 
-use super::{KvBackendRef, ResettableKvBackend};
 use crate::kv_backend::txn::{Txn, TxnOp, TxnOpResponse, TxnRequest, TxnResponse};
-use crate::kv_backend::{KvBackend, TxnService};
+use crate::kv_backend::{KvBackend, KvBackendRef, ResettableKvBackend, TxnService};
 use crate::metrics::METRIC_META_TXN_REQUEST;
 use crate::rpc::store::{
     BatchDeleteRequest, BatchDeleteResponse, BatchGetRequest, BatchGetResponse, BatchPutRequest,
@@ -36,19 +33,6 @@ use crate::rpc::KeyValue;
 pub struct MemoryKvBackend<T> {
     kvs: RwLock<BTreeMap<Vec<u8>, Vec<u8>>>,
     _phantom: PhantomData<T>,
-}
-
-impl<T> Display for MemoryKvBackend<T> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let kvs = self.kvs.read().unwrap();
-        for (k, v) in kvs.iter() {
-            f.serialize_str(&String::from_utf8_lossy(k))?;
-            f.serialize_str(" -> ")?;
-            f.serialize_str(&String::from_utf8_lossy(v))?;
-            f.serialize_str("\n")?;
-        }
-        Ok(())
-    }
 }
 
 impl<T> Default for MemoryKvBackend<T> {
@@ -70,20 +54,20 @@ impl<T> MemoryKvBackend<T> {
         kvs.clear();
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     /// Returns true if the `kvs` is empty.
     pub fn is_empty(&self) -> bool {
         self.kvs.read().unwrap().is_empty()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     /// Returns the `kvs`.
     pub fn dump(&self) -> BTreeMap<Vec<u8>, Vec<u8>> {
         let kvs = self.kvs.read().unwrap();
         kvs.clone()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     /// Returns the length of `kvs`
     pub fn len(&self) -> usize {
         self.kvs.read().unwrap().len()
@@ -324,10 +308,11 @@ mod tests {
     use super::*;
     use crate::error::Error;
     use crate::kv_backend::test::{
-        prepare_kv, test_kv_batch_delete, test_kv_batch_get, test_kv_compare_and_put,
-        test_kv_delete_range, test_kv_put, test_kv_range, test_kv_range_2, test_txn_compare_equal,
-        test_txn_compare_greater, test_txn_compare_less, test_txn_compare_not_equal,
-        test_txn_one_compare_op, text_txn_multi_compare_op,
+        prepare_kv, prepare_kv_with_prefix, test_kv_batch_delete, test_kv_batch_get,
+        test_kv_compare_and_put, test_kv_delete_range, test_kv_put, test_kv_range, test_kv_range_2,
+        test_simple_kv_range, test_txn_compare_equal, test_txn_compare_greater,
+        test_txn_compare_less, test_txn_compare_not_equal, test_txn_one_compare_op,
+        text_txn_multi_compare_op, unprepare_kv,
     };
 
     async fn mock_mem_store_with_data() -> MemoryKvBackend<Error> {
@@ -395,5 +380,13 @@ mod tests {
         test_txn_compare_greater(&kv_backend).await;
         test_txn_compare_less(&kv_backend).await;
         test_txn_compare_not_equal(&kv_backend).await;
+    }
+    #[tokio::test]
+    async fn test_mem_all_range() {
+        let kv_backend = MemoryKvBackend::<Error>::new();
+        let prefix = b"";
+        prepare_kv_with_prefix(&kv_backend, prefix.to_vec()).await;
+        test_simple_kv_range(&kv_backend).await;
+        unprepare_kv(&kv_backend, prefix).await;
     }
 }

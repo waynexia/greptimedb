@@ -25,7 +25,7 @@ use common_wal::options::WAL_OPTIONS_KEY;
 use rstest::rstest;
 use rstest_reuse::{self, apply};
 use store_api::region_engine::RegionEngine;
-use store_api::region_request::RegionRequest;
+use store_api::region_request::{RegionFlushRequest, RegionRequest};
 use store_api::storage::{RegionId, ScanRequest};
 
 use crate::config::MitoConfig;
@@ -33,15 +33,15 @@ use crate::engine::listener::{FlushListener, StallListener};
 use crate::test_util::{
     build_rows, build_rows_for_key, flush_region, kafka_log_store_factory,
     multiple_log_store_factories, prepare_test_for_kafka_log_store, put_rows,
-    raft_engine_log_store_factory, reopen_region, rows_schema, CreateRequestBuilder,
-    LogStoreFactory, MockWriteBufferManager, TestEnv,
+    raft_engine_log_store_factory, reopen_region, rows_schema, single_kafka_log_store_factory,
+    CreateRequestBuilder, LogStoreFactory, MockWriteBufferManager, TestEnv,
 };
 use crate::time_provider::TimeProvider;
 use crate::worker::MAX_INITIAL_CHECK_DELAY_SECS;
 
 #[tokio::test]
 async fn test_manual_flush() {
-    let mut env = TestEnv::new();
+    let mut env = TestEnv::new().await;
     let engine = env.create_engine(MitoConfig::default()).await;
 
     let region_id = RegionId::new(1, 1);
@@ -73,7 +73,7 @@ async fn test_manual_flush() {
     flush_region(&engine, region_id, None).await;
 
     let request = ScanRequest::default();
-    let scanner = engine.scanner(region_id, request).unwrap();
+    let scanner = engine.scanner(region_id, request).await.unwrap();
     assert_eq!(0, scanner.num_memtables());
     assert_eq!(1, scanner.num_files());
     let stream = scanner.scan().await.unwrap();
@@ -91,7 +91,7 @@ async fn test_manual_flush() {
 
 #[tokio::test]
 async fn test_flush_engine() {
-    let mut env = TestEnv::new();
+    let mut env = TestEnv::new().await;
     let write_buffer_manager = Arc::new(MockWriteBufferManager::default());
     let listener = Arc::new(FlushListener::default());
     let engine = env
@@ -142,7 +142,7 @@ async fn test_flush_engine() {
     listener.wait().await;
 
     let request = ScanRequest::default();
-    let scanner = engine.scanner(region_id, request).unwrap();
+    let scanner = engine.scanner(region_id, request).await.unwrap();
     assert_eq!(1, scanner.num_memtables());
     assert_eq!(1, scanner.num_files());
     let stream = scanner.scan().await.unwrap();
@@ -161,7 +161,7 @@ async fn test_flush_engine() {
 
 #[tokio::test]
 async fn test_write_stall() {
-    let mut env = TestEnv::new();
+    let mut env = TestEnv::new().await;
     let write_buffer_manager = Arc::new(MockWriteBufferManager::default());
     let listener = Arc::new(StallListener::default());
     let engine = env
@@ -217,7 +217,7 @@ async fn test_write_stall() {
     put_rows(&engine, region_id, rows).await;
 
     let request = ScanRequest::default();
-    let scanner = engine.scanner(region_id, request).unwrap();
+    let scanner = engine.scanner(region_id, request).await.unwrap();
     assert_eq!(1, scanner.num_memtables());
     assert_eq!(1, scanner.num_files());
     let stream = scanner.scan().await.unwrap();
@@ -236,7 +236,7 @@ async fn test_write_stall() {
 
 #[tokio::test]
 async fn test_flush_empty() {
-    let mut env = TestEnv::new();
+    let mut env = TestEnv::new().await;
     let write_buffer_manager = Arc::new(MockWriteBufferManager::default());
     let engine = env
         .create_engine_with(
@@ -267,7 +267,7 @@ async fn test_flush_empty() {
     flush_region(&engine, region_id, None).await;
 
     let request = ScanRequest::default();
-    let scanner = engine.scanner(region_id, request).unwrap();
+    let scanner = engine.scanner(region_id, request).await.unwrap();
     assert_eq!(0, scanner.num_memtables());
     assert_eq!(0, scanner.num_files());
     let stream = scanner.scan().await.unwrap();
@@ -289,7 +289,7 @@ async fn test_flush_reopen_region(factory: Option<LogStoreFactory>) {
         return;
     };
 
-    let mut env = TestEnv::new().with_log_store_factory(factory.clone());
+    let mut env = TestEnv::new().await.with_log_store_factory(factory.clone());
     let engine = env.create_engine(MitoConfig::default()).await;
     let region_id = RegionId::new(1, 1);
     env.get_schema_metadata_manager()
@@ -307,7 +307,7 @@ async fn test_flush_reopen_region(factory: Option<LogStoreFactory>) {
     let request = CreateRequestBuilder::new()
         .kafka_topic(topic.clone())
         .build();
-    let region_dir = request.region_dir.clone();
+    let table_dir = request.table_dir.clone();
 
     let column_schemas = rows_schema(&request);
     engine
@@ -342,7 +342,7 @@ async fn test_flush_reopen_region(factory: Option<LogStoreFactory>) {
             .unwrap(),
         );
     };
-    reopen_region(&engine, region_id, region_dir, true, options).await;
+    reopen_region(&engine, region_id, table_dir, true, options).await;
     check_region();
 
     // Puts again.
@@ -396,7 +396,7 @@ impl MockTimeProvider {
 
 #[tokio::test]
 async fn test_auto_flush_engine() {
-    let mut env = TestEnv::new();
+    let mut env = TestEnv::new().await;
     let write_buffer_manager = Arc::new(MockWriteBufferManager::default());
     let listener = Arc::new(FlushListener::default());
     let now = current_time_millis();
@@ -450,7 +450,7 @@ async fn test_auto_flush_engine() {
         .unwrap();
 
     let request = ScanRequest::default();
-    let scanner = engine.scanner(region_id, request).unwrap();
+    let scanner = engine.scanner(region_id, request).await.unwrap();
     assert_eq!(0, scanner.num_memtables());
     assert_eq!(1, scanner.num_files());
     let stream = scanner.scan().await.unwrap();
@@ -467,7 +467,7 @@ async fn test_auto_flush_engine() {
 
 #[tokio::test]
 async fn test_flush_workers() {
-    let mut env = TestEnv::new();
+    let mut env = TestEnv::new().await;
     let write_buffer_manager = Arc::new(MockWriteBufferManager::default());
     let listener = Arc::new(FlushListener::default());
     let engine = env
@@ -494,13 +494,13 @@ async fn test_flush_workers() {
         )
         .await;
 
-    let request = CreateRequestBuilder::new().region_dir("r0").build();
+    let request = CreateRequestBuilder::new().table_dir("r0").build();
     let column_schemas = rows_schema(&request);
     engine
         .handle_request(region_id0, RegionRequest::Create(request))
         .await
         .unwrap();
-    let request = CreateRequestBuilder::new().region_dir("r1").build();
+    let request = CreateRequestBuilder::new().table_dir("r1").build();
     engine
         .handle_request(region_id1, RegionRequest::Create(request.clone()))
         .await
@@ -530,7 +530,7 @@ async fn test_flush_workers() {
 
     // Scans region 1.
     let request = ScanRequest::default();
-    let scanner = engine.scanner(region_id1, request).unwrap();
+    let scanner = engine.scanner(region_id1, request).await.unwrap();
     assert_eq!(0, scanner.num_memtables());
     assert_eq!(1, scanner.num_files());
     let stream = scanner.scan().await.unwrap();
@@ -543,4 +543,68 @@ async fn test_flush_workers() {
 | a     | 1.0     | 1970-01-01T00:00:01 |
 +-------+---------+---------------------+";
     assert_eq!(expected, batches.pretty_print().unwrap());
+}
+
+#[apply(single_kafka_log_store_factory)]
+async fn test_update_topic_latest_entry_id(factory: Option<LogStoreFactory>) {
+    common_telemetry::init_default_ut_logging();
+    let Some(factory) = factory else {
+        return;
+    };
+    let write_buffer_manager = Arc::new(MockWriteBufferManager::default());
+    let listener = Arc::new(FlushListener::default());
+
+    let mut env = TestEnv::new().await.with_log_store_factory(factory.clone());
+    let engine = env
+        .create_engine_with(
+            MitoConfig::default(),
+            Some(write_buffer_manager.clone()),
+            Some(listener.clone()),
+        )
+        .await;
+    let region_id = RegionId::new(1, 1);
+    env.get_schema_metadata_manager()
+        .register_region_table_info(
+            region_id.table_id(),
+            "test_table",
+            "test_catalog",
+            "test_schema",
+            None,
+            env.get_kv_backend(),
+        )
+        .await;
+
+    let topic = prepare_test_for_kafka_log_store(&factory).await;
+    let request = CreateRequestBuilder::new()
+        .kafka_topic(topic.clone())
+        .build();
+    let column_schemas = rows_schema(&request);
+    engine
+        .handle_request(region_id, RegionRequest::Create(request.clone()))
+        .await
+        .unwrap();
+
+    let region = engine.get_region(region_id).unwrap();
+    assert_eq!(region.topic_latest_entry_id.load(Ordering::Relaxed), 0);
+
+    let rows = Rows {
+        schema: column_schemas.clone(),
+        rows: build_rows_for_key("a", 0, 2, 0),
+    };
+    put_rows(&engine, region_id, rows.clone()).await;
+
+    let request = RegionFlushRequest::default();
+    engine
+        .handle_request(region_id, RegionRequest::Flush(request.clone()))
+        .await
+        .unwrap();
+    // Wait until flush is finished.
+    listener.wait().await;
+    assert_eq!(region.topic_latest_entry_id.load(Ordering::Relaxed), 0);
+
+    engine
+        .handle_request(region_id, RegionRequest::Flush(request.clone()))
+        .await
+        .unwrap();
+    assert_eq!(region.topic_latest_entry_id.load(Ordering::Relaxed), 1);
 }

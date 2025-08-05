@@ -24,13 +24,12 @@ use table::table_name::TableName;
 
 use crate::flow_name::FlowName;
 use crate::key::schema_name::SchemaName;
-use crate::key::FlowId;
+use crate::key::{FlowId, FlowPartitionId};
 use crate::peer::Peer;
-use crate::{ClusterId, DatanodeId, FlownodeId};
+use crate::{DatanodeId, FlownodeId};
 
 #[derive(Eq, Hash, PartialEq, Clone, Debug, Serialize, Deserialize)]
 pub struct RegionIdent {
-    pub cluster_id: ClusterId,
     pub datanode_id: DatanodeId,
     pub table_id: TableId,
     pub region_number: RegionNumber,
@@ -47,8 +46,8 @@ impl Display for RegionIdent {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "RegionIdent(datanode_id='{}.{}', table_id={}, region_number={}, engine = {})",
-            self.cluster_id, self.datanode_id, self.table_id, self.region_number, self.engine
+            "RegionIdent(datanode_id='{}', table_id={}, region_number={}, engine = {})",
+            self.datanode_id, self.table_id, self.region_number, self.engine
         )
     }
 }
@@ -58,6 +57,8 @@ impl Display for RegionIdent {
 pub struct DowngradeRegionReply {
     /// Returns the `last_entry_id` if available.
     pub last_entry_id: Option<u64>,
+    /// Returns the `metadata_last_entry_id` if available (Only available for metric engine).
+    pub metadata_last_entry_id: Option<u64>,
     /// Indicates whether the region exists.
     pub exists: bool,
     /// Return error if any during the operation.
@@ -137,16 +138,14 @@ pub struct DowngradeRegion {
     /// `None` stands for don't flush before downgrading the region.
     #[serde(default)]
     pub flush_timeout: Option<Duration>,
-    /// Rejects all write requests after flushing.
-    pub reject_write: bool,
 }
 
 impl Display for DowngradeRegion {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "DowngradeRegion(region_id={}, flush_timeout={:?}, rejct_write={})",
-            self.region_id, self.flush_timeout, self.reject_write
+            "DowngradeRegion(region_id={}, flush_timeout={:?})",
+            self.region_id, self.flush_timeout,
         )
     }
 }
@@ -158,6 +157,8 @@ pub struct UpgradeRegion {
     pub region_id: RegionId,
     /// The `last_entry_id` of old leader region.
     pub last_entry_id: Option<u64>,
+    /// The `last_entry_id` of old leader metadata region (Only used for metric engine).
+    pub metadata_last_entry_id: Option<u64>,
     /// The timeout of waiting for a wal replay.
     ///
     /// `None` stands for no wait,
@@ -173,6 +174,8 @@ pub struct UpgradeRegion {
 /// The identifier of cache.
 pub enum CacheIdent {
     FlowId(FlowId),
+    /// Indicate change of address of flownode.
+    FlowNodeAddressChange(u64),
     FlowName(FlowName),
     TableId(TableId),
     TableName(TableName),
@@ -183,14 +186,25 @@ pub enum CacheIdent {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CreateFlow {
+    /// The unique identifier for the flow.
+    pub flow_id: FlowId,
     pub source_table_ids: Vec<TableId>,
-    pub flownodes: Vec<Peer>,
+    /// Mapping of flow partition to peer information
+    pub partition_to_peer_mapping: Vec<(FlowPartitionId, Peer)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DropFlow {
+    pub flow_id: FlowId,
     pub source_table_ids: Vec<TableId>,
-    pub flownode_ids: Vec<FlownodeId>,
+    /// Mapping of flow partition to flownode id
+    pub flow_part2node_id: Vec<(FlowPartitionId, FlownodeId)>,
+}
+
+/// Flushes a batch of regions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FlushRegions {
+    pub region_ids: Vec<RegionId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Display, PartialEq)]
@@ -209,6 +223,10 @@ pub enum Instruction {
     DowngradeRegion(DowngradeRegion),
     /// Invalidates batch cache.
     InvalidateCaches(Vec<CacheIdent>),
+    /// Flushes regions.
+    FlushRegions(FlushRegions),
+    /// Flushes a single region.
+    FlushRegion(RegionId),
 }
 
 /// The reply of [UpgradeRegion].
@@ -239,6 +257,7 @@ pub enum InstructionReply {
     CloseRegion(SimpleReply),
     UpgradeRegion(UpgradeRegionReply),
     DowngradeRegion(DowngradeRegionReply),
+    FlushRegion(SimpleReply),
 }
 
 impl Display for InstructionReply {
@@ -250,6 +269,7 @@ impl Display for InstructionReply {
             Self::DowngradeRegion(reply) => {
                 write!(f, "InstructionReply::DowngradeRegion({})", reply)
             }
+            Self::FlushRegion(reply) => write!(f, "InstructionReply::FlushRegion({})", reply),
         }
     }
 }
@@ -262,7 +282,6 @@ mod tests {
     fn test_serialize_instruction() {
         let open_region = Instruction::OpenRegion(OpenRegion::new(
             RegionIdent {
-                cluster_id: 1,
                 datanode_id: 2,
                 table_id: 1024,
                 region_number: 1,
@@ -277,12 +296,11 @@ mod tests {
         let serialized = serde_json::to_string(&open_region).unwrap();
 
         assert_eq!(
-            r#"{"OpenRegion":{"region_ident":{"cluster_id":1,"datanode_id":2,"table_id":1024,"region_number":1,"engine":"mito2"},"region_storage_path":"test/foo","region_options":{},"region_wal_options":{},"skip_wal_replay":false}}"#,
+            r#"{"OpenRegion":{"region_ident":{"datanode_id":2,"table_id":1024,"region_number":1,"engine":"mito2"},"region_storage_path":"test/foo","region_options":{},"region_wal_options":{},"skip_wal_replay":false}}"#,
             serialized
         );
 
         let close_region = Instruction::CloseRegion(RegionIdent {
-            cluster_id: 1,
             datanode_id: 2,
             table_id: 1024,
             region_number: 1,
@@ -292,7 +310,7 @@ mod tests {
         let serialized = serde_json::to_string(&close_region).unwrap();
 
         assert_eq!(
-            r#"{"CloseRegion":{"cluster_id":1,"datanode_id":2,"table_id":1024,"region_number":1,"engine":"mito2"}}"#,
+            r#"{"CloseRegion":{"datanode_id":2,"table_id":1024,"region_number":1,"engine":"mito2"}}"#,
             serialized
         );
     }
@@ -307,7 +325,6 @@ mod tests {
     #[test]
     fn test_compatible_serialize_open_region() {
         let region_ident = RegionIdent {
-            cluster_id: 1,
             datanode_id: 2,
             table_id: 1024,
             region_number: 1,

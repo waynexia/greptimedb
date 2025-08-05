@@ -22,7 +22,6 @@ use datatypes::schema::{ColumnSchema, SchemaRef};
 use partition::manager::PartitionRuleManager;
 use session::context::{QueryContext, QueryContextRef};
 use snafu::{ensure, OptionExt, ResultExt};
-use sql::statements;
 use sql::statements::insert::Insert;
 use sqlparser::ast::{ObjectName, Value as SqlValue};
 use table::metadata::TableInfoRef;
@@ -63,7 +62,8 @@ impl<'a> StatementToRegion<'a> {
         stmt: &Insert,
         query_ctx: &QueryContextRef,
     ) -> Result<(InstantAndNormalInsertRequests, TableInfoRef)> {
-        let (catalog, schema, table_name) = self.get_full_name(stmt.table_name())?;
+        let name = stmt.table_name().context(ParseSqlSnafu)?;
+        let (catalog, schema, table_name) = self.get_full_name(name)?;
         let table = self.get_table(&catalog, &schema, &table_name).await?;
         let table_schema = table.schema();
         let table_info = table.table_info();
@@ -128,13 +128,14 @@ impl<'a> StatementToRegion<'a> {
                     column_schema,
                     &sql_row[i],
                     Some(&query_ctx.timezone()),
+                    query_ctx.auto_string_to_numeric(),
                 )?;
                 grpc_row.values.push(value);
             }
         }
 
         let requests = Partitioner::new(self.partition_manager)
-            .partition_insert_requests(table_info.table_id(), Rows { schema, rows })
+            .partition_insert_requests(&table_info, Rows { schema, rows })
             .await?;
         let requests = RegionInsertRequests { requests };
         if table_info.is_ttl_instant_table() {
@@ -204,10 +205,14 @@ fn column_names<'a>(stmt: &'a Insert, table_schema: &'a SchemaRef) -> Vec<&'a St
     }
 }
 
+/// Converts SQL value to gRPC value according to the column schema.
+/// If `auto_string_to_numeric` is true, tries to cast the string value to numeric values,
+/// and fills the default value if the cast fails.
 fn sql_value_to_grpc_value(
     column_schema: &ColumnSchema,
     sql_val: &SqlValue,
     timezone: Option<&Timezone>,
+    auto_string_to_numeric: bool,
 ) -> Result<GrpcValue> {
     let column = &column_schema.name;
     let value = if replace_default(sql_val) {
@@ -221,8 +226,15 @@ fn sql_value_to_grpc_value(
             column: column.clone(),
         })?
     } else {
-        statements::sql_value_to_value(column, &column_schema.data_type, sql_val, timezone, None)
-            .context(ParseSqlSnafu)?
+        common_sql::convert::sql_value_to_value(
+            column,
+            &column_schema.data_type,
+            sql_val,
+            timezone,
+            None,
+            auto_string_to_numeric,
+        )
+        .context(crate::error::SqlCommonSnafu)?
     };
 
     let grpc_value = value_to_grpc_value(value);

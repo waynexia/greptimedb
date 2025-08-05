@@ -19,7 +19,8 @@ mod information_memory_table;
 pub mod key_column_usage;
 mod partitions;
 mod procedure_info;
-mod region_peers;
+pub mod process_list;
+pub mod region_peers;
 mod region_statistics;
 mod runtime_metrics;
 pub mod schemata;
@@ -37,11 +38,13 @@ use common_meta::cluster::NodeInfo;
 use common_meta::datanode::RegionStat;
 use common_meta::key::flow::flow_state::FlowStat;
 use common_meta::key::flow::FlowMetadataManager;
+use common_meta::kv_backend::KvBackendRef;
 use common_procedure::ProcedureInfo;
 use common_recordbatch::SendableRecordBatchStream;
 use datatypes::schema::SchemaRef;
 use lazy_static::lazy_static;
 use paste::paste;
+use process_list::InformationSchemaProcessList;
 use store_api::storage::{ScanRequest, TableId};
 use table::metadata::TableType;
 use table::TableRef;
@@ -49,8 +52,8 @@ pub use table_names::*;
 use views::InformationSchemaViews;
 
 use self::columns::InformationSchemaColumns;
-use super::{SystemSchemaProviderInner, SystemTable, SystemTableRef};
 use crate::error::{Error, Result};
+use crate::process_manager::ProcessManagerRef;
 use crate::system_schema::information_schema::cluster_info::InformationSchemaClusterInfo;
 use crate::system_schema::information_schema::flows::InformationSchemaFlows;
 use crate::system_schema::information_schema::information_memory_table::get_schema_columns;
@@ -63,7 +66,9 @@ use crate::system_schema::information_schema::table_constraints::InformationSche
 use crate::system_schema::information_schema::tables::InformationSchemaTables;
 use crate::system_schema::memory_table::MemoryTable;
 pub(crate) use crate::system_schema::predicate::Predicates;
-use crate::system_schema::SystemSchemaProvider;
+use crate::system_schema::{
+    SystemSchemaProvider, SystemSchemaProviderInner, SystemTable, SystemTableRef,
+};
 use crate::CatalogManager;
 
 lazy_static! {
@@ -108,12 +113,36 @@ macro_rules! setup_memory_table {
     };
 }
 
+#[cfg(feature = "enterprise")]
+pub struct MakeInformationTableRequest {
+    pub catalog_name: String,
+    pub catalog_manager: Weak<dyn CatalogManager>,
+    pub kv_backend: KvBackendRef,
+}
+
+/// A factory trait for making information schema tables.
+///
+/// This trait allows for extensibility of the information schema by providing
+/// a way to dynamically create custom information schema tables.
+#[cfg(feature = "enterprise")]
+pub trait InformationSchemaTableFactory {
+    fn make_information_table(&self, req: MakeInformationTableRequest) -> SystemTableRef;
+}
+
+#[cfg(feature = "enterprise")]
+pub type InformationSchemaTableFactoryRef = Arc<dyn InformationSchemaTableFactory + Send + Sync>;
+
 /// The `information_schema` tables info provider.
 pub struct InformationSchemaProvider {
     catalog_name: String,
     catalog_manager: Weak<dyn CatalogManager>,
+    process_manager: Option<ProcessManagerRef>,
     flow_metadata_manager: Arc<FlowMetadataManager>,
     tables: HashMap<String, TableRef>,
+    #[allow(dead_code)]
+    kv_backend: KvBackendRef,
+    #[cfg(feature = "enterprise")]
+    extra_table_factories: HashMap<String, InformationSchemaTableFactoryRef>,
 }
 
 impl SystemSchemaProvider for InformationSchemaProvider {
@@ -123,6 +152,7 @@ impl SystemSchemaProvider for InformationSchemaProvider {
         &self.tables
     }
 }
+
 impl SystemSchemaProviderInner for InformationSchemaProvider {
     fn catalog_name(&self) -> &str {
         &self.catalog_name
@@ -132,6 +162,16 @@ impl SystemSchemaProviderInner for InformationSchemaProvider {
     }
 
     fn system_table(&self, name: &str) -> Option<SystemTableRef> {
+        #[cfg(feature = "enterprise")]
+        if let Some(factory) = self.extra_table_factories.get(name) {
+            let req = MakeInformationTableRequest {
+                catalog_name: self.catalog_name.clone(),
+                catalog_manager: self.catalog_manager.clone(),
+                kv_backend: self.kv_backend.clone(),
+            };
+            return Some(factory.make_information_table(req));
+        }
+
         match name.to_ascii_lowercase().as_str() {
             TABLES => Some(Arc::new(InformationSchemaTables::new(
                 self.catalog_name.clone(),
@@ -206,6 +246,10 @@ impl SystemSchemaProviderInner for InformationSchemaProvider {
                     self.catalog_manager.clone(),
                 ),
             ) as _),
+            PROCESS_LIST => self
+                .process_manager
+                .as_ref()
+                .map(|p| Arc::new(InformationSchemaProcessList::new(p.clone())) as _),
             _ => None,
         }
     }
@@ -216,17 +260,33 @@ impl InformationSchemaProvider {
         catalog_name: String,
         catalog_manager: Weak<dyn CatalogManager>,
         flow_metadata_manager: Arc<FlowMetadataManager>,
+        process_manager: Option<ProcessManagerRef>,
+        kv_backend: KvBackendRef,
     ) -> Self {
         let mut provider = Self {
             catalog_name,
             catalog_manager,
             flow_metadata_manager,
+            process_manager,
             tables: HashMap::new(),
+            kv_backend,
+            #[cfg(feature = "enterprise")]
+            extra_table_factories: HashMap::new(),
         };
 
         provider.build_tables();
 
         provider
+    }
+
+    #[cfg(feature = "enterprise")]
+    pub(crate) fn with_extra_table_factories(
+        mut self,
+        factories: HashMap<String, InformationSchemaTableFactoryRef>,
+    ) -> Self {
+        self.extra_table_factories = factories;
+        self.build_tables();
+        self
     }
 
     fn build_tables(&mut self) {
@@ -276,16 +336,22 @@ impl InformationSchemaProvider {
             self.build_table(TABLE_CONSTRAINTS).unwrap(),
         );
         tables.insert(FLOWS.to_string(), self.build_table(FLOWS).unwrap());
+        if let Some(process_list) = self.build_table(PROCESS_LIST) {
+            tables.insert(PROCESS_LIST.to_string(), process_list);
+        }
+        #[cfg(feature = "enterprise")]
+        for name in self.extra_table_factories.keys() {
+            tables.insert(name.to_string(), self.build_table(name).expect(name));
+        }
         // Add memory tables
         for name in MEMORY_TABLES.iter() {
             tables.insert((*name).to_string(), self.build_table(name).expect(name));
         }
-
         self.tables = tables;
     }
 }
 
-trait InformationTable {
+pub trait InformationTable {
     fn table_id(&self) -> TableId;
 
     fn table_name(&self) -> &'static str;

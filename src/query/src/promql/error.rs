@@ -17,6 +17,7 @@ use std::any::Any;
 use common_error::ext::ErrorExt;
 use common_error::status_code::StatusCode;
 use common_macro::stack_trace_debug;
+use common_time::timestamp::TimeUnit;
 use datafusion::error::DataFusionError;
 use promql::error::Error as PromqlError;
 use promql_parser::parser::token::TokenType;
@@ -192,6 +193,20 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+
+    #[snafu(display("Timestamp out of range: {} of {:?}", timestamp, unit))]
+    TimestampOutOfRange {
+        timestamp: i64,
+        unit: TimeUnit,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("vector cannot contain metrics with the same labelset"))]
+    SameLabelSet {
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 impl ErrorExt for Error {
@@ -211,7 +226,9 @@ impl ErrorExt for Error {
             | UnsupportedVectorMatch { .. }
             | CombineTableColumnMismatch { .. }
             | UnexpectedPlanExpr { .. }
-            | UnsupportedMatcherOp { .. } => StatusCode::InvalidArguments,
+            | UnsupportedMatcherOp { .. }
+            | SameLabelSet { .. }
+            | TimestampOutOfRange { .. } => StatusCode::InvalidArguments,
 
             UnknownTable { .. } => StatusCode::Internal,
 

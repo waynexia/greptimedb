@@ -16,22 +16,24 @@ use std::any::Any;
 use std::time::Duration;
 
 use api::v1::meta::MailboxMessage;
-use common_meta::distributed_time_constants::MAILBOX_RTT_SECS;
+use common_meta::distributed_time_constants::REGION_LEASE_SECS;
 use common_meta::instruction::{Instruction, InstructionReply, OpenRegion, SimpleReply};
 use common_meta::key::datanode_table::RegionInfo;
 use common_meta::RegionIdent;
-use common_procedure::Status;
+use common_procedure::{Context as ProcedureContext, Status};
 use common_telemetry::info;
 use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt};
+use tokio::time::Instant;
 
 use crate::error::{self, Result};
 use crate::handler::HeartbeatMailbox;
-use crate::procedure::region_migration::update_metadata::UpdateMetadata;
+use crate::procedure::region_migration::flush_leader_region::PreFlushRegion;
 use crate::procedure::region_migration::{Context, State};
 use crate::service::mailbox::Channel;
 
-const OPEN_CANDIDATE_REGION_TIMEOUT: Duration = Duration::from_secs(MAILBOX_RTT_SECS);
+/// Uses lease time of a region as the timeout of opening a candidate region.
+const OPEN_CANDIDATE_REGION_TIMEOUT: Duration = Duration::from_secs(REGION_LEASE_SECS);
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OpenCandidateRegion;
@@ -39,14 +41,17 @@ pub struct OpenCandidateRegion;
 #[async_trait::async_trait]
 #[typetag::serde]
 impl State for OpenCandidateRegion {
-    async fn next(&mut self, ctx: &mut Context) -> Result<(Box<dyn State>, Status)> {
+    async fn next(
+        &mut self,
+        ctx: &mut Context,
+        _procedure_ctx: &ProcedureContext,
+    ) -> Result<(Box<dyn State>, Status)> {
         let instruction = self.build_open_region_instruction(ctx).await?;
+        let now = Instant::now();
         self.open_candidate_region(ctx, instruction).await?;
+        ctx.update_open_candidate_region_elapsed(now);
 
-        Ok((
-            Box::new(UpdateMetadata::Downgrade),
-            Status::executing(false),
-        ))
+        Ok((Box::new(PreFlushRegion), Status::executing(false)))
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -61,7 +66,6 @@ impl OpenCandidateRegion {
     /// - Datanode Table is not found.
     async fn build_open_region_instruction(&self, ctx: &mut Context) -> Result<Instruction> {
         let pc = &ctx.persistent_ctx;
-        let cluster_id = pc.cluster_id;
         let table_id = pc.region_id.table_id();
         let region_number = pc.region_id.region_number();
         let candidate_id = pc.to_peer.id;
@@ -76,7 +80,6 @@ impl OpenCandidateRegion {
 
         let open_instruction = Instruction::OpenRegion(OpenRegion::new(
             RegionIdent {
-                cluster_id,
                 datanode_id: candidate_id,
                 table_id,
                 region_number,
@@ -127,7 +130,7 @@ impl OpenCandidateRegion {
 
         let msg = MailboxMessage::json_message(
             &format!("Open candidate region: {}", region_id),
-            &format!("Meta@{}", ctx.server_addr()),
+            &format!("Metasrv@{}", ctx.server_addr()),
             &format!("Datanode-{}@{}", candidate.id, candidate.addr),
             common_time::util::current_time_millis(),
             &open_instruction,
@@ -137,17 +140,20 @@ impl OpenCandidateRegion {
         })?;
 
         let ch = Channel::Datanode(candidate.id);
+        let now = Instant::now();
         let receiver = ctx
             .mailbox
             .send(&ch, msg, OPEN_CANDIDATE_REGION_TIMEOUT)
             .await?;
 
-        match receiver.await? {
+        match receiver.await {
             Ok(msg) => {
                 let reply = HeartbeatMailbox::json_reply(&msg)?;
                 info!(
-                    "Received open region reply: {:?}, region: {}",
-                    reply, region_id
+                    "Received open region reply: {:?}, region: {}, elapsed: {:?}",
+                    reply,
+                    region_id,
+                    now.elapsed()
                 );
                 let InstructionReply::OpenRegion(SimpleReply { result, error }) = reply else {
                     return error::UnexpectedInstructionReplySnafu {
@@ -162,8 +168,9 @@ impl OpenCandidateRegion {
                 } else {
                     error::RetryLaterSnafu {
                         reason: format!(
-                            "Region {region_id} is not opened by datanode {:?}, error: {error:?}",
+                            "Region {region_id} is not opened by datanode {:?}, error: {error:?}, elapsed: {:?}",
                             candidate,
+                            now.elapsed()
                         ),
                     }
                     .fail()
@@ -171,8 +178,9 @@ impl OpenCandidateRegion {
             }
             Err(error::Error::MailboxTimeout { .. }) => {
                 let reason = format!(
-                    "Mailbox received timeout for open candidate region {region_id} on datanode {:?}", 
+                    "Mailbox received timeout for open candidate region {region_id} on datanode {:?}, elapsed: {:?}",
                     candidate,
+                    now.elapsed()
                 );
                 error::RetryLaterSnafu { reason }.fail()
             }
@@ -196,10 +204,11 @@ mod tests {
 
     use super::*;
     use crate::error::Error;
-    use crate::procedure::region_migration::test_util::{
-        self, new_close_region_reply, new_open_region_reply, send_mock_reply, TestingEnv,
-    };
+    use crate::procedure::region_migration::test_util::{self, new_procedure_context, TestingEnv};
     use crate::procedure::region_migration::{ContextFactory, PersistentContext};
+    use crate::procedure::test_util::{
+        new_close_region_reply, new_open_region_reply, send_mock_reply,
+    };
 
     fn new_persistent_context() -> PersistentContext {
         test_util::new_persistent_context(1, 2, RegionId::new(1024, 1))
@@ -208,7 +217,6 @@ mod tests {
     fn new_mock_open_instruction(datanode_id: DatanodeId, region_id: RegionId) -> Instruction {
         Instruction::OpenRegion(OpenRegion {
             region_ident: RegionIdent {
-                cluster_id: 0,
                 datanode_id,
                 table_id: region_id.table_id(),
                 region_number: region_id.region_number(),
@@ -392,7 +400,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_next_update_metadata_downgrade_state() {
+    async fn test_next_flush_leader_region_state() {
         let mut state = Box::new(OpenCandidateRegion);
         // from_peer: 1
         // to_peer: 2
@@ -430,16 +438,15 @@ mod tests {
             .await;
 
         send_mock_reply(mailbox, rx, |id| Ok(new_open_region_reply(id, true, None)));
-
-        let (next, _) = state.next(&mut ctx).await.unwrap();
+        let procedure_ctx = new_procedure_context();
+        let (next, _) = state.next(&mut ctx, &procedure_ctx).await.unwrap();
         let vc = ctx.volatile_ctx;
         assert_eq!(
             vc.opening_region_guard.unwrap().info(),
             (to_peer_id, region_id)
         );
 
-        let update_metadata = next.as_any().downcast_ref::<UpdateMetadata>().unwrap();
-
-        assert_matches!(update_metadata, UpdateMetadata::Downgrade);
+        let flush_leader_region = next.as_any().downcast_ref::<PreFlushRegion>().unwrap();
+        assert_matches!(flush_leader_region, PreFlushRegion);
     }
 }

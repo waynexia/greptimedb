@@ -18,7 +18,7 @@ mod eq_list;
 mod in_list;
 mod regex_match;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 use common_telemetry::warn;
 use datafusion_common::ScalarValue;
@@ -27,24 +27,30 @@ use datatypes::data_type::ConcreteDataType;
 use datatypes::value::Value;
 use index::inverted_index::search::index_apply::PredicatesIndexApplier;
 use index::inverted_index::search::predicate::Predicate;
+use mito_codec::index::IndexValueCodec;
+use mito_codec::row_converter::SortField;
 use object_store::ObjectStore;
 use puffin::puffin_manager::cache::PuffinMetadataCacheRef;
 use snafu::{OptionExt, ResultExt};
 use store_api::metadata::RegionMetadata;
+use store_api::region_request::PathType;
 use store_api::storage::ColumnId;
 
 use crate::cache::file_cache::FileCacheRef;
 use crate::cache::index::inverted_index::InvertedIndexCacheRef;
-use crate::error::{BuildIndexApplierSnafu, ColumnNotFoundSnafu, ConvertValueSnafu, Result};
-use crate::row_converter::SortField;
-use crate::sst::index::codec::IndexValueCodec;
+use crate::error::{
+    BuildIndexApplierSnafu, ColumnNotFoundSnafu, ConvertValueSnafu, EncodeSnafu, Result,
+};
 use crate::sst::index::inverted_index::applier::InvertedIndexApplier;
 use crate::sst::index::puffin_manager::PuffinManagerFactory;
 
 /// Constructs an [`InvertedIndexApplier`] which applies predicates to SST files during scan.
 pub(crate) struct InvertedIndexApplierBuilder<'a> {
-    /// Directory of the region, required argument for constructing [`InvertedIndexApplier`].
-    region_dir: String,
+    /// Directory of the table, required argument for constructing [`InvertedIndexApplier`].
+    table_dir: String,
+
+    /// Path type for generating file paths.
+    path_type: PathType,
 
     /// Object store, required argument for constructing [`InvertedIndexApplier`].
     object_store: ObjectStore,
@@ -59,7 +65,7 @@ pub(crate) struct InvertedIndexApplierBuilder<'a> {
     indexed_column_ids: HashSet<ColumnId>,
 
     /// Stores predicates during traversal on the Expr tree.
-    output: HashMap<ColumnId, Vec<Predicate>>,
+    output: BTreeMap<ColumnId, Vec<Predicate>>,
 
     /// The puffin manager factory.
     puffin_manager_factory: PuffinManagerFactory,
@@ -74,18 +80,20 @@ pub(crate) struct InvertedIndexApplierBuilder<'a> {
 impl<'a> InvertedIndexApplierBuilder<'a> {
     /// Creates a new [`InvertedIndexApplierBuilder`].
     pub fn new(
-        region_dir: String,
+        table_dir: String,
+        path_type: PathType,
         object_store: ObjectStore,
         metadata: &'a RegionMetadata,
         indexed_column_ids: HashSet<ColumnId>,
         puffin_manager_factory: PuffinManagerFactory,
     ) -> Self {
         Self {
-            region_dir,
+            table_dir,
+            path_type,
             object_store,
             metadata,
             indexed_column_ids,
-            output: HashMap::default(),
+            output: BTreeMap::default(),
             puffin_manager_factory,
             file_cache: None,
             inverted_index_cache: None,
@@ -130,18 +138,19 @@ impl<'a> InvertedIndexApplierBuilder<'a> {
 
         let predicates = self
             .output
-            .into_iter()
-            .map(|(column_id, predicates)| (column_id.to_string(), predicates))
+            .iter()
+            .map(|(column_id, predicates)| (column_id.to_string(), predicates.clone()))
             .collect();
         let applier = PredicatesIndexApplier::try_from(predicates);
 
         Ok(Some(
             InvertedIndexApplier::new(
-                self.region_dir,
-                self.metadata.region_id,
+                self.table_dir,
+                self.path_type,
                 self.object_store,
                 Box::new(applier.context(BuildIndexApplierSnafu)?),
                 self.puffin_manager_factory,
+                self.output,
             )
             .with_file_cache(self.file_cache)
             .with_puffin_metadata_cache(self.puffin_metadata_cache)
@@ -229,7 +238,8 @@ impl<'a> InvertedIndexApplierBuilder<'a> {
         let value = Value::try_from(lit.clone()).context(ConvertValueSnafu)?;
         let mut bytes = vec![];
         let field = SortField::new(data_type);
-        IndexValueCodec::encode_nonnull_value(value.as_value_ref(), &field, &mut bytes)?;
+        IndexValueCodec::encode_nonnull_value(value.as_value_ref(), &field, &mut bytes)
+            .context(EncodeSnafu)?;
         Ok(bytes)
     }
 }
@@ -287,31 +297,19 @@ mod tests {
     }
 
     pub(crate) fn tag_column() -> Expr {
-        Expr::Column(Column {
-            relation: None,
-            name: "a".to_string(),
-        })
+        Expr::Column(Column::from_name("a"))
     }
 
     pub(crate) fn tag_column2() -> Expr {
-        Expr::Column(Column {
-            relation: None,
-            name: "b".to_string(),
-        })
+        Expr::Column(Column::from_name("b"))
     }
 
     pub(crate) fn field_column() -> Expr {
-        Expr::Column(Column {
-            relation: None,
-            name: "c".to_string(),
-        })
+        Expr::Column(Column::from_name("c"))
     }
 
     pub(crate) fn nonexistent_column() -> Expr {
-        Expr::Column(Column {
-            relation: None,
-            name: "nonexistent".to_string(),
-        })
+        Expr::Column(Column::from_name("nonexistence"))
     }
 
     pub(crate) fn string_lit(s: impl Into<String>) -> Expr {
@@ -351,6 +349,7 @@ mod tests {
         let metadata = test_region_metadata();
         let mut builder = InvertedIndexApplierBuilder::new(
             "test".to_string(),
+            PathType::Bare,
             test_object_store(),
             &metadata,
             HashSet::from_iter([1, 2, 3]),

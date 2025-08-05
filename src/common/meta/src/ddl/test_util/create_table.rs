@@ -18,7 +18,9 @@ use api::v1::column_def::try_as_column_schema;
 use api::v1::meta::Partition;
 use api::v1::{ColumnDataType, ColumnDef, CreateTableExpr, SemanticType};
 use chrono::DateTime;
-use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, MITO2_ENGINE};
+use common_catalog::consts::{
+    DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, MITO2_ENGINE, MITO_ENGINE,
+};
 use datatypes::schema::RawSchema;
 use derive_builder::Builder;
 use store_api::storage::TableId;
@@ -130,6 +132,7 @@ pub fn build_raw_table_info_from_expr(expr: &CreateTableExpr) -> RawTableInfo {
             options: TableOptions::try_from_iter(&expr.table_options).unwrap(),
             created_on: DateTime::default(),
             partition_key_indices: vec![],
+            column_ids: vec![],
         },
         table_type: TableType::Base,
     }
@@ -164,6 +167,7 @@ pub fn test_create_table_task(name: &str, table_id: TableId) -> CreateTableTask 
         .time_index("ts")
         .primary_keys(["host".into()])
         .table_name(name)
+        .engine(MITO_ENGINE)
         .build()
         .unwrap()
         .into();
@@ -171,10 +175,7 @@ pub fn test_create_table_task(name: &str, table_id: TableId) -> CreateTableTask 
     CreateTableTask {
         create_table,
         // Single region
-        partitions: vec![Partition {
-            column_list: vec![],
-            value_list: vec![],
-        }],
+        partitions: vec![Partition::default()],
         table_info,
     }
 }

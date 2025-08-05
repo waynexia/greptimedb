@@ -17,7 +17,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use api::v1::meta::{HeartbeatRequest, NodeInfo, Peer, RegionRole, RegionStat};
+use api::v1::meta::heartbeat_request::NodeWorkloads;
+use api::v1::meta::{DatanodeWorkloads, HeartbeatRequest, NodeInfo, Peer, RegionRole, RegionStat};
+use common_base::Plugins;
 use common_meta::cache_invalidator::CacheInvalidatorRef;
 use common_meta::datanode::REGION_STATISTIC_KEY;
 use common_meta::distributed_time_constants::META_KEEP_ALIVE_INTERVAL_SECS;
@@ -29,6 +31,7 @@ use common_meta::heartbeat::handler::{
 use common_meta::heartbeat::mailbox::{HeartbeatMailbox, MailboxRef};
 use common_meta::heartbeat::utils::outgoing_message_to_mailbox_message;
 use common_telemetry::{debug, error, info, trace, warn};
+use common_workload::DatanodeWorkloadType;
 use meta_client::client::{HeartbeatSender, MetaClient};
 use meta_client::MetaClientRef;
 use servers::addrs;
@@ -37,7 +40,7 @@ use tokio::sync::{mpsc, Notify};
 use tokio::time::Instant;
 
 use self::handler::RegionHeartbeatResponseHandler;
-use crate::alive_keeper::RegionAliveKeeper;
+use crate::alive_keeper::{CountdownTaskHandlerExtRef, RegionAliveKeeper};
 use crate::config::DatanodeOptions;
 use crate::error::{self, MetaClientInitSnafu, Result};
 use crate::event_listener::RegionServerEventReceiver;
@@ -50,6 +53,7 @@ pub(crate) mod task_tracker;
 /// The datanode heartbeat task which sending `[HeartbeatRequest]` to Metasrv periodically in background.
 pub struct HeartbeatTask {
     node_id: u64,
+    workload_types: Vec<DatanodeWorkloadType>,
     node_epoch: u64,
     peer_addr: String,
     running: Arc<AtomicBool>,
@@ -73,9 +77,12 @@ impl HeartbeatTask {
         region_server: RegionServer,
         meta_client: MetaClientRef,
         cache_invalidator: CacheInvalidatorRef,
+        plugins: Plugins,
     ) -> Result<Self> {
+        let countdown_task_handler_ext = plugins.get::<CountdownTaskHandlerExtRef>();
         let region_alive_keeper = Arc::new(RegionAliveKeeper::new(
             region_server.clone(),
+            countdown_task_handler_ext,
             opts.heartbeat.interval.as_millis() as u64,
         ));
         let resp_handler_executor = Arc::new(HandlerGroupExecutor::new(vec![
@@ -87,6 +94,7 @@ impl HeartbeatTask {
 
         Ok(Self {
             node_id: opts.node_id.unwrap_or(0),
+            workload_types: opts.workload_types.clone(),
             // We use datanode's start time millis as the node's epoch.
             node_epoch: common_time::util::current_time_millis() as u64,
             peer_addr: addrs::resolve_addr(&opts.grpc.bind_addr, Some(&opts.grpc.server_addr)),
@@ -217,6 +225,7 @@ impl HeartbeatTask {
             addr: addr.clone(),
         });
         let epoch = self.region_alive_keeper.epoch();
+        let workload_types = self.workload_types.clone();
 
         self.region_alive_keeper.start(Some(event_receiver)).await?;
         let mut last_sent = Instant::now();
@@ -235,6 +244,9 @@ impl HeartbeatTask {
                     start_time_ms: node_epoch,
                     cpus: num_cpus::get() as u32,
                 }),
+                node_workloads: Some(NodeWorkloads::Datanode(DatanodeWorkloads {
+                    types: workload_types.iter().map(|w| w.to_i32()).collect(),
+                })),
                 ..Default::default()
             };
 

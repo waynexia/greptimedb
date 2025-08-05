@@ -78,7 +78,7 @@ pub const INFORMATION_SCHEMA_ROUTINES_TABLE_ID: u32 = 21;
 pub const INFORMATION_SCHEMA_SCHEMA_PRIVILEGES_TABLE_ID: u32 = 22;
 /// id for information_schema.TABLE_PRIVILEGES
 pub const INFORMATION_SCHEMA_TABLE_PRIVILEGES_TABLE_ID: u32 = 23;
-/// id for information_schema.TRIGGERS
+/// id for information_schema.TRIGGERS (for mysql)
 pub const INFORMATION_SCHEMA_TRIGGERS_TABLE_ID: u32 = 24;
 /// id for information_schema.GLOBAL_STATUS
 pub const INFORMATION_SCHEMA_GLOBAL_STATUS_TABLE_ID: u32 = 25;
@@ -102,6 +102,8 @@ pub const INFORMATION_SCHEMA_FLOW_TABLE_ID: u32 = 33;
 pub const INFORMATION_SCHEMA_PROCEDURE_INFO_TABLE_ID: u32 = 34;
 /// id for information_schema.region_statistics
 pub const INFORMATION_SCHEMA_REGION_STATISTICS_TABLE_ID: u32 = 35;
+/// id for information_schema.process_list
+pub const INFORMATION_SCHEMA_PROCESS_LIST_TABLE_ID: u32 = 36;
 
 // ----- End of information_schema tables -----
 
@@ -130,3 +132,19 @@ pub const SEMANTIC_TYPE_TIME_INDEX: &str = "TIMESTAMP";
 pub fn is_readonly_schema(schema: &str) -> bool {
     matches!(schema, INFORMATION_SCHEMA_NAME)
 }
+
+// ---- special table and fields ----
+pub const TRACE_ID_COLUMN: &str = "trace_id";
+pub const SPAN_ID_COLUMN: &str = "span_id";
+pub const SPAN_NAME_COLUMN: &str = "span_name";
+pub const SERVICE_NAME_COLUMN: &str = "service_name";
+pub const PARENT_SPAN_ID_COLUMN: &str = "parent_span_id";
+pub const TRACE_TABLE_NAME: &str = "opentelemetry_traces";
+pub const TRACE_TABLE_NAME_SESSION_KEY: &str = "trace_table_name";
+// ---- End of special table and fields ----
+
+/// Generate the trace services table name from the trace table name by adding `_services` suffix.
+pub fn trace_services_table_name(trace_table_name: &str) -> String {
+    format!("{}_services", trace_table_name)
+}
+// ---- End of special table and fields ----

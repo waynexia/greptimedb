@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(feature = "enterprise")]
+pub mod trigger;
+
 use std::collections::{HashMap, HashSet};
 
 use api::helper::ColumnDataTypeWrapper;
@@ -21,16 +24,19 @@ use api::v1::column_def::options_from_column_schema;
 use api::v1::{
     set_index, unset_index, AddColumn, AddColumns, AlterDatabaseExpr, AlterTableExpr, Analyzer,
     ColumnDataType, ColumnDataTypeExtension, CreateFlowExpr, CreateTableExpr, CreateViewExpr,
-    DropColumn, DropColumns, ExpireAfter, ModifyColumnType, ModifyColumnTypes, RenameTable,
-    SemanticType, SetDatabaseOptions, SetFulltext, SetIndex, SetInverted, SetSkipping,
-    SetTableOptions, SkippingIndexType as PbSkippingIndexType, TableName, UnsetDatabaseOptions,
-    UnsetFulltext, UnsetIndex, UnsetInverted, UnsetSkipping, UnsetTableOptions,
+    DropColumn, DropColumns, DropDefaults, ExpireAfter, FulltextBackend as PbFulltextBackend,
+    ModifyColumnType, ModifyColumnTypes, RenameTable, SemanticType, SetDatabaseOptions,
+    SetDefaults, SetFulltext, SetIndex, SetIndexes, SetInverted, SetSkipping, SetTableOptions,
+    SkippingIndexType as PbSkippingIndexType, TableName, UnsetDatabaseOptions, UnsetFulltext,
+    UnsetIndex, UnsetIndexes, UnsetInverted, UnsetSkipping, UnsetTableOptions,
 };
 use common_error::ext::BoxedError;
 use common_grpc_expr::util::ColumnExpr;
 use common_time::Timezone;
 use datafusion::sql::planner::object_name_to_table_reference;
-use datatypes::schema::{ColumnSchema, FulltextAnalyzer, Schema, SkippingIndexType, COMMENT_KEY};
+use datatypes::schema::{
+    ColumnSchema, FulltextAnalyzer, FulltextBackend, Schema, SkippingIndexType, COMMENT_KEY,
+};
 use file_engine::FileOptions;
 use query::sql::{
     check_file_to_table_schema_compatibility, file_column_schemas_to_table,
@@ -52,6 +58,8 @@ use sql::statements::{
 use sql::util::extract_tables_from_query;
 use table::requests::{TableOptions, FILE_TABLE_META_KEY};
 use table::table_reference::TableReference;
+#[cfg(feature = "enterprise")]
+pub use trigger::to_create_trigger_task_expr;
 
 use crate::error::{
     BuildCreateExprOnInsertionSnafu, ColumnDataTypeSnafu, ConvertColumnDefaultConstraintSnafu,
@@ -81,7 +89,7 @@ pub fn create_table_expr_by_column_schemas(
     Ok(expr)
 }
 
-pub(crate) fn extract_add_columns_expr(
+pub fn extract_add_columns_expr(
     schema: &Schema,
     column_exprs: Vec<ColumnExpr>,
 ) -> Result<Option<AddColumns>> {
@@ -433,6 +441,7 @@ fn columns_to_column_schemas(
         .collect::<Result<Vec<ColumnSchema>>>()
 }
 
+// TODO(weny): refactor this function to use `try_as_column_def`
 pub fn column_schemas_to_defs(
     column_schemas: Vec<ColumnSchema>,
     primary_keys: &[String],
@@ -568,56 +577,108 @@ pub(crate) fn to_alter_table_expr(
         AlterTableOperation::UnsetTableOptions { keys } => {
             AlterTableKind::UnsetTableOptions(UnsetTableOptions { keys })
         }
-        AlterTableOperation::SetIndex { options } => AlterTableKind::SetIndex(match options {
-            sql::statements::alter::SetIndexOperation::Fulltext {
-                column_name,
-                options,
-            } => SetIndex {
-                options: Some(set_index::Options::Fulltext(SetFulltext {
-                    column_name: column_name.value,
-                    enable: options.enable,
-                    analyzer: match options.analyzer {
-                        FulltextAnalyzer::English => Analyzer::English.into(),
-                        FulltextAnalyzer::Chinese => Analyzer::Chinese.into(),
-                    },
-                    case_sensitive: options.case_sensitive,
-                })),
-            },
-            sql::statements::alter::SetIndexOperation::Inverted { column_name } => SetIndex {
-                options: Some(set_index::Options::Inverted(SetInverted {
-                    column_name: column_name.value,
-                })),
-            },
-            sql::statements::alter::SetIndexOperation::Skipping {
-                column_name,
-                options,
-            } => SetIndex {
-                options: Some(set_index::Options::Skipping(SetSkipping {
-                    column_name: column_name.value,
-                    enable: true,
-                    granularity: options.granularity as u64,
-                    skipping_index_type: match options.index_type {
-                        SkippingIndexType::BloomFilter => PbSkippingIndexType::BloomFilter.into(),
-                    },
-                })),
-            },
-        }),
-        AlterTableOperation::UnsetIndex { options } => AlterTableKind::UnsetIndex(match options {
-            sql::statements::alter::UnsetIndexOperation::Fulltext { column_name } => UnsetIndex {
-                options: Some(unset_index::Options::Fulltext(UnsetFulltext {
-                    column_name: column_name.value,
-                })),
-            },
-            sql::statements::alter::UnsetIndexOperation::Inverted { column_name } => UnsetIndex {
-                options: Some(unset_index::Options::Inverted(UnsetInverted {
-                    column_name: column_name.value,
-                })),
-            },
-            sql::statements::alter::UnsetIndexOperation::Skipping { column_name } => UnsetIndex {
-                options: Some(unset_index::Options::Skipping(UnsetSkipping {
-                    column_name: column_name.value,
-                })),
-            },
+        AlterTableOperation::SetIndex { options } => {
+            let option = match options {
+                sql::statements::alter::SetIndexOperation::Fulltext {
+                    column_name,
+                    options,
+                } => SetIndex {
+                    options: Some(set_index::Options::Fulltext(SetFulltext {
+                        column_name: column_name.value,
+                        enable: options.enable,
+                        analyzer: match options.analyzer {
+                            FulltextAnalyzer::English => Analyzer::English.into(),
+                            FulltextAnalyzer::Chinese => Analyzer::Chinese.into(),
+                        },
+                        case_sensitive: options.case_sensitive,
+                        backend: match options.backend {
+                            FulltextBackend::Bloom => PbFulltextBackend::Bloom.into(),
+                            FulltextBackend::Tantivy => PbFulltextBackend::Tantivy.into(),
+                        },
+                        granularity: options.granularity as u64,
+                        false_positive_rate: options.false_positive_rate(),
+                    })),
+                },
+                sql::statements::alter::SetIndexOperation::Inverted { column_name } => SetIndex {
+                    options: Some(set_index::Options::Inverted(SetInverted {
+                        column_name: column_name.value,
+                    })),
+                },
+                sql::statements::alter::SetIndexOperation::Skipping {
+                    column_name,
+                    options,
+                } => SetIndex {
+                    options: Some(set_index::Options::Skipping(SetSkipping {
+                        column_name: column_name.value,
+                        enable: true,
+                        granularity: options.granularity as u64,
+                        false_positive_rate: options.false_positive_rate(),
+                        skipping_index_type: match options.index_type {
+                            SkippingIndexType::BloomFilter => {
+                                PbSkippingIndexType::BloomFilter.into()
+                            }
+                        },
+                    })),
+                },
+            };
+            AlterTableKind::SetIndexes(SetIndexes {
+                set_indexes: vec![option],
+            })
+        }
+        AlterTableOperation::UnsetIndex { options } => {
+            let option = match options {
+                sql::statements::alter::UnsetIndexOperation::Fulltext { column_name } => {
+                    UnsetIndex {
+                        options: Some(unset_index::Options::Fulltext(UnsetFulltext {
+                            column_name: column_name.value,
+                        })),
+                    }
+                }
+                sql::statements::alter::UnsetIndexOperation::Inverted { column_name } => {
+                    UnsetIndex {
+                        options: Some(unset_index::Options::Inverted(UnsetInverted {
+                            column_name: column_name.value,
+                        })),
+                    }
+                }
+                sql::statements::alter::UnsetIndexOperation::Skipping { column_name } => {
+                    UnsetIndex {
+                        options: Some(unset_index::Options::Skipping(UnsetSkipping {
+                            column_name: column_name.value,
+                        })),
+                    }
+                }
+            };
+
+            AlterTableKind::UnsetIndexes(UnsetIndexes {
+                unset_indexes: vec![option],
+            })
+        }
+        AlterTableOperation::DropDefaults { columns } => {
+            AlterTableKind::DropDefaults(DropDefaults {
+                drop_defaults: columns
+                    .into_iter()
+                    .map(|col| {
+                        let column_name = col.0.to_string();
+                        Ok(api::v1::DropDefault { column_name })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            })
+        }
+        AlterTableOperation::SetDefaults { defaults } => AlterTableKind::SetDefaults(SetDefaults {
+            set_defaults: defaults
+                .into_iter()
+                .map(|col| {
+                    let column_name = col.column_name.to_string();
+                    let default_constraint = serde_json::to_string(&col.default_constraint)
+                        .context(EncodeJsonSnafu)?
+                        .into_bytes();
+                    Ok(api::v1::SetDefault {
+                        column_name,
+                        default_constraint,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
         }),
     };
 
@@ -774,7 +835,76 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_create_flow_tql_expr() {
+        let sql = r#"
+CREATE FLOW calc_reqs SINK TO cnt_reqs AS
+TQL EVAL (0, 15, '5s') count_values("status_code", http_requests);"#;
+        let stmt =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap()
+                .pop()
+                .unwrap();
+
+        let Statement::CreateFlow(create_flow) = stmt else {
+            unreachable!()
+        };
+        let expr = to_create_flow_task_expr(create_flow, &QueryContext::arc()).unwrap();
+
+        let to_dot_sep =
+            |c: TableName| format!("{}.{}.{}", c.catalog_name, c.schema_name, c.table_name);
+        assert_eq!("calc_reqs", expr.flow_name);
+        assert_eq!("greptime", expr.catalog_name);
+        assert_eq!(
+            "greptime.public.cnt_reqs",
+            expr.sink_table_name.map(to_dot_sep).unwrap()
+        );
+        assert!(expr.source_table_names.is_empty());
+        assert_eq!(
+            r#"TQL EVAL (0, 15, '5s') count_values("status_code", http_requests)"#,
+            expr.sql
+        );
+    }
+
+    #[test]
     fn test_create_flow_expr() {
+        let sql = r"
+CREATE FLOW test_distinct_basic SINK TO out_distinct_basic AS
+SELECT
+    DISTINCT number as dis
+FROM
+    distinct_basic;";
+        let stmt =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap()
+                .pop()
+                .unwrap();
+
+        let Statement::CreateFlow(create_flow) = stmt else {
+            unreachable!()
+        };
+        let expr = to_create_flow_task_expr(create_flow, &QueryContext::arc()).unwrap();
+
+        let to_dot_sep =
+            |c: TableName| format!("{}.{}.{}", c.catalog_name, c.schema_name, c.table_name);
+        assert_eq!("test_distinct_basic", expr.flow_name);
+        assert_eq!("greptime", expr.catalog_name);
+        assert_eq!(
+            "greptime.public.out_distinct_basic",
+            expr.sink_table_name.map(to_dot_sep).unwrap()
+        );
+        assert_eq!(1, expr.source_table_names.len());
+        assert_eq!(
+            "greptime.public.distinct_basic",
+            to_dot_sep(expr.source_table_names[0].clone())
+        );
+        assert_eq!(
+            r"SELECT
+    DISTINCT number as dis
+FROM
+    distinct_basic",
+            expr.sql
+        );
+
         let sql = r"
 CREATE FLOW `task_2`
 SINK TO schema_1.table_1

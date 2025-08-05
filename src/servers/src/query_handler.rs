@@ -32,16 +32,15 @@ use std::sync::Arc;
 use api::prom_store::remote::ReadRequest;
 use api::v1::RowInsertRequests;
 use async_trait::async_trait;
+use catalog::CatalogManager;
 use common_query::Output;
+use datatypes::timestamp::TimestampNanosecond;
 use headers::HeaderValue;
 use log_query::LogQuery;
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
-use pipeline::{
-    GreptimePipelineParams, GreptimeTransformer, Pipeline, PipelineInfo, PipelineVersion,
-    PipelineWay,
-};
+use pipeline::{GreptimePipelineParams, Pipeline, PipelineInfo, PipelineVersion, PipelineWay};
 use serde_json::Value;
 use session::context::{QueryContext, QueryContextRef};
 
@@ -107,7 +106,10 @@ pub trait OpenTelemetryProtocolHandler: PipelineHandler {
     /// Handling opentelemetry traces request
     async fn traces(
         &self,
+        pipeline_handler: PipelineHandlerRef,
         request: ExportTraceServiceRequest,
+        pipeline: PipelineWay,
+        pipeline_params: GreptimePipelineParams,
         table_name: String,
         ctx: QueryContextRef,
     ) -> Result<Output>;
@@ -120,7 +122,7 @@ pub trait OpenTelemetryProtocolHandler: PipelineHandler {
         pipeline_params: GreptimePipelineParams,
         table_name: String,
         ctx: QueryContextRef,
-    ) -> Result<Output>;
+    ) -> Result<Vec<Output>>;
 }
 
 /// PipelineHandler is responsible for handling pipeline related requests.
@@ -139,7 +141,7 @@ pub trait PipelineHandler {
         name: &str,
         version: PipelineVersion,
         query_ctx: QueryContextRef,
-    ) -> Result<Arc<Pipeline<GreptimeTransformer>>>;
+    ) -> Result<Arc<Pipeline>>;
 
     async fn insert_pipeline(
         &self,
@@ -163,13 +165,25 @@ pub trait PipelineHandler {
     ) -> std::result::Result<Option<Arc<table::Table>>, catalog::error::Error>;
 
     //// Build a pipeline from a string.
-    fn build_pipeline(&self, pipeline: &str) -> Result<Pipeline<GreptimeTransformer>>;
+    fn build_pipeline(&self, pipeline: &str) -> Result<Pipeline>;
+
+    /// Get a original pipeline by name.
+    async fn get_pipeline_str(
+        &self,
+        name: &str,
+        version: PipelineVersion,
+        query_ctx: QueryContextRef,
+    ) -> Result<(String, TimestampNanosecond)>;
 }
 
 /// Handle log query requests.
 #[async_trait]
 pub trait LogQueryHandler {
+    /// Execute a log query.
     async fn query(&self, query: LogQuery, ctx: QueryContextRef) -> Result<Output>;
+
+    /// Get catalog manager.
+    fn catalog_manager(&self, ctx: &QueryContext) -> Result<&dyn CatalogManager>;
 }
 
 /// Handle Jaeger query requests.
@@ -184,10 +198,21 @@ pub trait JaegerQueryHandler {
         ctx: QueryContextRef,
         service_name: &str,
         span_kind: Option<&str>,
+        start_time: Option<i64>,
+        end_time: Option<i64>,
     ) -> Result<Output>;
 
-    /// Get trace by trace id. It's used for `/api/traces/{trace_id}` API.
-    async fn get_trace(&self, ctx: QueryContextRef, trace_id: &str) -> Result<Output>;
+    /// Retrieves a trace by its unique identifier.
+    ///
+    /// This method is used to handle requests to the `/api/traces/{trace_id}` endpoint.
+    /// It accepts optional `start_time` and `end_time` parameters in nanoseconds to filter the trace data within a specific time range.
+    async fn get_trace(
+        &self,
+        ctx: QueryContextRef,
+        trace_id: &str,
+        start_time: Option<i64>,
+        end_time: Option<i64>,
+    ) -> Result<Output>;
 
     /// Find traces by query params. It's used for `/api/traces` API.
     async fn find_traces(

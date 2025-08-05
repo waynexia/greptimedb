@@ -14,16 +14,17 @@
 
 use common_telemetry::debug;
 use snafu::OptionExt;
+use vrl::value::Value as VrlValue;
 use yaml_rust::Yaml;
 
-use crate::etl::error::{
+use crate::error::{
     Error, FieldRequiredForDispatcherSnafu, Result, TableSuffixRequiredForDispatcherRuleSnafu,
     ValueRequiredForDispatcherRuleSnafu,
 };
-use crate::{PipelineMap, Value};
+use crate::etl::ctx_req::TABLE_SUFFIX_KEY;
+use crate::etl::value::yaml_to_vrl_value;
 
 const FIELD: &str = "field";
-const TABLE_SUFFIX: &str = "table_suffix";
 const PIPELINE: &str = "pipeline";
 const VALUE: &str = "value";
 const RULES: &str = "rules";
@@ -62,7 +63,7 @@ pub(crate) struct Dispatcher {
 ///   name
 #[derive(Debug, PartialEq)]
 pub(crate) struct Rule {
-    pub value: Value,
+    pub value: VrlValue,
     pub table_suffix: String,
     pub pipeline: Option<String>,
 }
@@ -80,7 +81,7 @@ impl TryFrom<&Yaml> for Dispatcher {
             rules
                 .iter()
                 .map(|rule| {
-                    let table_part = rule[TABLE_SUFFIX]
+                    let table_part = rule[TABLE_SUFFIX_KEY]
                         .as_str()
                         .map(|s| s.to_string())
                         .context(TableSuffixRequiredForDispatcherRuleSnafu)?;
@@ -90,7 +91,8 @@ impl TryFrom<&Yaml> for Dispatcher {
                     if rule[VALUE].is_badvalue() {
                         ValueRequiredForDispatcherRuleSnafu.fail()?;
                     }
-                    let value = Value::try_from(&rule[VALUE])?;
+
+                    let value = yaml_to_vrl_value(&rule[VALUE])?;
 
                     Ok(Rule {
                         value,
@@ -109,8 +111,9 @@ impl TryFrom<&Yaml> for Dispatcher {
 
 impl Dispatcher {
     /// execute dispatcher and returns matched rule if any
-    pub(crate) fn exec(&self, data: &PipelineMap) -> Option<&Rule> {
-        if let Some(value) = data.get(&self.field) {
+    pub(crate) fn exec(&self, data: &VrlValue) -> Option<&Rule> {
+        let data = data.as_object()?;
+        if let Some(value) = data.get(self.field.as_str()) {
             for rule in &self.rules {
                 if rule.value == *value {
                     return Some(rule);
@@ -119,7 +122,7 @@ impl Dispatcher {
 
             None
         } else {
-            debug!("field {} not found in keys {:?}", &self.field, data.keys());
+            debug!("field {} not found in keys {:?}", &self.field, data);
             None
         }
     }

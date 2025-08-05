@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common_meta::distributed_time_constants::{META_KEEP_ALIVE_INTERVAL_SECS, META_LEASE_SECS};
+use common_meta::key::{CANDIDATES_ROOT, ELECTION_KEY};
 use common_telemetry::{error, info, warn};
 use etcd_client::{
     Client, GetOptions, LeaderKey as EtcdLeaderKey, LeaseKeepAliveStream, LeaseKeeper, PutOptions,
@@ -27,8 +28,8 @@ use tokio::sync::broadcast::Receiver;
 use tokio::time::{timeout, MissedTickBehavior};
 
 use crate::election::{
-    listen_leader_change, Election, LeaderChangeMessage, LeaderKey, CANDIDATES_ROOT,
-    CANDIDATE_LEASE_SECS, ELECTION_KEY, KEEP_ALIVE_INTERVAL_SECS,
+    listen_leader_change, send_leader_change_and_set_flags, Election, LeaderChangeMessage,
+    LeaderKey, CANDIDATE_LEASE_SECS, KEEP_ALIVE_INTERVAL_SECS,
 };
 use crate::error;
 use crate::error::Result;
@@ -121,7 +122,7 @@ impl Election for EtcdElection {
 
     fn in_leader_infancy(&self) -> bool {
         self.infancy
-            .compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed)
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
 
@@ -247,18 +248,12 @@ impl Election for EtcdElection {
                 }
             }
 
-            if self
-                .is_leader
-                .compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                if let Err(e) = self
-                    .leader_watcher
-                    .send(LeaderChangeMessage::StepDown(Arc::new(leader.clone())))
-                {
-                    error!(e; "Failed to send leader change message");
-                }
-            }
+            send_leader_change_and_set_flags(
+                &self.is_leader,
+                &self.infancy,
+                &self.leader_watcher,
+                LeaderChangeMessage::StepDown(Arc::new(leader.clone())),
+            );
         }
 
         Ok(())
@@ -305,20 +300,12 @@ impl EtcdElection {
             );
 
             // Only after a successful `keep_alive` is the leader considered official.
-            if self
-                .is_leader
-                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                self.infancy.store(true, Ordering::Relaxed);
-
-                if let Err(e) = self
-                    .leader_watcher
-                    .send(LeaderChangeMessage::Elected(Arc::new(leader)))
-                {
-                    error!(e; "Failed to send leader change message");
-                }
-            }
+            send_leader_change_and_set_flags(
+                &self.is_leader,
+                &self.infancy,
+                &self.leader_watcher,
+                LeaderChangeMessage::Elected(Arc::new(leader.clone())),
+            );
         }
 
         Ok(())

@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use api::helper::to_pb_time_ranges;
 use api::v1::region::{
-    region_request, RegionRequest, RegionRequestHeader, TruncateRequest as PbTruncateRegionRequest,
+    region_request, truncate_request, RegionRequest, RegionRequestHeader,
+    TruncateRequest as PbTruncateRegionRequest,
 };
 use async_trait::async_trait;
 use common_procedure::error::{FromJsonSnafu, ToJsonSnafu};
@@ -31,17 +33,16 @@ use table::metadata::{RawTableInfo, TableId};
 use table::table_name::TableName;
 use table::table_reference::TableReference;
 
-use super::utils::handle_retry_error;
-use crate::ddl::utils::add_peer_context_if_needed;
+use crate::ddl::utils::{add_peer_context_if_needed, map_to_procedure_error};
 use crate::ddl::DdlContext;
-use crate::error::{Result, TableNotFoundSnafu};
+use crate::error::{ConvertTimeRangesSnafu, Result, TableNotFoundSnafu};
 use crate::key::table_info::TableInfoValue;
 use crate::key::table_name::TableNameKey;
 use crate::key::DeserializedValueWithBytes;
 use crate::lock_key::{CatalogLock, SchemaLock, TableLock};
+use crate::metrics;
 use crate::rpc::ddl::TruncateTableTask;
 use crate::rpc::router::{find_leader_regions, find_leaders, RegionRoute};
-use crate::{metrics, ClusterId};
 
 pub struct TruncateTableProcedure {
     context: DdlContext,
@@ -67,7 +68,7 @@ impl Procedure for TruncateTableProcedure {
                 self.on_datanode_truncate_regions().await
             }
         }
-        .map_err(handle_retry_error)
+        .map_err(map_to_procedure_error)
     }
 
     fn dump(&self) -> ProcedureResult<String> {
@@ -91,7 +92,6 @@ impl TruncateTableProcedure {
     pub(crate) const TYPE_NAME: &'static str = "metasrv-procedure::TruncateTable";
 
     pub(crate) fn new(
-        cluster_id: ClusterId,
         task: TruncateTableTask,
         table_info_value: DeserializedValueWithBytes<TableInfoValue>,
         region_routes: Vec<RegionRoute>,
@@ -99,7 +99,7 @@ impl TruncateTableProcedure {
     ) -> Self {
         Self {
             context,
-            data: TruncateTableData::new(cluster_id, task, table_info_value, region_routes),
+            data: TruncateTableData::new(task, table_info_value, region_routes),
         }
     }
 
@@ -155,6 +155,15 @@ impl TruncateTableProcedure {
                     datanode
                 );
 
+                let time_ranges = &self.data.task.time_ranges;
+                let kind = if time_ranges.is_empty() {
+                    truncate_request::Kind::All(api::v1::region::All {})
+                } else {
+                    let pb_time_ranges =
+                        to_pb_time_ranges(time_ranges).context(ConvertTimeRangesSnafu)?;
+                    truncate_request::Kind::TimeRanges(pb_time_ranges)
+                };
+
                 let request = RegionRequest {
                     header: Some(RegionRequestHeader {
                         tracing_context: TracingContext::from_current_span().to_w3c(),
@@ -162,6 +171,7 @@ impl TruncateTableProcedure {
                     }),
                     body: Some(region_request::Body::Truncate(PbTruncateRegionRequest {
                         region_id: region_id.as_u64(),
+                        kind: Some(kind),
                     })),
                 };
 
@@ -189,7 +199,6 @@ impl TruncateTableProcedure {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TruncateTableData {
     state: TruncateTableState,
-    cluster_id: ClusterId,
     task: TruncateTableTask,
     table_info_value: DeserializedValueWithBytes<TableInfoValue>,
     region_routes: Vec<RegionRoute>,
@@ -197,14 +206,12 @@ pub struct TruncateTableData {
 
 impl TruncateTableData {
     pub fn new(
-        cluster_id: ClusterId,
         task: TruncateTableTask,
         table_info_value: DeserializedValueWithBytes<TableInfoValue>,
         region_routes: Vec<RegionRoute>,
     ) -> Self {
         Self {
             state: TruncateTableState::Prepare,
-            cluster_id,
             task,
             table_info_value,
             region_routes,

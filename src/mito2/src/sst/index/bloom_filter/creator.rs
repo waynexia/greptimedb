@@ -19,6 +19,8 @@ use std::sync::Arc;
 use common_telemetry::{debug, warn};
 use datatypes::schema::SkippingIndexType;
 use index::bloom_filter::creator::BloomFilterCreator;
+use mito_codec::index::{IndexValueCodec, IndexValuesCodec};
+use mito_codec::row_converter::SortField;
 use puffin::puffin_manager::{PuffinWriter, PutOptions};
 use snafu::{ensure, ResultExt};
 use store_api::metadata::RegionMetadataRef;
@@ -26,14 +28,12 @@ use store_api::storage::ColumnId;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::error::{
-    BiErrorsSnafu, BloomFilterFinishSnafu, IndexOptionsSnafu, OperateAbortedIndexSnafu,
-    PuffinAddBlobSnafu, PushBloomFilterValueSnafu, Result,
+    BiErrorsSnafu, BloomFilterFinishSnafu, EncodeSnafu, IndexOptionsSnafu,
+    OperateAbortedIndexSnafu, PuffinAddBlobSnafu, PushBloomFilterValueSnafu, Result,
 };
 use crate::read::Batch;
-use crate::row_converter::SortField;
 use crate::sst::file::FileId;
 use crate::sst::index::bloom_filter::INDEX_BLOB_TYPE;
-use crate::sst::index::codec::{IndexValueCodec, IndexValuesCodec};
 use crate::sst::index::intermediate::{
     IntermediateLocation, IntermediateManager, TempFileProvider,
 };
@@ -97,6 +97,7 @@ impl BloomFilterIndexer {
 
             let creator = BloomFilterCreator::new(
                 options.granularity as _,
+                options.false_positive_rate(),
                 temp_file_provider.clone(),
                 global_memory_usage.clone(),
                 memory_usage_threshold,
@@ -210,7 +211,8 @@ impl BloomFilterIndexer {
                                 v.as_value_ref(),
                                 field,
                                 &mut buf,
-                            )?;
+                            )
+                            .context(EncodeSnafu)?;
                             Ok(buf)
                         })
                         .transpose()?;
@@ -234,11 +236,8 @@ impl BloomFilterIndexer {
                         let elems = (!value.is_null())
                             .then(|| {
                                 let mut buf = vec![];
-                                IndexValueCodec::encode_nonnull_value(
-                                    value,
-                                    &sort_field,
-                                    &mut buf,
-                                )?;
+                                IndexValueCodec::encode_nonnull_value(value, &sort_field, &mut buf)
+                                    .context(EncodeSnafu)?;
                                 Ok(buf)
                             })
                             .transpose()?;
@@ -304,7 +303,12 @@ impl BloomFilterIndexer {
         let blob_name = format!("{}-{}", INDEX_BLOB_TYPE, col_id);
         let (index_finish, puffin_add_blob) = futures::join!(
             creator.finish(tx.compat_write()),
-            puffin_writer.put_blob(&blob_name, rx.compat(), PutOptions::default())
+            puffin_writer.put_blob(
+                &blob_name,
+                rx.compat(),
+                PutOptions::default(),
+                Default::default(),
+            )
         );
 
         match (
@@ -341,7 +345,6 @@ impl BloomFilterIndexer {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::iter;
 
     use api::v1::SemanticType;
     use datatypes::data_type::ConcreteDataType;
@@ -349,16 +352,17 @@ pub(crate) mod tests {
     use datatypes::value::ValueRef;
     use datatypes::vectors::{UInt64Vector, UInt8Vector};
     use index::bloom_filter::reader::{BloomFilterReader, BloomFilterReaderImpl};
+    use mito_codec::row_converter::{DensePrimaryKeyCodec, PrimaryKeyCodecExt};
     use object_store::services::Memory;
     use object_store::ObjectStore;
-    use puffin::puffin_manager::{BlobGuard, PuffinManager, PuffinReader};
+    use puffin::puffin_manager::{PuffinManager, PuffinReader};
     use store_api::metadata::{ColumnMetadata, RegionMetadataBuilder};
     use store_api::storage::RegionId;
 
     use super::*;
     use crate::access_layer::FilePathProvider;
     use crate::read::BatchColumn;
-    use crate::row_converter::{DensePrimaryKeyCodec, PrimaryKeyCodecExt};
+    use crate::sst::file::RegionFileId;
     use crate::sst::index::puffin_manager::PuffinManagerFactory;
 
     pub fn mock_object_store() -> ObjectStore {
@@ -372,12 +376,12 @@ pub(crate) mod tests {
     pub struct TestPathProvider;
 
     impl FilePathProvider for TestPathProvider {
-        fn build_index_file_path(&self, file_id: FileId) -> String {
-            file_id.to_string()
+        fn build_index_file_path(&self, file_id: RegionFileId) -> String {
+            file_id.file_id().to_string()
         }
 
-        fn build_sst_file_path(&self, file_id: FileId) -> String {
-            file_id.to_string()
+        fn build_sst_file_path(&self, file_id: RegionFileId) -> String {
+            file_id.file_id().to_string()
         }
     }
 
@@ -406,10 +410,11 @@ pub(crate) mod tests {
                     ConcreteDataType::string_datatype(),
                     false,
                 )
-                .with_skipping_options(SkippingIndexOptions {
-                    index_type: SkippingIndexType::BloomFilter,
-                    granularity: 2,
-                })
+                .with_skipping_options(SkippingIndexOptions::new_unchecked(
+                    2,
+                    0.01,
+                    SkippingIndexType::BloomFilter,
+                ))
                 .unwrap(),
                 semantic_type: SemanticType::Tag,
                 column_id: 1,
@@ -429,10 +434,11 @@ pub(crate) mod tests {
                     ConcreteDataType::uint64_datatype(),
                     false,
                 )
-                .with_skipping_options(SkippingIndexOptions {
-                    index_type: SkippingIndexType::BloomFilter,
-                    granularity: 4,
-                })
+                .with_skipping_options(SkippingIndexOptions::new_unchecked(
+                    4,
+                    0.01,
+                    SkippingIndexType::BloomFilter,
+                ))
                 .unwrap(),
                 semantic_type: SemanticType::Field,
                 column_id: 3,
@@ -456,15 +462,15 @@ pub(crate) mod tests {
 
         Batch::new(
             primary_key,
-            Arc::new(UInt64Vector::from_iter_values(
-                iter::repeat(0).take(num_rows),
-            )),
-            Arc::new(UInt64Vector::from_iter_values(
-                iter::repeat(0).take(num_rows),
-            )),
-            Arc::new(UInt8Vector::from_iter_values(
-                iter::repeat(1).take(num_rows),
-            )),
+            Arc::new(UInt64Vector::from_iter_values(std::iter::repeat_n(
+                0, num_rows,
+            ))),
+            Arc::new(UInt64Vector::from_iter_values(std::iter::repeat_n(
+                0, num_rows,
+            ))),
+            Arc::new(UInt8Vector::from_iter_values(std::iter::repeat_n(
+                1, num_rows,
+            ))),
             vec![u64_field],
         )
         .unwrap()
@@ -479,14 +485,11 @@ pub(crate) mod tests {
         let region_metadata = mock_region_metadata();
         let memory_usage_threshold = Some(1024);
 
-        let mut indexer = BloomFilterIndexer::new(
-            FileId::random(),
-            &region_metadata,
-            intm_mgr,
-            memory_usage_threshold,
-        )
-        .unwrap()
-        .unwrap();
+        let file_id = FileId::random();
+        let mut indexer =
+            BloomFilterIndexer::new(file_id, &region_metadata, intm_mgr, memory_usage_threshold)
+                .unwrap()
+                .unwrap();
 
         // push 20 rows
         let mut batch = new_batch("tag1", 0..10);
@@ -498,7 +501,7 @@ pub(crate) mod tests {
         let (_d, factory) = PuffinManagerFactory::new_for_test_async(prefix).await;
         let puffin_manager = factory.build(object_store, TestPathProvider);
 
-        let file_id = FileId::random();
+        let file_id = RegionFileId::new(region_metadata.region_id, file_id);
         let mut puffin_writer = puffin_manager.writer(&file_id).await.unwrap();
         let (row_count, byte_count) = indexer.finish(&mut puffin_writer).await.unwrap();
         assert_eq!(row_count, 20);

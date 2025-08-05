@@ -17,21 +17,22 @@ use std::ops::Deref;
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use itertools::Itertools;
 use snafu::OptionExt;
+use vrl::prelude::Bytes;
+use vrl::value::{KeyString, Value as VrlValue};
 
-use crate::etl::error::{
+use crate::error::{
     DissectAppendOrderAlreadySetSnafu, DissectConsecutiveNamesSnafu, DissectEmptyPatternSnafu,
     DissectEndModifierAlreadySetSnafu, DissectInvalidPatternSnafu, DissectModifierAlreadySetSnafu,
     DissectNoMatchingPatternSnafu, DissectOrderOnlyAppendModifierSnafu,
     DissectOrderOnlyAppendSnafu, DissectSplitExceedsInputSnafu, DissectSplitNotMatchInputSnafu,
     Error, KeyMustBeStringSnafu, ProcessorExpectStringSnafu, ProcessorMissingFieldSnafu, Result,
+    ValueMustBeMapSnafu,
 };
 use crate::etl::field::Fields;
 use crate::etl::processor::{
     yaml_bool, yaml_new_field, yaml_new_fields, yaml_parse_string, yaml_parse_strings, yaml_string,
     Processor, FIELDS_NAME, FIELD_NAME, IGNORE_MISSING_NAME, PATTERNS_NAME, PATTERN_NAME,
 };
-use crate::etl::value::Value;
-use crate::etl::PipelineMap;
 
 pub(crate) const PROCESSOR_DISSECT: &str = "dissect";
 
@@ -325,7 +326,7 @@ impl std::str::FromStr for Pattern {
 
 impl Pattern {
     fn check(&self) -> Result<()> {
-        if self.len() == 0 {
+        if self.is_empty() {
             return DissectEmptyPatternSnafu.fail();
         }
 
@@ -422,7 +423,7 @@ impl DissectProcessor {
         name: &'a Name,
         value: String,
         appends: &mut HashMap<&'a String, Vec<(String, u32)>>,
-        map: &mut Vec<(&'a String, Value)>,
+        map: &mut Vec<(&'a String, VrlValue)>,
     ) {
         match name.start_modifier {
             Some(StartModifier::NamedSkip) => {
@@ -439,12 +440,16 @@ impl DissectProcessor {
                 // because transform can know the key name
             }
             None => {
-                map.push((&name.name, Value::String(value)));
+                map.push((&name.name, VrlValue::Bytes(Bytes::from(value))));
             }
         }
     }
 
-    fn process_pattern(&self, chs: &[char], pattern: &Pattern) -> Result<Vec<(String, Value)>> {
+    fn process_pattern(
+        &self,
+        chs: &[char],
+        pattern: &Pattern,
+    ) -> Result<Vec<(KeyString, VrlValue)>> {
         let mut map = Vec::new();
         let mut pos = 0;
 
@@ -524,14 +529,17 @@ impl DissectProcessor {
             for (name, mut values) in appends {
                 values.sort_by(|a, b| a.1.cmp(&b.1));
                 let value = values.into_iter().map(|(a, _)| a).join(sep);
-                map.push((name, Value::String(value)));
+                map.push((name, VrlValue::Bytes(Bytes::from(value))));
             }
         }
 
-        Ok(map.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+        Ok(map
+            .into_iter()
+            .map(|(k, v)| (KeyString::from(k.clone()), v))
+            .collect())
     }
 
-    fn process(&self, val: &str) -> Result<Vec<(String, Value)>> {
+    fn process(&self, val: &str) -> Result<Vec<(KeyString, VrlValue)>> {
         let chs = val.chars().collect::<Vec<char>>();
 
         for pattern in &self.patterns {
@@ -601,17 +609,18 @@ impl Processor for DissectProcessor {
         self.ignore_missing
     }
 
-    fn exec_mut(&self, val: &mut PipelineMap) -> Result<()> {
+    fn exec_mut(&self, mut val: VrlValue) -> Result<VrlValue> {
         for field in self.fields.iter() {
             let index = field.input_field();
+            let val = val.as_object_mut().context(ValueMustBeMapSnafu)?;
             match val.get(index) {
-                Some(Value::String(val_str)) => {
-                    let r = self.process(val_str)?;
+                Some(VrlValue::Bytes(val_str)) => {
+                    let r = self.process(String::from_utf8_lossy(val_str).as_ref())?;
                     for (k, v) in r {
                         val.insert(k, v);
                     }
                 }
-                Some(Value::Null) | None => {
+                Some(VrlValue::Null) | None => {
                     if !self.ignore_missing {
                         return ProcessorMissingFieldSnafu {
                             processor: self.kind(),
@@ -629,7 +638,7 @@ impl Processor for DissectProcessor {
                 }
             }
         }
-        Ok(())
+        Ok(val)
     }
 }
 
@@ -640,17 +649,18 @@ fn is_valid_char(ch: char) -> bool {
 #[cfg(test)]
 mod tests {
     use ahash::HashMap;
+    use vrl::prelude::Bytes;
+    use vrl::value::{KeyString, Value as VrlValue};
 
     use super::{DissectProcessor, EndModifier, Name, Part, StartModifier};
     use crate::etl::processor::dissect::Pattern;
-    use crate::etl::value::Value;
 
-    fn assert(pattern_str: &str, input: &str, expected: HashMap<String, Value>) {
+    fn assert(pattern_str: &str, input: &str, expected: HashMap<KeyString, VrlValue>) {
         let chs = input.chars().collect::<Vec<char>>();
         let patterns: Vec<Pattern> = vec![pattern_str.parse().unwrap()];
 
         let processor = DissectProcessor::default();
-        let result: HashMap<String, Value> = processor
+        let result: HashMap<KeyString, VrlValue> = processor
             .process_pattern(&chs, &patterns[0])
             .unwrap()
             .into_iter()
@@ -992,8 +1002,13 @@ mod tests {
             ("httpversion", "1.0"),
         ]
         .into_iter()
-        .map(|(k, v)| (k.to_string(), Value::String(v.to_string())))
-        .collect::<HashMap<String, Value>>();
+        .map(|(k, v)| {
+            (
+                KeyString::from(k.to_string()),
+                VrlValue::Bytes(Bytes::from(v.to_string())),
+            )
+        })
+        .collect::<HashMap<KeyString, VrlValue>>();
 
         {
             // pattern start with Name
@@ -1033,9 +1048,12 @@ mod tests {
         ]
         .into_iter()
         .map(|(pattern, input, expected)| {
-            let map = expected
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), Value::String(v.to_string())));
+            let map = expected.into_iter().map(|(k, v)| {
+                (
+                    KeyString::from(k.to_string()),
+                    VrlValue::Bytes(Bytes::from(v.to_string())),
+                )
+            });
             (pattern, input, map)
         });
 
@@ -1043,7 +1061,7 @@ mod tests {
             assert(
                 pattern_str,
                 input,
-                expected.collect::<HashMap<String, Value>>(),
+                expected.collect::<HashMap<KeyString, VrlValue>>(),
             );
         }
     }
@@ -1064,9 +1082,12 @@ mod tests {
         ]
         .into_iter()
         .map(|(pattern, input, expected)| {
-            let map = expected
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), Value::String(v.to_string())));
+            let map = expected.into_iter().map(|(k, v)| {
+                (
+                    KeyString::from(k.to_string()),
+                    VrlValue::Bytes(Bytes::from(v.to_string())),
+                )
+            });
             (pattern, input, map)
         });
 
@@ -1074,7 +1095,7 @@ mod tests {
             assert(
                 pattern_str,
                 input,
-                expected.collect::<HashMap<String, Value>>(),
+                expected.collect::<HashMap<KeyString, VrlValue>>(),
             );
         }
     }
@@ -1091,9 +1112,12 @@ mod tests {
         )]
         .into_iter()
         .map(|(pattern, input, expected)| {
-            let map = expected
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), Value::String(v.to_string())));
+            let map = expected.into_iter().map(|(k, v)| {
+                (
+                    KeyString::from(k.to_string()),
+                    VrlValue::Bytes(Bytes::from(v.to_string())),
+                )
+            });
             (pattern, input, map)
         });
 
@@ -1101,7 +1125,7 @@ mod tests {
             assert(
                 pattern_str,
                 input,
-                expected.collect::<HashMap<String, Value>>(),
+                expected.collect::<HashMap<KeyString, VrlValue>>(),
             );
         }
     }

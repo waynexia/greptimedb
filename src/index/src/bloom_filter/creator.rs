@@ -30,9 +30,6 @@ use crate::bloom_filter::SEED;
 use crate::external_provider::ExternalTempFileProvider;
 use crate::Bytes;
 
-/// The false positive rate of the Bloom filter.
-pub const FALSE_POSITIVE_RATE: f64 = 0.01;
-
 /// `BloomFilterCreator` is responsible for creating and managing bloom filters
 /// for a set of elements. It divides the rows into segments and creates
 /// bloom filters for each segment.
@@ -64,6 +61,9 @@ pub struct BloomFilterCreator {
     /// Storage for finalized Bloom filters.
     finalized_bloom_filters: FinalizedBloomFilterStorage,
 
+    /// Row count that finalized so far.
+    finalized_row_count: usize,
+
     /// Global memory usage of the bloom filter creator.
     global_memory_usage: Arc<AtomicUsize>,
 }
@@ -76,6 +76,7 @@ impl BloomFilterCreator {
     /// `rows_per_segment` <= 0
     pub fn new(
         rows_per_segment: usize,
+        false_positive_rate: f64,
         intermediate_provider: Arc<dyn ExternalTempFileProvider>,
         global_memory_usage: Arc<AtomicUsize>,
         global_memory_usage_threshold: Option<usize>,
@@ -92,10 +93,12 @@ impl BloomFilterCreator {
             cur_seg_distinct_elems_mem_usage: 0,
             global_memory_usage: global_memory_usage.clone(),
             finalized_bloom_filters: FinalizedBloomFilterStorage::new(
+                false_positive_rate,
                 intermediate_provider,
                 global_memory_usage,
                 global_memory_usage_threshold,
             ),
+            finalized_row_count: 0,
         }
     }
 
@@ -136,6 +139,7 @@ impl BloomFilterCreator {
 
             if self.accumulated_row_count % self.rows_per_segment == 0 {
                 self.finalize_segment().await?;
+                self.finalized_row_count = self.accumulated_row_count;
             }
         }
 
@@ -161,6 +165,7 @@ impl BloomFilterCreator {
 
         if self.accumulated_row_count % self.rows_per_segment == 0 {
             self.finalize_segment().await?;
+            self.finalized_row_count = self.accumulated_row_count;
         }
 
         Ok(())
@@ -168,7 +173,7 @@ impl BloomFilterCreator {
 
     /// Finalizes any remaining segments and writes the bloom filters and metadata to the provided writer.
     pub async fn finish(&mut self, mut writer: impl AsyncWrite + Unpin) -> Result<()> {
-        if !self.cur_seg_distinct_elems.is_empty() {
+        if self.accumulated_row_count > self.finalized_row_count {
             self.finalize_segment().await?;
         }
 
@@ -257,6 +262,7 @@ mod tests {
         let mut writer = Cursor::new(Vec::new());
         let mut creator = BloomFilterCreator::new(
             2,
+            0.01,
             Arc::new(MockExternalTempFileProvider::new()),
             Arc::new(AtomicUsize::new(0)),
             None,
@@ -331,6 +337,7 @@ mod tests {
         let mut writer = Cursor::new(Vec::new());
         let mut creator: BloomFilterCreator = BloomFilterCreator::new(
             2,
+            0.01,
             Arc::new(MockExternalTempFileProvider::new()),
             Arc::new(AtomicUsize::new(0)),
             None,
@@ -405,5 +412,37 @@ mod tests {
             assert!(bf.contains(&b"e"));
             assert!(bf.contains(&b"f"));
         }
+    }
+
+    #[tokio::test]
+    async fn test_final_seg_all_null() {
+        let mut writer = Cursor::new(Vec::new());
+        let mut creator = BloomFilterCreator::new(
+            2,
+            0.01,
+            Arc::new(MockExternalTempFileProvider::new()),
+            Arc::new(AtomicUsize::new(0)),
+            None,
+        );
+
+        creator
+            .push_n_row_elems(4, vec![b"a".to_vec(), b"b".to_vec()])
+            .await
+            .unwrap();
+        creator.push_row_elems(Vec::new()).await.unwrap();
+
+        creator.finish(&mut writer).await.unwrap();
+
+        let bytes = writer.into_inner();
+        let total_size = bytes.len();
+        let meta_size_offset = total_size - 4;
+        let meta_size = u32::from_le_bytes((&bytes[meta_size_offset..]).try_into().unwrap());
+
+        let meta_bytes = &bytes[total_size - meta_size as usize - 4..total_size - 4];
+        let meta = BloomFilterMeta::decode(meta_bytes).unwrap();
+
+        assert_eq!(meta.rows_per_segment, 2);
+        assert_eq!(meta.segment_count, 3);
+        assert_eq!(meta.row_count, 5);
     }
 }

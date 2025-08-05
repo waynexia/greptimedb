@@ -70,8 +70,8 @@ lazy_static! {
         )
         .unwrap();
     /// Counter of scheduled failed flush jobs.
-    pub static ref FLUSH_ERRORS_TOTAL: IntCounter =
-        register_int_counter!("greptime_mito_flush_errors_total", "mito flush errors total").unwrap();
+    pub static ref FLUSH_FAILURE_TOTAL: IntCounter =
+        register_int_counter!("greptime_mito_flush_failure_total", "mito flush failure total").unwrap();
     /// Elapsed time of a flush job.
     pub static ref FLUSH_ELAPSED: HistogramVec = register_histogram_vec!(
             "greptime_mito_flush_elapsed",
@@ -84,7 +84,7 @@ lazy_static! {
     /// Histogram of flushed bytes.
     pub static ref FLUSH_BYTES_TOTAL: IntCounter =
         register_int_counter!("greptime_mito_flush_bytes_total", "mito flush bytes total").unwrap();
-    /// Gauge for inflight compaction tasks.
+    /// Gauge for inflight flush tasks.
     pub static ref INFLIGHT_FLUSH_COUNT: IntGauge =
         register_int_gauge!(
             "greptime_mito_inflight_flush_count",
@@ -94,12 +94,7 @@ lazy_static! {
 
 
     // ------ Write related metrics
-    /// Number of stalled write requests in each worker.
-    pub static ref WRITE_STALL_TOTAL: IntGaugeVec = register_int_gauge_vec!(
-            "greptime_mito_write_stall_total",
-            "mito stalled write request in each worker",
-            &[WORKER_LABEL]
-        ).unwrap();
+    //
     /// Counter of rejected write requests.
     pub static ref WRITE_REJECT_TOTAL: IntCounter =
         register_int_counter!("greptime_mito_write_reject_total", "mito write reject total").unwrap();
@@ -124,6 +119,14 @@ lazy_static! {
 
     // Compaction metrics
     /// Timer of different stages in compaction.
+    /// - pick
+    /// - merge (in parallel)
+    ///   - iter_source
+    ///   - write_batch
+    ///   - update_index
+    ///   - upload_parquet
+    ///   - upload puffin
+    /// - write_manifest
     pub static ref COMPACTION_STAGE_ELAPSED: HistogramVec = register_histogram_vec!(
         "greptime_mito_compaction_stage_elapsed",
         "mito compaction stage elapsed",
@@ -153,7 +156,6 @@ lazy_static! {
             "greptime_mito_inflight_compaction_count",
             "inflight compaction count",
         ).unwrap();
-    // ------- End of compaction metrics.
 
     // Query metrics.
     /// Timer of different stages in query.
@@ -241,6 +243,11 @@ lazy_static! {
         &[TYPE_LABEL],
         // 0.1 ~ 10000
         exponential_buckets(0.1, 10.0, 6).unwrap(),
+    ).unwrap();
+    /// Number of inflight download tasks.
+    pub static ref WRITE_CACHE_INFLIGHT_DOWNLOAD: IntGauge = register_int_gauge!(
+        "mito_write_cache_inflight_download_count",
+        "mito write cache inflight download tasks",
     ).unwrap();
     /// Upload bytes counter.
     pub static ref UPLOAD_BYTES_TOTAL: IntCounter = register_int_counter!(
@@ -387,6 +394,63 @@ lazy_static! {
         // 0.01 ~ 1000
         exponential_buckets(0.01, 10.0, 6).unwrap(),
     ).unwrap();
+
+
+    pub static ref REGION_WORKER_HANDLE_WRITE_ELAPSED: HistogramVec = register_histogram_vec!(
+        "greptime_region_worker_handle_write",
+        "elapsed time for handling writes in region worker loop",
+        &["stage"],
+        exponential_buckets(0.001, 10.0, 5).unwrap()
+    ).unwrap();
+
+}
+
+// Use another block to avoid reaching the recursion limit.
+lazy_static! {
+    /// Counter for compaction input file size.
+    pub static ref COMPACTION_INPUT_BYTES: Counter = register_counter!(
+        "greptime_mito_compaction_input_bytes",
+        "mito compaction input file size",
+        ).unwrap();
+
+    /// Counter for compaction output file size.
+    pub static ref COMPACTION_OUTPUT_BYTES: Counter = register_counter!(
+        "greptime_mito_compaction_output_bytes",
+        "mito compaction output file size",
+        ).unwrap();
+
+    /// Active series count in TimeSeriesMemtable
+    pub static ref MEMTABLE_ACTIVE_SERIES_COUNT: IntGauge = register_int_gauge!(
+        "greptime_mito_memtable_active_series_count",
+        "active time series count in TimeSeriesMemtable",
+        ).unwrap();
+
+    /// Active field builder count in TimeSeriesMemtable
+    pub static ref MEMTABLE_ACTIVE_FIELD_BUILDER_COUNT: IntGauge = register_int_gauge!(
+        "greptime_mito_memtable_field_builder_count",
+        "active field builder count in TimeSeriesMemtable",
+        ).unwrap();
+
+    /// Number of stalling write requests in each worker.
+    pub static ref WRITE_STALLING: IntGaugeVec = register_int_gauge_vec!(
+            "greptime_mito_write_stalling_count",
+            "mito stalled write request in each worker",
+            &[WORKER_LABEL]
+        ).unwrap();
+    /// Total number of stalled write requests.
+    pub static ref WRITE_STALL_TOTAL: IntCounter = register_int_counter!(
+        "greptime_mito_write_stall_total",
+        "Total number of stalled write requests"
+    ).unwrap();
+    /// Time waiting for requests to be handled by the region worker.
+    pub static ref REQUEST_WAIT_TIME: HistogramVec = register_histogram_vec!(
+            "greptime_mito_request_wait_time",
+            "mito request wait time before being handled by region worker",
+            &[WORKER_LABEL],
+            // 0.001 ~ 10000
+            exponential_buckets(0.001, 10.0, 8).unwrap(),
+        )
+        .unwrap();
 }
 
 /// Stager notifier to collect metrics.

@@ -18,12 +18,13 @@ use common_error::ext::ErrorExt;
 use common_error::status_code::StatusCode;
 use common_macro::stack_trace_debug;
 use datafusion_common::ScalarValue;
-use datafusion_expr::expr::Expr;
+use datatypes::arrow;
+use datatypes::prelude::Value;
 use snafu::{Location, Snafu};
 use store_api::storage::RegionId;
 use table::metadata::TableId;
 
-use crate::expr::PartitionExpr;
+use crate::expr::{Operand, PartitionExpr};
 
 #[derive(Snafu)]
 #[snafu(visibility(pub))]
@@ -93,20 +94,6 @@ pub enum Error {
         location: Location,
     },
 
-    #[snafu(display("Failed to find region, reason: {}", reason))]
-    FindRegion {
-        reason: String,
-        #[snafu(implicit)]
-        location: Location,
-    },
-
-    #[snafu(display("Failed to find regions by filters: {:?}", filters))]
-    FindRegions {
-        filters: Vec<Expr>,
-        #[snafu(implicit)]
-        location: Location,
-    },
-
     #[snafu(display("Invalid InsertRequest, reason: {}", reason))]
     InvalidInsertRequest {
         reason: String,
@@ -117,14 +104,6 @@ pub enum Error {
     #[snafu(display("Invalid DeleteRequest, reason: {}", reason))]
     InvalidDeleteRequest {
         reason: String,
-        #[snafu(implicit)]
-        location: Location,
-    },
-
-    #[snafu(display("Invalid table route data, table id: {}, msg: {}", table_id, err_msg))]
-    InvalidTableRouteData {
-        table_id: TableId,
-        err_msg: String,
         #[snafu(implicit)]
         location: Location,
     },
@@ -153,24 +132,16 @@ pub enum Error {
         source: common_meta::error::Error,
     },
 
-    #[snafu(display("Conjunct expr with non-expr is invalid"))]
-    ConjunctExprWithNonExpr {
-        expr: PartitionExpr,
-        #[snafu(implicit)]
-        location: Location,
-    },
-
-    #[snafu(display("Unclosed value {} on column {}", value, column))]
-    UnclosedValue {
-        value: String,
-        column: String,
-        #[snafu(implicit)]
-        location: Location,
-    },
-
     #[snafu(display("Invalid partition expr: {:?}", expr))]
     InvalidExpr {
         expr: PartitionExpr,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Unexpected operand: {:?}, want Expr", operand))]
+    NoExprOperand {
+        operand: Operand,
         #[snafu(implicit)]
         location: Location,
     },
@@ -188,22 +159,96 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+
+    #[snafu(display("Failed to convert to vector"))]
+    ConvertToVector {
+        source: datatypes::error::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Failed to evaluate record batch"))]
+    EvaluateRecordBatch {
+        #[snafu(source)]
+        error: datafusion_common::error::DataFusionError,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Failed to compute arrow kernel"))]
+    ComputeArrowKernel {
+        #[snafu(source)]
+        error: arrow::error::ArrowError,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Unexpected evaluation result column type: {}", data_type))]
+    UnexpectedColumnType {
+        data_type: arrow::datatypes::DataType,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Failed to convert to DataFusion's Schema"))]
+    ToDFSchema {
+        #[snafu(source)]
+        error: datafusion_common::error::DataFusionError,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Failed to create physical expression"))]
+    CreatePhysicalExpr {
+        #[snafu(source)]
+        error: datafusion_common::error::DataFusionError,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Partition expr value is not supported: {:?}", value))]
+    UnsupportedPartitionExprValue {
+        value: Value,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Duplicate expr: {:?}", expr))]
+    DuplicateExpr {
+        expr: PartitionExpr,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Checkpoint `{}` is not covered", checkpoint))]
+    CheckpointNotCovered {
+        checkpoint: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Checkpoint `{}` is overlapped", checkpoint))]
+    CheckpointOverlapped {
+        checkpoint: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 impl ErrorExt for Error {
     fn status_code(&self) -> StatusCode {
         match self {
-            Error::GetCache { .. } | Error::FindLeader { .. } => StatusCode::StorageUnavailable,
-            Error::FindRegionRoutes { .. } => StatusCode::RegionNotReady,
+            Error::GetCache { .. } => StatusCode::StorageUnavailable,
+            Error::FindLeader { .. } => StatusCode::TableUnavailable,
 
-            Error::ConjunctExprWithNonExpr { .. }
-            | Error::UnclosedValue { .. }
-            | Error::InvalidExpr { .. }
-            | Error::UndefinedColumn { .. } => StatusCode::InvalidArguments,
+            Error::InvalidExpr { .. }
+            | Error::NoExprOperand { .. }
+            | Error::UndefinedColumn { .. }
+            | Error::DuplicateExpr { .. }
+            | Error::CheckpointNotCovered { .. }
+            | Error::CheckpointOverlapped { .. } => StatusCode::InvalidArguments,
 
-            Error::FindRegion { .. }
-            | Error::FindRegions { .. }
-            | Error::RegionKeysSize { .. }
+            Error::RegionKeysSize { .. }
             | Error::InvalidInsertRequest { .. }
             | Error::InvalidDeleteRequest { .. } => StatusCode::InvalidArguments,
 
@@ -211,12 +256,19 @@ impl ErrorExt for Error {
             | Error::SerializeJson { .. }
             | Error::DeserializeJson { .. } => StatusCode::Internal,
 
-            Error::Unexpected { .. } => StatusCode::Unexpected,
-            Error::InvalidTableRouteData { .. } => StatusCode::TableUnavailable,
-            Error::FindTableRoutes { .. } => StatusCode::TableUnavailable,
+            Error::Unexpected { .. }
+            | Error::FindTableRoutes { .. }
+            | Error::FindRegionRoutes { .. } => StatusCode::Unexpected,
             Error::TableRouteNotFound { .. } => StatusCode::TableNotFound,
             Error::TableRouteManager { source, .. } => source.status_code(),
             Error::UnexpectedLogicalRouteTable { source, .. } => source.status_code(),
+            Error::ConvertToVector { source, .. } => source.status_code(),
+            Error::EvaluateRecordBatch { .. } => StatusCode::Internal,
+            Error::ComputeArrowKernel { .. } => StatusCode::Internal,
+            Error::UnexpectedColumnType { .. } => StatusCode::Internal,
+            Error::ToDFSchema { .. } => StatusCode::Internal,
+            Error::CreatePhysicalExpr { .. } => StatusCode::Internal,
+            Error::UnsupportedPartitionExprValue { .. } => StatusCode::InvalidArguments,
         }
     }
 

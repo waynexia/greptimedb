@@ -22,6 +22,7 @@ use common_test_util::temp_dir::{create_temp_dir, TempDir};
 use object_store::services::Fs;
 use object_store::ObjectStore;
 use store_api::metadata::RegionMetadataRef;
+use store_api::region_request::PathType;
 use tokio::sync::mpsc::Sender;
 
 use crate::access_layer::{AccessLayer, AccessLayerRef};
@@ -32,7 +33,7 @@ use crate::error::Result;
 use crate::flush::FlushScheduler;
 use crate::manifest::manager::{RegionManifestManager, RegionManifestOptions};
 use crate::region::{ManifestContext, ManifestContextRef, RegionLeaderState, RegionRoleState};
-use crate::request::WorkerRequest;
+use crate::request::WorkerRequestWithTime;
 use crate::schedule::scheduler::{Job, LocalScheduler, Scheduler, SchedulerRef};
 use crate::sst::index::intermediate::IntermediateManager;
 use crate::sst::index::puffin_manager::PuffinManagerFactory;
@@ -64,6 +65,7 @@ impl SchedulerEnv {
         let object_store = ObjectStore::new(builder).unwrap().finish();
         let access_layer = Arc::new(AccessLayer::new(
             "",
+            PathType::Bare,
             object_store.clone(),
             puffin_mgr,
             intm_mgr,
@@ -85,7 +87,7 @@ impl SchedulerEnv {
     /// Creates a new compaction scheduler.
     pub(crate) fn mock_compaction_scheduler(
         &self,
-        request_sender: Sender<WorkerRequest>,
+        request_sender: Sender<WorkerRequestWithTime>,
     ) -> CompactionScheduler {
         let scheduler = self.get_scheduler();
 
@@ -120,6 +122,7 @@ impl SchedulerEnv {
                     compress_type: CompressionType::Uncompressed,
                     checkpoint_distance: 10,
                 },
+                Default::default(),
                 Default::default(),
             )
             .await

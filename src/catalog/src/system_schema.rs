@@ -15,7 +15,7 @@
 pub mod information_schema;
 mod memory_table;
 pub mod pg_catalog;
-mod predicate;
+pub mod predicate;
 mod utils;
 
 use std::collections::HashMap;
@@ -77,7 +77,7 @@ trait SystemSchemaProviderInner {
     fn system_table(&self, name: &str) -> Option<SystemTableRef>;
 
     fn table_info(catalog_name: String, table: &SystemTableRef) -> TableInfoRef {
-        let table_meta = TableMetaBuilder::default()
+        let table_meta = TableMetaBuilder::empty()
             .schema(table.schema())
             .primary_key_indices(vec![])
             .next_column_id(0)
@@ -96,7 +96,7 @@ trait SystemSchemaProviderInner {
     }
 }
 
-pub(crate) trait SystemTable {
+pub trait SystemTable {
     fn table_id(&self) -> TableId;
 
     fn table_name(&self) -> &'static str;
@@ -110,7 +110,7 @@ pub(crate) trait SystemTable {
     }
 }
 
-pub(crate) type SystemTableRef = Arc<dyn SystemTable + Send + Sync>;
+pub type SystemTableRef = Arc<dyn SystemTable + Send + Sync>;
 
 struct SystemTableDataSource {
     table: SystemTableRef,

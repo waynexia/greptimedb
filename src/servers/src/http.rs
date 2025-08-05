@@ -28,7 +28,7 @@ use axum::{middleware, routing, Router};
 use common_base::readable_size::ReadableSize;
 use common_base::Plugins;
 use common_recordbatch::RecordBatch;
-use common_telemetry::{error, info};
+use common_telemetry::{debug, error, info};
 use common_time::timestamp::TimeUnit;
 use common_time::Timestamp;
 use datatypes::data_type::DataType;
@@ -37,6 +37,7 @@ use datatypes::value::transform_value_ref_to_json_value;
 use event::{LogState, LogValidatorRef};
 use futures::FutureExt;
 use http::{HeaderValue, Method};
+use prost::DecodeError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::{ensure, ResultExt};
@@ -57,6 +58,8 @@ use crate::error::{
     ToJsonSnafu,
 };
 use crate::http::influxdb::{influxdb_health, influxdb_ping, influxdb_write_v1, influxdb_write_v2};
+use crate::http::otlp::OtlpState;
+use crate::http::prom_store::PromStoreState;
 use crate::http::prometheus::{
     build_info_query, format_query, instant_query, label_values_query, labels_query, parse_query,
     range_query, series_query,
@@ -67,6 +70,7 @@ use crate::http::result::error_result::ErrorResponse;
 use crate::http::result::greptime_result_v1::GreptimedbV1Response;
 use crate::http::result::influxdb_result_v1::InfluxdbV1Response;
 use crate::http::result::json_result::JsonResponse;
+use crate::http::result::null_result::NullResponse;
 use crate::interceptor::LogIngestInterceptorRef;
 use crate::metrics::http_metrics_layer;
 use crate::metrics_handler::MetricsHandler;
@@ -84,7 +88,7 @@ pub mod authorize;
 mod dashboard;
 pub mod dyn_log;
 pub mod event;
-mod extractor;
+pub mod extractor;
 pub mod handler;
 pub mod header;
 pub mod influxdb;
@@ -103,6 +107,7 @@ mod timeout;
 pub(crate) use timeout::DynamicTimeoutLayer;
 
 mod hints;
+mod read_preference;
 #[cfg(any(test, feature = "testing"))]
 pub mod test_helpers;
 
@@ -115,7 +120,7 @@ const DEFAULT_BODY_LIMIT: ReadableSize = ReadableSize::mb(64);
 pub const AUTHORIZATION_HEADER: &str = "x-greptime-auth";
 
 // TODO(fys): This is a temporary workaround, it will be improved later
-pub static PUBLIC_APIS: [&str; 2] = ["/v1/influxdb/ping", "/v1/influxdb/health"];
+pub static PUBLIC_APIS: [&str; 3] = ["/v1/influxdb/ping", "/v1/influxdb/health", "/v1/health"];
 
 #[derive(Default)]
 pub struct HttpServer {
@@ -128,6 +133,7 @@ pub struct HttpServer {
 
     // server configs
     options: HttpOptions,
+    bind_addr: Option<SocketAddr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,23 +149,53 @@ pub struct HttpOptions {
 
     pub body_limit: ReadableSize,
 
-    pub is_strict_mode: bool,
+    /// Validation mode while decoding Prometheus remote write requests.
+    pub prom_validation_mode: PromValidationMode,
 
     pub cors_allowed_origins: Vec<String>,
 
     pub enable_cors: bool,
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromValidationMode {
+    /// Force UTF8 validation
+    Strict,
+    /// Allow lossy UTF8 strings
+    Lossy,
+    /// Do not validate UTF8 strings.
+    Unchecked,
+}
+
+impl PromValidationMode {
+    /// Decodes provided bytes to [String] with optional UTF-8 validation.
+    pub fn decode_string(&self, bytes: &[u8]) -> std::result::Result<String, DecodeError> {
+        let result = match self {
+            PromValidationMode::Strict => match String::from_utf8(bytes.to_vec()) {
+                Ok(s) => s,
+                Err(e) => {
+                    debug!("Invalid UTF-8 string value: {:?}, error: {:?}", bytes, e);
+                    return Err(DecodeError::new("invalid utf-8"));
+                }
+            },
+            PromValidationMode::Lossy => String::from_utf8_lossy(bytes).to_string(),
+            PromValidationMode::Unchecked => unsafe { String::from_utf8_unchecked(bytes.to_vec()) },
+        };
+        Ok(result)
+    }
+}
+
 impl Default for HttpOptions {
     fn default() -> Self {
         Self {
             addr: "127.0.0.1:4000".to_string(),
-            timeout: Duration::from_secs(30),
+            timeout: Duration::from_secs(0),
             disable_dashboard: false,
             body_limit: DEFAULT_BODY_LIMIT,
-            is_strict_mode: false,
             cors_allowed_origins: Vec::new(),
             enable_cors: true,
+            prom_validation_mode: PromValidationMode::Strict,
         }
     }
 }
@@ -291,23 +327,28 @@ pub enum GreptimeQueryOutput {
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponseFormat {
     Arrow,
-    Csv,
+    // (with_names, with_types)
+    Csv(bool, bool),
     Table,
     #[default]
     GreptimedbV1,
     InfluxdbV1,
     Json,
+    Null,
 }
 
 impl ResponseFormat {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "arrow" => Some(ResponseFormat::Arrow),
-            "csv" => Some(ResponseFormat::Csv),
+            "csv" => Some(ResponseFormat::Csv(false, false)),
+            "csvwithnames" => Some(ResponseFormat::Csv(true, false)),
+            "csvwithnamesandtypes" => Some(ResponseFormat::Csv(true, true)),
             "table" => Some(ResponseFormat::Table),
             "greptimedb_v1" => Some(ResponseFormat::GreptimedbV1),
             "influxdb_v1" => Some(ResponseFormat::InfluxdbV1),
             "json" => Some(ResponseFormat::Json),
+            "null" => Some(ResponseFormat::Null),
             _ => None,
         }
     }
@@ -315,11 +356,12 @@ impl ResponseFormat {
     pub fn as_str(&self) -> &'static str {
         match self {
             ResponseFormat::Arrow => "arrow",
-            ResponseFormat::Csv => "csv",
+            ResponseFormat::Csv(_, _) => "csv",
             ResponseFormat::Table => "table",
             ResponseFormat::GreptimedbV1 => "greptimedb_v1",
             ResponseFormat::InfluxdbV1 => "influxdb_v1",
             ResponseFormat::Json => "json",
+            ResponseFormat::Null => "null",
         }
     }
 }
@@ -377,6 +419,7 @@ pub enum HttpResponse {
     GreptimedbV1(GreptimedbV1Response),
     InfluxdbV1(InfluxdbV1Response),
     Json(JsonResponse),
+    Null(NullResponse),
 }
 
 impl HttpResponse {
@@ -388,6 +431,7 @@ impl HttpResponse {
             HttpResponse::GreptimedbV1(resp) => resp.with_execution_time(execution_time).into(),
             HttpResponse::InfluxdbV1(resp) => resp.with_execution_time(execution_time).into(),
             HttpResponse::Json(resp) => resp.with_execution_time(execution_time).into(),
+            HttpResponse::Null(resp) => resp.with_execution_time(execution_time).into(),
             HttpResponse::Error(resp) => resp.with_execution_time(execution_time).into(),
         }
     }
@@ -431,6 +475,7 @@ impl IntoResponse for HttpResponse {
             HttpResponse::GreptimedbV1(resp) => resp.into_response(),
             HttpResponse::InfluxdbV1(resp) => resp.into_response(),
             HttpResponse::Json(resp) => resp.into_response(),
+            HttpResponse::Null(resp) => resp.into_response(),
             HttpResponse::Error(resp) => resp.into_response(),
         }
     }
@@ -475,6 +520,12 @@ impl From<InfluxdbV1Response> for HttpResponse {
 impl From<JsonResponse> for HttpResponse {
     fn from(value: JsonResponse) -> Self {
         HttpResponse::Json(value)
+    }
+}
+
+impl From<NullResponse> for HttpResponse {
+    fn from(value: NullResponse) -> Self {
+        HttpResponse::Null(value)
     }
 }
 
@@ -551,13 +602,21 @@ impl HttpServerBuilder {
     pub fn with_prom_handler(
         self,
         handler: PromStoreProtocolHandlerRef,
+        pipeline_handler: Option<PipelineHandlerRef>,
         prom_store_with_metric_engine: bool,
-        is_strict_mode: bool,
+        prom_validation_mode: PromValidationMode,
     ) -> Self {
+        let state = PromStoreState {
+            prom_store_handler: handler,
+            pipeline_handler,
+            prom_store_with_metric_engine,
+            prom_validation_mode,
+        };
+
         Self {
             router: self.router.nest(
                 &format!("/{HTTP_API_VERSION}/prometheus"),
-                HttpServer::route_prom(handler, prom_store_with_metric_engine, is_strict_mode),
+                HttpServer::route_prom(state),
             ),
             ..self
         }
@@ -573,11 +632,15 @@ impl HttpServerBuilder {
         }
     }
 
-    pub fn with_otlp_handler(self, handler: OpenTelemetryProtocolHandlerRef) -> Self {
+    pub fn with_otlp_handler(
+        self,
+        handler: OpenTelemetryProtocolHandlerRef,
+        with_metric_engine: bool,
+    ) -> Self {
         Self {
             router: self.router.nest(
                 &format!("/{HTTP_API_VERSION}/otlp"),
-                HttpServer::route_otlp(handler),
+                HttpServer::route_otlp(handler, with_metric_engine),
             ),
             ..self
         }
@@ -679,6 +742,7 @@ impl HttpServerBuilder {
             shutdown_tx: Mutex::new(None),
             plugins: self.plugins,
             router: StdMutex::new(self.router),
+            bind_addr: None,
         }
     }
 }
@@ -694,6 +758,10 @@ impl HttpServer {
         router = router
             .route(
                 "/health",
+                routing::get(handler::health).post(handler::health),
+            )
+            .route(
+                &format!("/{HTTP_API_VERSION}/health"),
                 routing::get(handler::health).post(handler::health),
             )
             .route(
@@ -804,7 +872,10 @@ impl HttpServer {
                         AuthState::new(self.user_provider.clone()),
                         authorize::check_http_auth,
                     ))
-                    .layer(middleware::from_fn(hints::extract_hints)),
+                    .layer(middleware::from_fn(hints::extract_hints))
+                    .layer(middleware::from_fn(
+                        read_preference::extract_read_preference,
+                    )),
             )
             // Handlers for debug, we don't expect a timeout.
             .nest(
@@ -816,7 +887,19 @@ impl HttpServer {
                         "/prof",
                         Router::new()
                             .route("/cpu", routing::post(pprof::pprof_handler))
-                            .route("/mem", routing::post(mem_prof::mem_prof_handler)),
+                            .route("/mem", routing::post(mem_prof::mem_prof_handler))
+                            .route(
+                                "/mem/activate",
+                                routing::post(mem_prof::activate_heap_prof_handler),
+                            )
+                            .route(
+                                "/mem/deactivate",
+                                routing::post(mem_prof::deactivate_heap_prof_handler),
+                            )
+                            .route(
+                                "/mem/status",
+                                routing::get(mem_prof::heap_prof_status_handler),
+                            ),
                     ),
             ))
     }
@@ -919,6 +1002,10 @@ impl HttpServer {
             .route("/logs", routing::post(event::log_ingester))
             .route(
                 "/pipelines/{pipeline_name}",
+                routing::get(event::query_pipeline),
+            )
+            .route(
+                "/pipelines/{pipeline_name}",
                 routing::post(event::add_pipeline),
             )
             .route(
@@ -936,6 +1023,10 @@ impl HttpServer {
     fn route_pipelines<S>(log_state: LogState) -> Router<S> {
         Router::new()
             .route("/ingest", routing::post(event::log_ingester))
+            .route(
+                "/pipelines/{pipeline_name}",
+                routing::get(event::query_pipeline),
+            )
             .route(
                 "/pipelines/{pipeline_name}",
                 routing::post(event::add_pipeline),
@@ -1000,36 +1091,11 @@ impl HttpServer {
     ///
     /// [read]: https://prometheus.io/docs/prometheus/latest/querying/remote_read_api/
     /// [write]: https://prometheus.io/docs/concepts/remote_write_spec/
-    fn route_prom<S>(
-        prom_handler: PromStoreProtocolHandlerRef,
-        prom_store_with_metric_engine: bool,
-        is_strict_mode: bool,
-    ) -> Router<S> {
-        let mut router = Router::new().route("/read", routing::post(prom_store::remote_read));
-        match (prom_store_with_metric_engine, is_strict_mode) {
-            (true, true) => {
-                router = router.route("/write", routing::post(prom_store::remote_write))
-            }
-            (true, false) => {
-                router = router.route(
-                    "/write",
-                    routing::post(prom_store::remote_write_without_strict_mode),
-                )
-            }
-            (false, true) => {
-                router = router.route(
-                    "/write",
-                    routing::post(prom_store::route_write_without_metric_engine),
-                )
-            }
-            (false, false) => {
-                router = router.route(
-                    "/write",
-                    routing::post(prom_store::route_write_without_metric_engine_and_strict_mode),
-                )
-            }
-        }
-        router.with_state(prom_handler)
+    fn route_prom<S>(state: PromStoreState) -> Router<S> {
+        Router::new()
+            .route("/read", routing::post(prom_store::remote_read))
+            .route("/write", routing::post(prom_store::remote_write))
+            .with_state(state)
     }
 
     fn route_influxdb<S>(influxdb_handler: InfluxdbLineProtocolHandlerRef) -> Router<S> {
@@ -1051,7 +1117,10 @@ impl HttpServer {
             .with_state(opentsdb_handler)
     }
 
-    fn route_otlp<S>(otlp_handler: OpenTelemetryProtocolHandlerRef) -> Router<S> {
+    fn route_otlp<S>(
+        otlp_handler: OpenTelemetryProtocolHandlerRef,
+        with_metric_engine: bool,
+    ) -> Router<S> {
         Router::new()
             .route("/v1/metrics", routing::post(otlp::metrics))
             .route("/v1/traces", routing::post(otlp::traces))
@@ -1060,7 +1129,10 @@ impl HttpServer {
                 ServiceBuilder::new()
                     .layer(RequestDecompressionLayer::new().pass_through_unaccepted(true)),
             )
-            .with_state(otlp_handler)
+            .with_state(OtlpState {
+                with_metric_engine,
+                handler: otlp_handler,
+            })
     }
 
     fn route_config<S>(state: GreptimeOptionsConfigState) -> Router<S> {
@@ -1097,7 +1169,7 @@ impl Server for HttpServer {
         let mut shutdown_tx = self.shutdown_tx.lock().await;
         if let Some(tx) = shutdown_tx.take() {
             if tx.send(()).is_err() {
-                info!("Receiver dropped, the HTTP server has already existed");
+                info!("Receiver dropped, the HTTP server has already exited");
             }
         }
         info!("Shutdown HTTP server");
@@ -1105,7 +1177,7 @@ impl Server for HttpServer {
         Ok(())
     }
 
-    async fn start(&self, listening: SocketAddr) -> Result<SocketAddr> {
+    async fn start(&mut self, listening: SocketAddr) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         let serve = {
             let mut shutdown_tx = self.shutdown_tx.lock().await;
@@ -1161,11 +1233,17 @@ impl Server for HttpServer {
                 error!(e; "Failed to shutdown http server");
             }
         });
-        Ok(listening)
+
+        self.bind_addr = Some(listening);
+        Ok(())
     }
 
     fn name(&self) -> &str {
         HTTP_SERVER
+    }
+
+    fn bind_addr(&self) -> Option<SocketAddr> {
+        self.bind_addr
     }
 }
 
@@ -1175,7 +1253,6 @@ mod test {
     use std::io::Cursor;
     use std::sync::Arc;
 
-    use api::v1::greptime_request::Request;
     use arrow_ipc::reader::FileReader;
     use arrow_schema::DataType;
     use axum::handler::Handler;
@@ -1197,24 +1274,10 @@ mod test {
     use super::*;
     use crate::error::Error;
     use crate::http::test_helpers::TestClient;
-    use crate::query_handler::grpc::GrpcQueryHandler;
     use crate::query_handler::sql::{ServerSqlQueryHandlerAdapter, SqlQueryHandler};
 
     struct DummyInstance {
         _tx: mpsc::Sender<(String, Vec<u8>)>,
-    }
-
-    #[async_trait]
-    impl GrpcQueryHandler for DummyInstance {
-        type Error = Error;
-
-        async fn do_query(
-            &self,
-            _query: Request,
-            _ctx: QueryContextRef,
-        ) -> std::result::Result<Output, Self::Error> {
-            unimplemented!()
-        }
     }
 
     #[async_trait]
@@ -1286,6 +1349,16 @@ mod test {
         let client = TestClient::new(app).await;
 
         let res = client.get("/health").send().await;
+
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers()
+                .get(http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .expect("expect cors header origin"),
+            "*"
+        );
+
+        let res = client.get("/v1/health").send().await;
 
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(
@@ -1384,7 +1457,7 @@ mod test {
     fn test_http_options_default() {
         let default = HttpOptions::default();
         assert_eq!("127.0.0.1:4000".to_string(), default.addr);
-        assert_eq!(Duration::from_secs(30), default.timeout)
+        assert_eq!(Duration::from_secs(0), default.timeout)
     }
 
     #[tokio::test]
@@ -1479,21 +1552,25 @@ mod test {
         for format in [
             ResponseFormat::GreptimedbV1,
             ResponseFormat::InfluxdbV1,
-            ResponseFormat::Csv,
+            ResponseFormat::Csv(true, true),
             ResponseFormat::Table,
             ResponseFormat::Arrow,
             ResponseFormat::Json,
+            ResponseFormat::Null,
         ] {
             let recordbatches =
                 RecordBatches::try_new(schema.clone(), vec![recordbatch.clone()]).unwrap();
             let outputs = vec![Ok(Output::new_with_record_batches(recordbatches))];
             let json_resp = match format {
                 ResponseFormat::Arrow => ArrowResponse::from_output(outputs, None).await,
-                ResponseFormat::Csv => CsvResponse::from_output(outputs).await,
+                ResponseFormat::Csv(with_names, with_types) => {
+                    CsvResponse::from_output(outputs, with_names, with_types).await
+                }
                 ResponseFormat::Table => TableResponse::from_output(outputs).await,
                 ResponseFormat::GreptimedbV1 => GreptimedbV1Response::from_output(outputs).await,
                 ResponseFormat::InfluxdbV1 => InfluxdbV1Response::from_output(outputs, None).await,
                 ResponseFormat::Json => JsonResponse::from_output(outputs).await,
+                ResponseFormat::Null => NullResponse::from_output(outputs).await,
             };
 
             match json_resp {
@@ -1578,8 +1655,57 @@ mod test {
                     }
                 }
 
+                HttpResponse::Null(resp) => {
+                    assert_eq!(resp.rows(), 4);
+                }
+
                 HttpResponse::Error(err) => unreachable!("{err:?}"),
             }
         }
+    }
+
+    #[test]
+    fn test_response_format_misc() {
+        assert_eq!(ResponseFormat::default(), ResponseFormat::GreptimedbV1);
+        assert_eq!(ResponseFormat::parse("arrow"), Some(ResponseFormat::Arrow));
+        assert_eq!(
+            ResponseFormat::parse("csv"),
+            Some(ResponseFormat::Csv(false, false))
+        );
+        assert_eq!(
+            ResponseFormat::parse("csvwithnames"),
+            Some(ResponseFormat::Csv(true, false))
+        );
+        assert_eq!(
+            ResponseFormat::parse("csvwithnamesandtypes"),
+            Some(ResponseFormat::Csv(true, true))
+        );
+        assert_eq!(ResponseFormat::parse("table"), Some(ResponseFormat::Table));
+        assert_eq!(
+            ResponseFormat::parse("greptimedb_v1"),
+            Some(ResponseFormat::GreptimedbV1)
+        );
+        assert_eq!(
+            ResponseFormat::parse("influxdb_v1"),
+            Some(ResponseFormat::InfluxdbV1)
+        );
+        assert_eq!(ResponseFormat::parse("json"), Some(ResponseFormat::Json));
+        assert_eq!(ResponseFormat::parse("null"), Some(ResponseFormat::Null));
+
+        // invalid formats
+        assert_eq!(ResponseFormat::parse("invalid"), None);
+        assert_eq!(ResponseFormat::parse(""), None);
+        assert_eq!(ResponseFormat::parse("CSV"), None); // Case sensitive
+
+        // as str
+        assert_eq!(ResponseFormat::Arrow.as_str(), "arrow");
+        assert_eq!(ResponseFormat::Csv(false, false).as_str(), "csv");
+        assert_eq!(ResponseFormat::Csv(true, true).as_str(), "csv");
+        assert_eq!(ResponseFormat::Table.as_str(), "table");
+        assert_eq!(ResponseFormat::GreptimedbV1.as_str(), "greptimedb_v1");
+        assert_eq!(ResponseFormat::InfluxdbV1.as_str(), "influxdb_v1");
+        assert_eq!(ResponseFormat::Json.as_str(), "json");
+        assert_eq!(ResponseFormat::Null.as_str(), "null");
+        assert_eq!(ResponseFormat::default().as_str(), "greptimedb_v1");
     }
 }

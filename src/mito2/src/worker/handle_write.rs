@@ -19,16 +19,20 @@ use std::sync::Arc;
 
 use api::v1::OpType;
 use common_telemetry::{debug, error};
+use common_wal::options::WalOptions;
 use snafu::ensure;
 use store_api::codec::PrimaryKeyEncoding;
 use store_api::logstore::LogStore;
 use store_api::storage::RegionId;
 
-use crate::error::{InvalidRequestSnafu, RegionLeaderStateSnafu, RejectWriteSnafu, Result};
-use crate::metrics::{WRITE_REJECT_TOTAL, WRITE_ROWS_TOTAL, WRITE_STAGE_ELAPSED};
+use crate::error::{InvalidRequestSnafu, RegionStateSnafu, RejectWriteSnafu, Result};
+use crate::metrics;
+use crate::metrics::{
+    WRITE_REJECT_TOTAL, WRITE_ROWS_TOTAL, WRITE_STAGE_ELAPSED, WRITE_STALL_TOTAL,
+};
 use crate::region::{RegionLeaderState, RegionRoleState};
 use crate::region_write_ctx::RegionWriteCtx;
-use crate::request::{SenderWriteRequest, WriteRequest};
+use crate::request::{SenderBulkRequest, SenderWriteRequest, WriteRequest};
 use crate::worker::RegionWorkerLoop;
 
 impl<S: LogStore> RegionWorkerLoop<S> {
@@ -36,9 +40,10 @@ impl<S: LogStore> RegionWorkerLoop<S> {
     pub(crate) async fn handle_write_requests(
         &mut self,
         write_requests: &mut Vec<SenderWriteRequest>,
+        bulk_requests: &mut Vec<SenderBulkRequest>,
         allow_stall: bool,
     ) {
-        if write_requests.is_empty() {
+        if write_requests.is_empty() && bulk_requests.is_empty() {
             return;
         }
 
@@ -47,15 +52,17 @@ impl<S: LogStore> RegionWorkerLoop<S> {
 
         if self.should_reject_write() {
             // The memory pressure is still too high, reject write requests.
-            reject_write_requests(write_requests);
+            reject_write_requests(write_requests, bulk_requests);
             // Also reject all stalled requests.
             self.reject_stalled_requests();
             return;
         }
 
         if self.write_buffer_manager.should_stall() && allow_stall {
-            self.stalled_count.add(write_requests.len() as i64);
-            self.stalled_requests.append(write_requests);
+            let stalled_count = (write_requests.len() + bulk_requests.len()) as i64;
+            self.stalling_count.add(stalled_count);
+            WRITE_STALL_TOTAL.inc_by(stalled_count as u64);
+            self.stalled_requests.append(write_requests, bulk_requests);
             self.listener.on_write_stall();
             return;
         }
@@ -65,7 +72,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             let _timer = WRITE_STAGE_ELAPSED
                 .with_label_values(&["prepare_ctx"])
                 .start_timer();
-            self.prepare_region_write_ctx(write_requests)
+            self.prepare_region_write_ctx(write_requests, bulk_requests)
         };
 
         // Write to WAL.
@@ -75,6 +82,10 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                 .start_timer();
             let mut wal_writer = self.wal.writer();
             for region_ctx in region_ctxs.values_mut() {
+                if let WalOptions::Noop = &region_ctx.version().options.wal_options {
+                    // Skip wal write for noop region.
+                    continue;
+                }
                 if let Err(e) = region_ctx.add_wal_entry(&mut wal_writer).map_err(Arc::new) {
                     region_ctx.set_error(e);
                 }
@@ -82,6 +93,10 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             match wal_writer.write_to_wal().await.map_err(Arc::new) {
                 Ok(response) => {
                     for (region_id, region_ctx) in region_ctxs.iter_mut() {
+                        if let WalOptions::Noop = &region_ctx.version().options.wal_options {
+                            continue;
+                        }
+
                         // Safety: the log store implementation ensures that either the `write_to_wal` fails and no
                         // response is returned or the last entry ids for each region do exist.
                         let last_entry_id = response.last_entry_ids.get(region_id).unwrap();
@@ -108,6 +123,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                 // fast path for single region.
                 let mut region_ctx = region_ctxs.into_values().next().unwrap();
                 region_ctx.write_memtable().await;
+                region_ctx.write_bulk().await;
                 put_rows += region_ctx.put_num;
                 delete_rows += region_ctx.delete_num;
             } else {
@@ -117,6 +133,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                         // use tokio runtime to schedule tasks.
                         common_runtime::spawn_global(async move {
                             region_ctx.write_memtable().await;
+                            region_ctx.write_bulk().await;
                             (region_ctx.put_num, region_ctx.delete_num)
                         })
                     })
@@ -147,36 +164,40 @@ impl<S: LogStore> RegionWorkerLoop<S> {
     pub(crate) async fn handle_stalled_requests(&mut self) {
         // Handle stalled requests.
         let stalled = std::mem::take(&mut self.stalled_requests);
-        self.stalled_count.sub(stalled.requests.len() as i64);
+        self.stalling_count.sub(stalled.stalled_count() as i64);
         // We already stalled these requests, don't stall them again.
-        for (_, (_, mut requests)) in stalled.requests {
-            self.handle_write_requests(&mut requests, false).await;
+        for (_, (_, mut requests, mut bulk)) in stalled.requests {
+            self.handle_write_requests(&mut requests, &mut bulk, false)
+                .await;
         }
     }
 
     /// Rejects all stalled requests.
     pub(crate) fn reject_stalled_requests(&mut self) {
         let stalled = std::mem::take(&mut self.stalled_requests);
-        self.stalled_count.sub(stalled.requests.len() as i64);
-        for (_, (_, mut requests)) in stalled.requests {
-            reject_write_requests(&mut requests);
+        self.stalling_count.sub(stalled.stalled_count() as i64);
+        for (_, (_, mut requests, mut bulk)) in stalled.requests {
+            reject_write_requests(&mut requests, &mut bulk);
         }
     }
 
     /// Rejects a specific region's stalled requests.
     pub(crate) fn reject_region_stalled_requests(&mut self, region_id: &RegionId) {
         debug!("Rejects stalled requests for region {}", region_id);
-        let mut requests = self.stalled_requests.remove(region_id);
-        self.stalled_count.sub(requests.len() as i64);
-        reject_write_requests(&mut requests);
+        let (mut requests, mut bulk) = self.stalled_requests.remove(region_id);
+        self.stalling_count
+            .sub((requests.len() + bulk.len()) as i64);
+        reject_write_requests(&mut requests, &mut bulk);
     }
 
     /// Handles a specific region's stalled requests.
     pub(crate) async fn handle_region_stalled_requests(&mut self, region_id: &RegionId) {
         debug!("Handles stalled requests for region {}", region_id);
-        let mut requests = self.stalled_requests.remove(region_id);
-        self.stalled_count.sub(requests.len() as i64);
-        self.handle_write_requests(&mut requests, true).await;
+        let (mut requests, mut bulk) = self.stalled_requests.remove(region_id);
+        self.stalling_count
+            .sub((requests.len() + bulk.len()) as i64);
+        self.handle_write_requests(&mut requests, &mut bulk, true)
+            .await;
     }
 }
 
@@ -185,9 +206,20 @@ impl<S> RegionWorkerLoop<S> {
     fn prepare_region_write_ctx(
         &mut self,
         write_requests: &mut Vec<SenderWriteRequest>,
+        bulk_requests: &mut Vec<SenderBulkRequest>,
     ) -> HashMap<RegionId, RegionWriteCtx> {
         // Initialize region write context map.
         let mut region_ctxs = HashMap::new();
+        self.process_write_requests(&mut region_ctxs, write_requests);
+        self.process_bulk_requests(&mut region_ctxs, bulk_requests);
+        region_ctxs
+    }
+
+    fn process_write_requests(
+        &mut self,
+        region_ctxs: &mut HashMap<RegionId, RegionWriteCtx>,
+        write_requests: &mut Vec<SenderWriteRequest>,
+    ) {
         for mut sender_req in write_requests.drain(..) {
             let region_id = sender_req.request.region_id;
 
@@ -224,17 +256,18 @@ impl<S> RegionWorkerLoop<S> {
                             "Region {} is altering, add request to pending writes",
                             region.region_id
                         );
-                        self.stalled_count.add(1);
+                        self.stalling_count.add(1);
+                        WRITE_STALL_TOTAL.inc();
                         self.stalled_requests.push(sender_req);
                         continue;
                     }
                     state => {
                         // The region is not writable.
                         sender_req.sender.send(
-                            RegionLeaderStateSnafu {
+                            RegionStateSnafu {
                                 region_id,
                                 state,
-                                expect: RegionLeaderState::Writable,
+                                expect: RegionRoleState::Leader(RegionLeaderState::Writable),
                             }
                             .fail(),
                         );
@@ -285,12 +318,96 @@ impl<S> RegionWorkerLoop<S> {
                 sender_req.sender,
             );
         }
+    }
 
-        region_ctxs
+    /// Processes bulk insert requests.
+    fn process_bulk_requests(
+        &mut self,
+        region_ctxs: &mut HashMap<RegionId, RegionWriteCtx>,
+        requests: &mut Vec<SenderBulkRequest>,
+    ) {
+        let _timer = metrics::REGION_WORKER_HANDLE_WRITE_ELAPSED
+            .with_label_values(&["prepare_bulk_request"])
+            .start_timer();
+        for mut bulk_req in requests.drain(..) {
+            let region_id = bulk_req.region_id;
+            // If region is waiting for alteration, add requests to pending writes.
+            if self.flush_scheduler.has_pending_ddls(region_id) {
+                // Safety: The region has pending ddls.
+                self.flush_scheduler.add_bulk_request_to_pending(bulk_req);
+                continue;
+            }
+
+            // Checks whether the region exists and is it stalling.
+            if let hash_map::Entry::Vacant(e) = region_ctxs.entry(region_id) {
+                let Some(region) = self.regions.get_region_or(region_id, &mut bulk_req.sender)
+                else {
+                    continue;
+                };
+                match region.state() {
+                    RegionRoleState::Leader(RegionLeaderState::Writable) => {
+                        let region_ctx = RegionWriteCtx::new(
+                            region.region_id,
+                            &region.version_control,
+                            region.provider.clone(),
+                        );
+
+                        e.insert(region_ctx);
+                    }
+                    RegionRoleState::Leader(RegionLeaderState::Altering) => {
+                        debug!(
+                            "Region {} is altering, add request to pending writes",
+                            region.region_id
+                        );
+                        self.stalling_count.add(1);
+                        WRITE_STALL_TOTAL.inc();
+                        self.stalled_requests.push_bulk(bulk_req);
+                        continue;
+                    }
+                    state => {
+                        // The region is not writable.
+                        bulk_req.sender.send(
+                            RegionStateSnafu {
+                                region_id,
+                                state,
+                                expect: RegionRoleState::Leader(RegionLeaderState::Writable),
+                            }
+                            .fail(),
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            // Safety: Now we ensure the region exists.
+            let region_ctx = region_ctxs.get_mut(&region_id).unwrap();
+
+            // Double-check the request schema
+            let need_fill_missing_columns = region_ctx.version().metadata.schema_version
+                != bulk_req.region_metadata.schema_version;
+
+            // Only fill missing columns if primary key is dense encoded.
+            if need_fill_missing_columns {
+                // todo(hl): support filling default columns
+                bulk_req.sender.send(
+                    InvalidRequestSnafu {
+                        region_id,
+                        reason: "Schema mismatch",
+                    }
+                    .fail(),
+                );
+                return;
+            }
+
+            // Collect requests by region.
+            if !region_ctx.push_bulk(bulk_req.sender, bulk_req.request) {
+                return;
+            }
+        }
     }
 
     /// Returns true if the engine needs to reject some write requests.
-    fn should_reject_write(&self) -> bool {
+    pub(crate) fn should_reject_write(&self) -> bool {
         // If memory usage reaches high threshold (we should also consider stalled requests) returns true.
         self.write_buffer_manager.memory_usage() + self.stalled_requests.estimated_size
             >= self.config.global_write_buffer_reject_size.as_bytes() as usize
@@ -298,7 +415,10 @@ impl<S> RegionWorkerLoop<S> {
 }
 
 /// Send rejected error to all `write_requests`.
-fn reject_write_requests(write_requests: &mut Vec<SenderWriteRequest>) {
+fn reject_write_requests(
+    write_requests: &mut Vec<SenderWriteRequest>,
+    bulk_requests: &mut Vec<SenderBulkRequest>,
+) {
     WRITE_REJECT_TOTAL.inc_by(write_requests.len() as u64);
 
     for req in write_requests.drain(..) {
@@ -308,6 +428,10 @@ fn reject_write_requests(write_requests: &mut Vec<SenderWriteRequest>) {
             }
             .fail(),
         );
+    }
+    for req in bulk_requests.drain(..) {
+        let region_id = req.region_id;
+        req.sender.send(RejectWriteSnafu { region_id }.fail());
     }
 }
 

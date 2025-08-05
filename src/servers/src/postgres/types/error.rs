@@ -374,6 +374,7 @@ impl From<StatusCode> for PgErrorCode {
             StatusCode::Unsupported => PgErrorCode::Ec0A000,
             StatusCode::InvalidArguments => PgErrorCode::Ec22023,
             StatusCode::Cancelled => PgErrorCode::Ec57000,
+            StatusCode::DeadlineExceeded => PgErrorCode::Ec57000,
             StatusCode::External => PgErrorCode::Ec58000,
 
             StatusCode::Unknown
@@ -388,11 +389,13 @@ impl From<StatusCode> for PgErrorCode {
             // ====== End of SQL & query related status code ===========
 
             // ====== Begin of catalog & flow related status code =====
-            StatusCode::TableNotFound | StatusCode::FlowNotFound | StatusCode::RegionNotFound => {
-                PgErrorCode::Ec42P01
-            }
+            StatusCode::TableNotFound
+            | StatusCode::FlowNotFound
+            | StatusCode::RegionNotFound
+            | StatusCode::TriggerNotFound => PgErrorCode::Ec42P01,
             StatusCode::TableAlreadyExists
             | StatusCode::FlowAlreadyExists
+            | StatusCode::TriggerAlreadyExists
             | StatusCode::RegionAlreadyExists => PgErrorCode::Ec42P07,
 
             StatusCode::TableColumnNotFound => PgErrorCode::Ec42703,

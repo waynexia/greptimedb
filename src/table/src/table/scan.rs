@@ -25,17 +25,25 @@ use common_telemetry::tracing_context::TracingContext;
 use common_telemetry::warn;
 use datafusion::error::Result as DfResult;
 use datafusion::execution::context::TaskContext;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, PlanProperties,
+    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
     RecordBatchStream as DfRecordBatchStream,
 };
 use datafusion_common::stats::Precision;
 use datafusion_common::{ColumnStatistics, DataFusionError, Statistics};
-use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalSortExpr};
+use datafusion_physical_expr::expressions::Column;
+use datafusion_physical_expr::{
+    EquivalenceProperties, LexOrdering, Partitioning, PhysicalSortExpr,
+};
 use datatypes::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use datatypes::compute::SortOptions;
 use futures::{Stream, StreamExt};
-use store_api::region_engine::{PartitionRange, PrepareRequest, RegionScannerRef};
+use store_api::region_engine::{
+    PartitionRange, PrepareRequest, QueryScanContext, RegionScannerRef,
+};
+use store_api::storage::{ScanRequest, TimeSeriesDistribution};
 
 use crate::table::metrics::StreamMetrics;
 
@@ -51,10 +59,13 @@ pub struct RegionScanExec {
     append_mode: bool,
     total_rows: usize,
     is_partition_set: bool,
+    // TODO(ruihang): handle TimeWindowed dist via this parameter
+    distribution: Option<TimeSeriesDistribution>,
+    explain_verbose: bool,
 }
 
 impl RegionScanExec {
-    pub fn new(scanner: RegionScannerRef) -> Self {
+    pub fn new(scanner: RegionScannerRef, request: ScanRequest) -> DfResult<Self> {
         let arrow_schema = scanner.schema().arrow_schema().clone();
         let scanner_props = scanner.properties();
         let mut num_output_partition = scanner_props.num_partitions();
@@ -64,14 +75,90 @@ impl RegionScanExec {
         if num_output_partition == 0 {
             num_output_partition = 1;
         }
+
+        let metadata = scanner.metadata();
+        let mut pk_names = metadata
+            .primary_key_columns()
+            .map(|col| col.column_schema.name.clone())
+            .collect::<Vec<_>>();
+        // workaround for logical table
+        if scanner.properties().is_logical_region() {
+            pk_names.sort_unstable();
+        }
+        let pk_columns = pk_names
+            .iter()
+            .filter_map(
+                |col| Some(Arc::new(Column::new_with_schema(col, &arrow_schema).ok()?) as _),
+            )
+            .collect::<Vec<_>>();
+        let mut pk_sort_columns: Vec<PhysicalSortExpr> = pk_names
+            .iter()
+            .filter_map(|col| {
+                Some(PhysicalSortExpr::new(
+                    Arc::new(Column::new_with_schema(col, &arrow_schema).ok()?) as _,
+                    SortOptions {
+                        descending: false,
+                        nulls_first: true,
+                    },
+                ))
+            })
+            .collect::<Vec<_>>();
+        let ts_col: Option<PhysicalSortExpr> = try {
+            PhysicalSortExpr::new(
+                Arc::new(
+                    Column::new_with_schema(
+                        &metadata.time_index_column().column_schema.name,
+                        &arrow_schema,
+                    )
+                    .ok()?,
+                ) as _,
+                SortOptions {
+                    descending: false,
+                    nulls_first: true,
+                },
+            )
+        };
+
+        let eq_props = match request.distribution {
+            Some(TimeSeriesDistribution::PerSeries) => {
+                if let Some(ts) = ts_col {
+                    pk_sort_columns.push(ts);
+                }
+                EquivalenceProperties::new_with_orderings(
+                    arrow_schema.clone(),
+                    &[LexOrdering::new(pk_sort_columns)],
+                )
+            }
+            Some(TimeSeriesDistribution::TimeWindowed) => {
+                if let Some(ts_col) = ts_col {
+                    pk_sort_columns.insert(0, ts_col);
+                }
+                EquivalenceProperties::new_with_orderings(
+                    arrow_schema.clone(),
+                    &[LexOrdering::new(pk_sort_columns)],
+                )
+            }
+            None => EquivalenceProperties::new(arrow_schema.clone()),
+        };
+
+        let partitioning = match request.distribution {
+            Some(TimeSeriesDistribution::PerSeries) => {
+                Partitioning::Hash(pk_columns.clone(), num_output_partition)
+            }
+            Some(TimeSeriesDistribution::TimeWindowed) | None => {
+                Partitioning::UnknownPartitioning(num_output_partition)
+            }
+        };
+
         let properties = PlanProperties::new(
-            EquivalenceProperties::new(arrow_schema.clone()),
-            Partitioning::UnknownPartitioning(num_output_partition),
-            ExecutionMode::Bounded,
+            eq_props,
+            partitioning,
+            EmissionType::Incremental,
+            Boundedness::Bounded,
         );
         let append_mode = scanner_props.append_mode();
         let total_rows = scanner_props.total_rows();
-        Self {
+        Ok(Self {
             scanner: Arc::new(Mutex::new(scanner)),
             arrow_schema,
             output_ordering: None,
@@ -80,7 +167,9 @@ impl RegionScanExec {
             append_mode,
             total_rows,
             is_partition_set: false,
-        }
+            distribution: request.distribution,
+            explain_verbose: false,
+        })
     }
 
     /// Get the partition ranges of the scanner. This method will collapse the ranges into
@@ -118,9 +207,14 @@ impl RegionScanExec {
             warn!("Setting partition ranges more than once for RegionScanExec");
         }
 
-        let num_partitions = partitions.len();
         let mut properties = self.properties.clone();
-        properties.partitioning = Partitioning::UnknownPartitioning(num_partitions);
+        let new_partitioning = match properties.partitioning {
+            Partitioning::Hash(ref columns, _) => {
+                Partitioning::Hash(columns.clone(), target_partitions)
+            }
+            _ => Partitioning::UnknownPartitioning(target_partitions),
+        };
+        properties.partitioning = new_partitioning;
 
         {
             let mut scanner = self.scanner.lock().unwrap();
@@ -140,7 +234,13 @@ impl RegionScanExec {
             append_mode: self.append_mode,
             total_rows: self.total_rows,
             is_partition_set: true,
+            distribution: self.distribution,
+            explain_verbose: self.explain_verbose,
         })
+    }
+
+    pub fn distribution(&self) -> Option<TimeSeriesDistribution> {
+        self.distribution
     }
 
     pub fn with_distinguish_partition_range(&self, distinguish_partition_range: bool) {
@@ -170,6 +270,10 @@ impl RegionScanExec {
             .primary_key_columns()
             .map(|col| col.column_schema.name.clone())
             .collect()
+    }
+
+    pub fn set_explain_verbose(&mut self, explain_verbose: bool) {
+        self.explain_verbose = explain_verbose;
     }
 }
 
@@ -206,11 +310,14 @@ impl ExecutionPlan for RegionScanExec {
         let span =
             tracing_context.attach(common_telemetry::tracing::info_span!("read_from_region"));
 
+        let ctx = QueryScanContext {
+            explain_verbose: self.explain_verbose,
+        };
         let stream = self
             .scanner
             .lock()
             .unwrap()
-            .scan_partition(partition)
+            .scan_partition(&ctx, &self.metric, partition)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let stream_metrics = StreamMetrics::new(&self.metric, partition);
         Ok(Box::pin(StreamWithMetricWrapper {
@@ -388,7 +495,7 @@ mod test {
         let region_metadata = Arc::new(builder.build().unwrap());
 
         let scanner = Box::new(SinglePartitionScanner::new(stream, false, region_metadata));
-        let plan = RegionScanExec::new(scanner);
+        let plan = RegionScanExec::new(scanner, ScanRequest::default()).unwrap();
         let actual: SchemaRef = Arc::new(
             plan.properties
                 .eq_properties
@@ -405,12 +512,6 @@ mod test {
         assert_eq!(batch2.df_record_batch(), &recordbatches[1]);
 
         let result = plan.execute(0, ctx.task_ctx());
-        assert!(result.is_err());
-        match result {
-            Err(e) => assert!(e
-                .to_string()
-                .contains("Not expected to run ExecutionPlan more than once")),
-            _ => unreachable!(),
-        }
+        assert!(result.is_ok());
     }
 }

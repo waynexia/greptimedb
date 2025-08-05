@@ -21,14 +21,14 @@ use arc_swap::ArcSwapOption;
 use arrow_flight::Ticket;
 use async_stream::stream;
 use async_trait::async_trait;
-use common_error::ext::{BoxedError, ErrorExt};
+use common_error::ext::BoxedError;
 use common_error::status_code::StatusCode;
 use common_grpc::flight::{FlightDecoder, FlightMessage};
 use common_meta::error::{self as meta_error, Result as MetaResult};
 use common_meta::node_manager::Datanode;
 use common_query::request::QueryRequest;
 use common_recordbatch::error::ExternalSnafu;
-use common_recordbatch::{RecordBatchStreamWrapper, SendableRecordBatchStream};
+use common_recordbatch::{RecordBatch, RecordBatchStreamWrapper, SendableRecordBatchStream};
 use common_telemetry::error;
 use common_telemetry::tracing_context::TracingContext;
 use prost::Message;
@@ -46,6 +46,8 @@ use crate::{metrics, Client, Error};
 #[derive(Debug)]
 pub struct RegionRequester {
     client: Client,
+    send_compression: bool,
+    accept_compression: bool,
 }
 
 #[async_trait]
@@ -55,6 +57,7 @@ impl Datanode for RegionRequester {
             if err.should_retry() {
                 meta_error::Error::RetryLater {
                     source: BoxedError::new(err),
+                    clean_poisons: false,
                 }
             } else {
                 meta_error::Error::External {
@@ -88,34 +91,34 @@ impl Datanode for RegionRequester {
 }
 
 impl RegionRequester {
-    pub fn new(client: Client) -> Self {
-        Self { client }
+    pub fn new(client: Client, send_compression: bool, accept_compression: bool) -> Self {
+        Self {
+            client,
+            send_compression,
+            accept_compression,
+        }
     }
 
     pub async fn do_get_inner(&self, ticket: Ticket) -> Result<SendableRecordBatchStream> {
-        let mut flight_client = self.client.make_flight_client()?;
+        let mut flight_client = self
+            .client
+            .make_flight_client(self.send_compression, self.accept_compression)?;
         let response = flight_client
             .mut_inner()
             .do_get(ticket)
             .await
-            .map_err(|e| {
+            .or_else(|e| {
                 let tonic_code = e.code();
                 let e: error::Error = e.into();
-                let code = e.status_code();
-                let msg = e.to_string();
-                let error = ServerSnafu { code, msg }
-                    .fail::<()>()
-                    .map_err(BoxedError::new)
-                    .with_context(|_| FlightGetSnafu {
-                        tonic_code,
-                        addr: flight_client.addr().to_string(),
-                    })
-                    .unwrap_err();
                 error!(
                     e; "Failed to do Flight get, addr: {}, code: {}",
                     flight_client.addr(),
                     tonic_code
                 );
+                let error = Err(BoxedError::new(e)).with_context(|_| FlightGetSnafu {
+                    addr: flight_client.addr().to_string(),
+                    tonic_code,
+                });
                 error
             })?;
 
@@ -125,7 +128,10 @@ impl RegionRequester {
         let mut flight_message_stream = flight_data_stream.map(move |flight_data| {
             flight_data
                 .map_err(Error::from)
-                .and_then(|data| decoder.try_decode(data).context(ConvertFlightDataSnafu))
+                .and_then(|data| decoder.try_decode(&data).context(ConvertFlightDataSnafu))?
+                .context(IllegalFlightMessagesSnafu {
+                    reason: "none message",
+                })
         });
 
         let Some(first_flight_message) = flight_message_stream.next().await else {
@@ -146,18 +152,78 @@ impl RegionRequester {
 
         let tracing_context = TracingContext::from_current_span();
 
+        let schema = Arc::new(
+            datatypes::schema::Schema::try_from(schema).context(error::ConvertSchemaSnafu)?,
+        );
+        let schema_cloned = schema.clone();
         let stream = Box::pin(stream!({
             let _span = tracing_context.attach(common_telemetry::tracing::info_span!(
                 "poll_flight_data_stream"
             ));
-            while let Some(flight_message) = flight_message_stream.next().await {
-                let flight_message = flight_message
-                    .map_err(BoxedError::new)
-                    .context(ExternalSnafu)?;
+
+            let mut buffered_message: Option<FlightMessage> = None;
+            let mut stream_ended = false;
+
+            while !stream_ended {
+                // get the next message from the buffered message or read from the flight message stream
+                let flight_message_item = if let Some(msg) = buffered_message.take() {
+                    Some(Ok(msg))
+                } else {
+                    flight_message_stream.next().await
+                };
+
+                let flight_message = match flight_message_item {
+                    Some(Ok(message)) => message,
+                    Some(Err(e)) => {
+                        yield Err(BoxedError::new(e)).context(ExternalSnafu);
+                        break;
+                    }
+                    None => break,
+                };
 
                 match flight_message {
-                    FlightMessage::Recordbatch(record_batch) => yield Ok(record_batch),
+                    FlightMessage::RecordBatch(record_batch) => {
+                        let result_to_yield = RecordBatch::try_from_df_record_batch(
+                            schema_cloned.clone(),
+                            record_batch,
+                        );
+
+                        // get the next message from the stream. normally it should be a metrics message.
+                        if let Some(next_flight_message_result) = flight_message_stream.next().await
+                        {
+                            match next_flight_message_result {
+                                Ok(FlightMessage::Metrics(s)) => {
+                                    let m = serde_json::from_str(&s).ok().map(Arc::new);
+                                    metrics_ref.swap(m);
+                                }
+                                Ok(FlightMessage::RecordBatch(rb)) => {
+                                    // for some reason it's not a metrics message, so we need to buffer this record batch
+                                    // and yield it in the next iteration.
+                                    buffered_message = Some(FlightMessage::RecordBatch(rb));
+                                }
+                                Ok(_) => {
+                                    yield IllegalFlightMessagesSnafu {
+                                        reason: "A RecordBatch message can only be succeeded by a Metrics message or another RecordBatch message"
+                                    }
+                                    .fail()
+                                    .map_err(BoxedError::new)
+                                    .context(ExternalSnafu);
+                                    break;
+                                }
+                                Err(e) => {
+                                    yield Err(BoxedError::new(e)).context(ExternalSnafu);
+                                    break;
+                                }
+                            }
+                        } else {
+                            // the stream has ended
+                            stream_ended = true;
+                        }
+
+                        yield result_to_yield;
+                    }
                     FlightMessage::Metrics(s) => {
+                        // just a branch in case of some metrics message comes after other things.
                         let m = serde_json::from_str(&s).ok().map(Arc::new);
                         metrics_ref.swap(m);
                         break;
@@ -201,12 +267,11 @@ impl RegionRequester {
             .await
             .map_err(|e| {
                 let code = e.code();
-                let err: error::Error = e.into();
                 // Uses `Error::RegionServer` instead of `Error::Server`
                 error::Error::RegionServer {
                     addr,
                     code,
-                    source: BoxedError::new(err),
+                    source: BoxedError::new(error::Error::from(e)),
                     location: location!(),
                 }
             })?

@@ -13,12 +13,11 @@
 // limitations under the License.
 
 pub(crate) mod bloom_filter;
-mod codec;
 pub(crate) mod fulltext_index;
 mod indexer;
-pub(crate) mod intermediate;
+pub mod intermediate;
 pub(crate) mod inverted_index;
-pub(crate) mod puffin_manager;
+pub mod puffin_manager;
 mod statistics;
 pub(crate) mod store;
 
@@ -392,6 +391,7 @@ mod tests {
     use super::*;
     use crate::access_layer::FilePathProvider;
     use crate::config::{FulltextIndexConfig, Mode};
+    use crate::sst::file::RegionFileId;
 
     struct MetaConfig {
         with_inverted: bool,
@@ -453,10 +453,11 @@ mod tests {
         if with_skipping_bloom {
             let column_schema =
                 ColumnSchema::new("bloom", ConcreteDataType::string_datatype(), false)
-                    .with_skipping_options(SkippingIndexOptions {
-                        granularity: 42,
-                        index_type: SkippingIndexType::BloomFilter,
-                    })
+                    .with_skipping_options(SkippingIndexOptions::new_unchecked(
+                        42,
+                        0.01,
+                        SkippingIndexType::BloomFilter,
+                    ))
                     .unwrap();
 
             let column = ColumnMetadata {
@@ -482,11 +483,11 @@ mod tests {
     struct NoopPathProvider;
 
     impl FilePathProvider for NoopPathProvider {
-        fn build_index_file_path(&self, _file_id: FileId) -> String {
+        fn build_index_file_path(&self, _file_id: RegionFileId) -> String {
             unreachable!()
         }
 
-        fn build_sst_file_path(&self, _file_id: FileId) -> String {
+        fn build_sst_file_path(&self, _file_id: RegionFileId) -> String {
             unreachable!()
         }
     }

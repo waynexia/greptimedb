@@ -30,11 +30,11 @@ use serde::{Deserialize, Serialize};
 use crate::error::{self, Error, Result};
 use crate::type_id::LogicalTypeId;
 use crate::types::{
-    BinaryType, BooleanType, DateTimeType, DateType, Decimal128Type, DictionaryType,
-    DurationMicrosecondType, DurationMillisecondType, DurationNanosecondType, DurationSecondType,
-    DurationType, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
-    IntervalDayTimeType, IntervalMonthDayNanoType, IntervalType, IntervalYearMonthType, JsonType,
-    ListType, NullType, StringType, TimeMillisecondType, TimeType, TimestampMicrosecondType,
+    BinaryType, BooleanType, DateType, Decimal128Type, DictionaryType, DurationMicrosecondType,
+    DurationMillisecondType, DurationNanosecondType, DurationSecondType, DurationType, Float32Type,
+    Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, IntervalDayTimeType,
+    IntervalMonthDayNanoType, IntervalType, IntervalYearMonthType, JsonType, ListType, NullType,
+    StringType, StructType, TimeMillisecondType, TimeType, TimestampMicrosecondType,
     TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, TimestampType,
     UInt16Type, UInt32Type, UInt64Type, UInt8Type, VectorType,
 };
@@ -68,7 +68,6 @@ pub enum ConcreteDataType {
 
     // Date and time types:
     Date(DateType),
-    DateTime(DateTimeType),
     Timestamp(TimestampType),
     Time(TimeType),
 
@@ -81,6 +80,7 @@ pub enum ConcreteDataType {
     // Compound types:
     List(ListType),
     Dictionary(DictionaryType),
+    Struct(StructType),
 
     // JSON type:
     Json(JsonType),
@@ -107,7 +107,6 @@ impl fmt::Display for ConcreteDataType {
             ConcreteDataType::Binary(v) => write!(f, "{}", v.name()),
             ConcreteDataType::String(v) => write!(f, "{}", v.name()),
             ConcreteDataType::Date(v) => write!(f, "{}", v.name()),
-            ConcreteDataType::DateTime(v) => write!(f, "{}", v.name()),
             ConcreteDataType::Timestamp(t) => match t {
                 TimestampType::Second(v) => write!(f, "{}", v.name()),
                 TimestampType::Millisecond(v) => write!(f, "{}", v.name()),
@@ -133,6 +132,7 @@ impl fmt::Display for ConcreteDataType {
             },
             ConcreteDataType::Decimal128(v) => write!(f, "{}", v.name()),
             ConcreteDataType::List(v) => write!(f, "{}", v.name()),
+            ConcreteDataType::Struct(v) => write!(f, "{}", v.name()),
             ConcreteDataType::Dictionary(v) => write!(f, "{}", v.name()),
             ConcreteDataType::Json(v) => write!(f, "{}", v.name()),
             ConcreteDataType::Vector(v) => write!(f, "{}", v.name()),
@@ -163,7 +163,6 @@ impl ConcreteDataType {
             self,
             ConcreteDataType::String(_)
                 | ConcreteDataType::Date(_)
-                | ConcreteDataType::DateTime(_)
                 | ConcreteDataType::Timestamp(_)
                 | ConcreteDataType::Time(_)
                 | ConcreteDataType::Interval(_)
@@ -183,7 +182,6 @@ impl ConcreteDataType {
                 | ConcreteDataType::Int32(_)
                 | ConcreteDataType::Int64(_)
                 | ConcreteDataType::Date(_)
-                | ConcreteDataType::DateTime(_)
                 | ConcreteDataType::Timestamp(_)
                 | ConcreteDataType::Time(_)
                 | ConcreteDataType::Interval(_)
@@ -385,7 +383,7 @@ impl ConcreteDataType {
             &ConcreteDataType::Binary(_) | &ConcreteDataType::Vector(_) => "BYTEA",
             &ConcreteDataType::String(_) => "VARCHAR",
             &ConcreteDataType::Date(_) => "DATE",
-            &ConcreteDataType::DateTime(_) | &ConcreteDataType::Timestamp(_) => "TIMESTAMP",
+            &ConcreteDataType::Timestamp(_) => "TIMESTAMP",
             &ConcreteDataType::Time(_) => "TIME",
             &ConcreteDataType::Interval(_) => "INTERVAL",
             &ConcreteDataType::Decimal128(_) => "NUMERIC",
@@ -402,7 +400,7 @@ impl ConcreteDataType {
                 &ConcreteDataType::Binary(_) => "_BYTEA",
                 &ConcreteDataType::String(_) => "_VARCHAR",
                 &ConcreteDataType::Date(_) => "_DATE",
-                &ConcreteDataType::DateTime(_) | &ConcreteDataType::Timestamp(_) => "_TIMESTAMP",
+                &ConcreteDataType::Timestamp(_) => "_TIMESTAMP",
                 &ConcreteDataType::Time(_) => "_TIME",
                 &ConcreteDataType::Interval(_) => "_INTERVAL",
                 &ConcreteDataType::Decimal128(_) => "_NUMERIC",
@@ -410,9 +408,12 @@ impl ConcreteDataType {
                 &ConcreteDataType::Duration(_)
                 | &ConcreteDataType::Dictionary(_)
                 | &ConcreteDataType::Vector(_)
-                | &ConcreteDataType::List(_) => "UNKNOWN",
+                | &ConcreteDataType::List(_)
+                | &ConcreteDataType::Struct(_) => "UNKNOWN",
             },
-            &ConcreteDataType::Duration(_) | &ConcreteDataType::Dictionary(_) => "UNKNOWN",
+            &ConcreteDataType::Duration(_)
+            | &ConcreteDataType::Dictionary(_)
+            | &ConcreteDataType::Struct(_) => "UNKNOWN",
         }
     }
 }
@@ -441,7 +442,6 @@ impl TryFrom<&ArrowDataType> for ConcreteDataType {
             ArrowDataType::Float32 => Self::float32_datatype(),
             ArrowDataType::Float64 => Self::float64_datatype(),
             ArrowDataType::Date32 => Self::date_datatype(),
-            ArrowDataType::Date64 => Self::datetime_datatype(),
             ArrowDataType::Timestamp(u, _) => ConcreteDataType::from_arrow_time_unit(u),
             ArrowDataType::Interval(u) => ConcreteDataType::from_arrow_interval_unit(u),
             ArrowDataType::Binary | ArrowDataType::LargeBinary => Self::binary_datatype(),
@@ -462,7 +462,20 @@ impl TryFrom<&ArrowDataType> for ConcreteDataType {
             ArrowDataType::Decimal128(precision, scale) => {
                 ConcreteDataType::decimal128_datatype(*precision, *scale)
             }
-            _ => {
+            ArrowDataType::Struct(fields) => ConcreteDataType::Struct(fields.try_into()?),
+            ArrowDataType::Float16
+            | ArrowDataType::Date64
+            | ArrowDataType::FixedSizeBinary(_)
+            | ArrowDataType::BinaryView
+            | ArrowDataType::Utf8View
+            | ArrowDataType::ListView(_)
+            | ArrowDataType::FixedSizeList(_, _)
+            | ArrowDataType::LargeList(_)
+            | ArrowDataType::LargeListView(_)
+            | ArrowDataType::Union(_, _)
+            | ArrowDataType::Decimal256(_, _)
+            | ArrowDataType::Map(_, _)
+            | ArrowDataType::RunEndEncoded(_, _) => {
                 return error::UnsupportedArrowTypeSnafu {
                     arrow_type: dt.clone(),
                 }
@@ -490,7 +503,7 @@ macro_rules! impl_new_concrete_type_functions {
 
 impl_new_concrete_type_functions!(
     Null, Boolean, UInt8, UInt16, UInt32, UInt64, Int8, Int16, Int32, Int64, Float32, Float64,
-    Binary, Date, DateTime, String, Json
+    Binary, Date, String, Json
 );
 
 impl ConcreteDataType {
@@ -616,6 +629,10 @@ impl ConcreteDataType {
 
     pub fn list_datatype(item_type: ConcreteDataType) -> ConcreteDataType {
         ConcreteDataType::List(ListType::new(item_type))
+    }
+
+    pub fn struct_datatype(fields: StructType) -> ConcreteDataType {
+        ConcreteDataType::Struct(fields)
     }
 
     pub fn dictionary_datatype(
@@ -814,7 +831,6 @@ mod tests {
         assert!(ConcreteDataType::string_datatype().is_stringifiable());
         assert!(ConcreteDataType::binary_datatype().is_stringifiable());
         assert!(ConcreteDataType::date_datatype().is_stringifiable());
-        assert!(ConcreteDataType::datetime_datatype().is_stringifiable());
         assert!(ConcreteDataType::timestamp_second_datatype().is_stringifiable());
         assert!(ConcreteDataType::timestamp_millisecond_datatype().is_stringifiable());
         assert!(ConcreteDataType::timestamp_microsecond_datatype().is_stringifiable());
@@ -843,7 +859,6 @@ mod tests {
         assert!(ConcreteDataType::int32_datatype().is_signed());
         assert!(ConcreteDataType::int64_datatype().is_signed());
         assert!(ConcreteDataType::date_datatype().is_signed());
-        assert!(ConcreteDataType::datetime_datatype().is_signed());
         assert!(ConcreteDataType::timestamp_second_datatype().is_signed());
         assert!(ConcreteDataType::timestamp_millisecond_datatype().is_signed());
         assert!(ConcreteDataType::timestamp_microsecond_datatype().is_signed());
@@ -878,7 +893,6 @@ mod tests {
         assert!(!ConcreteDataType::int32_datatype().is_unsigned());
         assert!(!ConcreteDataType::int64_datatype().is_unsigned());
         assert!(!ConcreteDataType::date_datatype().is_unsigned());
-        assert!(!ConcreteDataType::datetime_datatype().is_unsigned());
         assert!(!ConcreteDataType::timestamp_second_datatype().is_unsigned());
         assert!(!ConcreteDataType::timestamp_millisecond_datatype().is_unsigned());
         assert!(!ConcreteDataType::timestamp_microsecond_datatype().is_unsigned());

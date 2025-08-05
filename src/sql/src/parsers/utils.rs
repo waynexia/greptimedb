@@ -28,7 +28,9 @@ use datafusion_sql::planner::{ContextProvider, SqlToRel};
 use datafusion_sql::TableReference;
 use datatypes::arrow::datatypes::DataType;
 use datatypes::schema::{
-    COLUMN_FULLTEXT_OPT_KEY_ANALYZER, COLUMN_FULLTEXT_OPT_KEY_CASE_SENSITIVE,
+    COLUMN_FULLTEXT_OPT_KEY_ANALYZER, COLUMN_FULLTEXT_OPT_KEY_BACKEND,
+    COLUMN_FULLTEXT_OPT_KEY_CASE_SENSITIVE, COLUMN_FULLTEXT_OPT_KEY_FALSE_POSITIVE_RATE,
+    COLUMN_FULLTEXT_OPT_KEY_GRANULARITY, COLUMN_SKIPPING_INDEX_OPT_KEY_FALSE_POSITIVE_RATE,
     COLUMN_SKIPPING_INDEX_OPT_KEY_GRANULARITY, COLUMN_SKIPPING_INDEX_OPT_KEY_TYPE,
 };
 use snafu::ResultExt;
@@ -40,7 +42,7 @@ use crate::error::{
 /// Convert a parser expression to a scalar value. This function will try the
 /// best to resolve and reduce constants. Exprs like `1 + 1` or `now()` can be
 /// handled properly.
-pub fn parser_expr_to_scalar_value(expr: sqlparser::ast::Expr) -> Result<ScalarValue> {
+pub fn parser_expr_to_scalar_value_literal(expr: sqlparser::ast::Expr) -> Result<ScalarValue> {
     // 1. convert parser expr to logical expr
     let empty_df_schema = DFSchema::empty();
     let logical_expr = SqlToRel::new(&StubContextProvider::default())
@@ -124,6 +126,9 @@ pub fn validate_column_fulltext_create_option(key: &str) -> bool {
     [
         COLUMN_FULLTEXT_OPT_KEY_ANALYZER,
         COLUMN_FULLTEXT_OPT_KEY_CASE_SENSITIVE,
+        COLUMN_FULLTEXT_OPT_KEY_BACKEND,
+        COLUMN_FULLTEXT_OPT_KEY_GRANULARITY,
+        COLUMN_FULLTEXT_OPT_KEY_FALSE_POSITIVE_RATE,
     ]
     .contains(&key)
 }
@@ -132,6 +137,7 @@ pub fn validate_column_skipping_index_create_option(key: &str) -> bool {
     [
         COLUMN_SKIPPING_INDEX_OPT_KEY_GRANULARITY,
         COLUMN_SKIPPING_INDEX_OPT_KEY_TYPE,
+        COLUMN_SKIPPING_INDEX_OPT_KEY_FALSE_POSITIVE_RATE,
     ]
     .contains(&key)
 }

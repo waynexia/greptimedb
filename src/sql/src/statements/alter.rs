@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(feature = "enterprise")]
+pub mod trigger;
+
 use std::fmt::{Debug, Display};
 
 use api::v1;
@@ -19,7 +22,7 @@ use common_query::AddColumnLocation;
 use datatypes::schema::{FulltextOptions, SkippingIndexOptions};
 use itertools::Itertools;
 use serde::Serialize;
-use sqlparser::ast::{ColumnDef, DataType, Ident, ObjectName, TableConstraint};
+use sqlparser::ast::{ColumnDef, DataType, Expr, Ident, ObjectName, TableConstraint};
 use sqlparser_derive::{Visit, VisitMut};
 
 #[derive(Debug, Clone, PartialEq, Eq, Visit, VisitMut, Serialize)]
@@ -92,6 +95,23 @@ pub enum AlterTableOperation {
     UnsetIndex {
         options: UnsetIndexOperation,
     },
+    DropDefaults {
+        columns: Vec<DropDefaultsOperation>,
+    },
+    /// `ALTER <column_name> SET DEFAULT <default_value>`
+    SetDefaults {
+        defaults: Vec<SetDefaultsOperation>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Visit, VisitMut, Serialize)]
+/// `ALTER <column_name> DROP DEFAULT`
+pub struct DropDefaultsOperation(pub Ident);
+
+#[derive(Debug, Clone, PartialEq, Eq, Visit, VisitMut, Serialize)]
+pub struct SetDefaultsOperation {
+    pub column_name: Ident,
+    pub default_constraint: Expr,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Visit, VisitMut, Serialize)]
@@ -181,7 +201,7 @@ impl Display for AlterTableOperation {
                     column_name,
                     options,
                 } => {
-                    write!(f, "MODIFY COLUMN {column_name} SET FULLTEXT INDEX WITH(analyzer={0}, case_sensitive={1})", options.analyzer, options.case_sensitive)
+                    write!(f, "MODIFY COLUMN {column_name} SET FULLTEXT INDEX WITH(analyzer={0}, case_sensitive={1}, backend={2})", options.analyzer, options.case_sensitive, options.backend)
                 }
                 SetIndexOperation::Inverted { column_name } => {
                     write!(f, "MODIFY COLUMN {column_name} SET INVERTED INDEX")
@@ -204,6 +224,25 @@ impl Display for AlterTableOperation {
                     write!(f, "MODIFY COLUMN {column_name} UNSET SKIPPING INDEX")
                 }
             },
+            AlterTableOperation::DropDefaults { columns } => {
+                let columns = columns
+                    .iter()
+                    .map(|column| format!("MODIFY COLUMN {} DROP DEFAULT", column.0))
+                    .join(", ");
+                write!(f, "{columns}")
+            }
+            AlterTableOperation::SetDefaults { defaults } => {
+                let defaults = defaults
+                    .iter()
+                    .map(|column| {
+                        format!(
+                            "MODIFY COLUMN {} SET DEFAULT {}",
+                            column.column_name, column.default_constraint
+                        )
+                    })
+                    .join(", ");
+                write!(f, "{defaults}")
+            }
         }
     }
 }
@@ -425,7 +464,7 @@ ALTER TABLE monitor RENAME monitor_new"#,
             }
         }
 
-        let sql = "ALTER TABLE monitor MODIFY COLUMN a SET FULLTEXT INDEX WITH(analyzer='English',case_sensitive='false')";
+        let sql = "ALTER TABLE monitor MODIFY COLUMN a SET FULLTEXT INDEX WITH(analyzer='English',case_sensitive='false',backend='bloom')";
         let stmts =
             ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
                 .unwrap();
@@ -437,7 +476,7 @@ ALTER TABLE monitor RENAME monitor_new"#,
                 let new_sql = format!("\n{}", set);
                 assert_eq!(
                     r#"
-ALTER TABLE monitor MODIFY COLUMN a SET FULLTEXT INDEX WITH(analyzer=English, case_sensitive=false)"#,
+ALTER TABLE monitor MODIFY COLUMN a SET FULLTEXT INDEX WITH(analyzer=English, case_sensitive=false, backend=bloom)"#,
                     &new_sql
                 );
             }
@@ -480,6 +519,48 @@ ALTER TABLE monitor MODIFY COLUMN a UNSET FULLTEXT INDEX"#,
                 assert_eq!(
                     r#"
 ALTER TABLE monitor MODIFY COLUMN a SET INVERTED INDEX"#,
+                    &new_sql
+                );
+            }
+            _ => {
+                unreachable!();
+            }
+        }
+
+        let sql = "ALTER TABLE monitor MODIFY COLUMN a DROP DEFAULT";
+        let stmts =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
+        assert_eq!(1, stmts.len());
+        assert_matches!(&stmts[0], Statement::AlterTable { .. });
+
+        match &stmts[0] {
+            Statement::AlterTable(set) => {
+                let new_sql = format!("\n{}", set);
+                assert_eq!(
+                    r#"
+ALTER TABLE monitor MODIFY COLUMN a DROP DEFAULT"#,
+                    &new_sql
+                );
+            }
+            _ => {
+                unreachable!();
+            }
+        }
+
+        let sql = "ALTER TABLE monitor MODIFY COLUMN a SET DEFAULT 'default_for_a'";
+        let stmts =
+            ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+                .unwrap();
+        assert_eq!(1, stmts.len());
+        assert_matches!(&stmts[0], Statement::AlterTable { .. });
+
+        match &stmts[0] {
+            Statement::AlterTable(set) => {
+                let new_sql = format!("\n{}", set);
+                assert_eq!(
+                    r#"
+ALTER TABLE monitor MODIFY COLUMN a SET DEFAULT 'default_for_a'"#,
                     &new_sql
                 );
             }

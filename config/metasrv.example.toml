@@ -1,13 +1,5 @@
 ## The working home directory.
-data_home = "/tmp/metasrv/"
-
-## The bind address of metasrv.
-bind_addr = "127.0.0.1:3002"
-
-## The communication server address for the frontend and datanode to connect to metasrv.
-## If left empty or unset, the server will automatically use the IP address of the first network interface
-## on the host, with the same port number as the one specified in `bind_addr`.
-server_addr = "127.0.0.1:3002"
+data_home = "./greptimedb_data"
 
 ## Store server address default to etcd store.
 ## For postgres store, the format is:
@@ -24,6 +16,7 @@ store_key_prefix = ""
 ## - `etcd_store` (default value)
 ## - `memory_store`
 ## - `postgres_store`
+## - `mysql_store`
 backend = "etcd_store"
 
 ## Table name in RDS to store metadata. Effect when using a RDS kvbackend.
@@ -50,6 +43,18 @@ use_memory_store = false
 ## - Using shared storage (e.g., s3).
 enable_region_failover = false
 
+## The delay before starting region failure detection.
+## This delay helps prevent Metasrv from triggering unnecessary region failovers before all Datanodes are fully started.
+## Especially useful when the cluster is not deployed with GreptimeDB Operator and maintenance mode is not enabled.
+region_failure_detector_initialization_delay = '10m'
+
+## Whether to allow region failover on local WAL.
+## **This option is not recommended to be set to true, because it may lead to data loss during failover.**
+allow_region_failover_on_local_wal = false
+
+## Max allowed idle time before removing node info from metasrv memory.
+node_max_idle_time = "24hours"
+
 ## Whether to enable greptimedb telemetry. Enabled by default.
 #+ enable_telemetry = true
 
@@ -59,6 +64,60 @@ enable_region_failover = false
 #+ global_rt_size = 8
 ## The number of threads to execute the runtime for global write operations.
 #+ compact_rt_size = 4
+
+## TLS configuration for kv store backend (only applicable for PostgreSQL/MySQL backends)
+## When using PostgreSQL or MySQL as metadata store, you can configure TLS here
+[backend_tls]
+## TLS mode, refer to https://www.postgresql.org/docs/current/libpq-ssl.html
+## - "disable" - No TLS
+## - "prefer" (default) - Try TLS, fallback to plain
+## - "require" - Require TLS
+## - "verify_ca" - Require TLS and verify CA
+## - "verify_full" - Require TLS and verify hostname
+mode = "prefer"
+
+## Path to client certificate file (for client authentication)
+## Like "/path/to/client.crt"
+cert_path = ""
+
+## Path to client private key file (for client authentication)
+## Like "/path/to/client.key"
+key_path = ""
+
+## Path to CA certificate file (for server certificate verification)
+## Required when using custom CAs or self-signed certificates
+## Leave empty to use system root certificates only
+## Like "/path/to/ca.crt"
+ca_cert_path = ""
+
+## Watch for certificate file changes and auto reload
+watch = false
+
+## The gRPC server options.
+[grpc]
+## The address to bind the gRPC server.
+bind_addr = "127.0.0.1:3002"
+## The communication server address for the frontend and datanode to connect to metasrv.
+## If left empty or unset, the server will automatically use the IP address of the first network interface
+## on the host, with the same port number as the one specified in `bind_addr`.
+server_addr = "127.0.0.1:3002"
+## The number of server worker threads.
+runtime_size = 8
+## The maximum receive message size for gRPC server.
+max_recv_message_size = "512MB"
+## The maximum send message size for gRPC server.
+max_send_message_size = "512MB"
+
+## The HTTP server options.
+[http]
+## The address to bind the HTTP server.
+addr = "127.0.0.1:4000"
+## HTTP request timeout. Set to 0 to disable timeout.
+timeout = "0s"
+## HTTP request body limit.
+## The following units are supported: `B`, `KB`, `KiB`, `MB`, `MiB`, `GB`, `GiB`, `TB`, `TiB`, `PB`, `PiB`.
+## Set to 0 to disable limit.
+body_limit = "64MB"
 
 ## Procedure storage options.
 [procedure]
@@ -75,6 +134,11 @@ retry_delay = "500ms"
 ## 1500KiB = 1536KiB (1.5MiB) - 36KiB (reserved size of key)
 ## Comments out the `max_metadata_value_size`, for don't split large value (no limit).
 max_metadata_value_size = "1500KiB"
+
+## Max running procedures.
+## The maximum number of procedures that can be running at the same time.
+## If the number of running procedures exceeds this limit, the procedure will be rejected.
+max_running_procedures = 128
 
 # Failure detectors options.
 [failure_detector]
@@ -122,6 +186,22 @@ broker_endpoints = ["127.0.0.1:9092"]
 ## Otherwise, use topics named `topic_name_prefix_[0..num_topics)`
 auto_create_topics = true
 
+## Interval of automatically WAL pruning.
+## Set to `0s` to disable automatically WAL pruning which delete unused remote WAL entries periodically.
+auto_prune_interval = "0s"
+
+## The threshold to trigger a flush operation of a region in automatically WAL pruning.
+## Metasrv will send a flush request to flush the region when:
+## `trigger_flush_threshold` + `prunable_entry_id` < `max_prunable_entry_id`
+## where:
+## - `prunable_entry_id` is the maximum entry id that can be pruned of the region.
+## - `max_prunable_entry_id` is the maximum prunable entry id among all regions in the same topic.
+## Set to `0` to disable the flush operation.
+trigger_flush_threshold = 0
+
+## Concurrent task limit for automatically WAL pruning.
+auto_prune_parallelism = 10
+
 ## Number of topics.
 num_topics = 64
 
@@ -141,17 +221,6 @@ replication_factor = 1
 
 ## Above which a topic creation operation will be cancelled.
 create_topic_timeout = "30s"
-## The initial backoff for kafka clients.
-backoff_init = "500ms"
-
-## The maximum backoff for kafka clients.
-backoff_max = "10s"
-
-## Exponential backoff rate, i.e. next backoff = base * current backoff.
-backoff_base = 2
-
-## Stop reconnecting if the total wait time reaches the deadline. If this config is missing, the reconnecting won't terminate.
-backoff_deadline = "5mins"
 
 # The Kafka SASL configuration.
 # **It's only used when the provider is `kafka`**.
@@ -174,7 +243,7 @@ backoff_deadline = "5mins"
 ## The logging options.
 [logging]
 ## The directory to store the log files. If set to empty, logs will not be written to files.
-dir = "/tmp/greptimedb/logs"
+dir = "./greptimedb_data/logs"
 
 ## The log level. Can be `info`/`debug`/`warn`/`error`.
 ## @toml2docs:none-default
@@ -184,7 +253,7 @@ level = "info"
 enable_otlp_tracing = false
 
 ## The OTLP tracing endpoint.
-otlp_endpoint = "http://localhost:4317"
+otlp_endpoint = "http://localhost:4318"
 
 ## Whether to append logs to stdout.
 append_stdout = true
@@ -195,43 +264,25 @@ log_format = "text"
 ## The maximum amount of log files.
 max_log_files = 720
 
+## The OTLP tracing export protocol. Can be `grpc`/`http`.
+otlp_export_protocol = "http"
+
 ## The percentage of tracing will be sampled and exported.
 ## Valid range `[0, 1]`, 1 means all traces are sampled, 0 means all traces are not sampled, the default value is 1.
 ## ratio > 1 are treated as 1. Fractions < 0 are treated as 0
 [logging.tracing_sample_ratio]
 default_ratio = 1.0
 
-## The slow query log options.
-[logging.slow_query]
-## Whether to enable slow query log.
-enable = false
-
-## The threshold of slow query.
-## @toml2docs:none-default
-threshold = "10s"
-
-## The sampling ratio of slow query log. The value should be in the range of (0, 1].
-## @toml2docs:none-default
-sample_ratio = 1.0
-
-## The datanode can export its metrics and send to Prometheus compatible service (e.g. send to `greptimedb` itself) from remote-write API.
+## The metasrv can export its metrics and send to Prometheus compatible service (e.g. `greptimedb` itself) from remote-write API.
 ## This is only used for `greptimedb` to export its own metrics internally. It's different from prometheus scrape.
 [export_metrics]
-
 ## whether enable export metrics.
 enable = false
-
 ## The interval of export metrics.
 write_interval = "30s"
 
-## For `standalone` mode, `self_import` is recommend to collect metrics generated by itself
-## You must create the database before enabling it.
-[export_metrics.self_import]
-## @toml2docs:none-default
-db = "greptime_metrics"
-
 [export_metrics.remote_write]
-## The url the metrics send to. The url example can be: `http://127.0.0.1:4000/v1/prometheus/write?db=greptime_metrics`.
+## The prometheus remote write endpoint that the metrics send to. The url example can be: `http://127.0.0.1:4000/v1/prometheus/write?db=greptime_metrics`.
 url = ""
 
 ## HTTP headers of Prometheus remote-write carry.
@@ -242,3 +293,11 @@ headers = { }
 ## The tokio console address.
 ## @toml2docs:none-default
 #+ tokio_console_addr = "127.0.0.1"
+
+## The memory options.
+[memory]
+## Whether to enable heap profiling activation during startup.
+## When enabled, heap profiling will be activated if the `MALLOC_CONF` environment variable
+## is set to "prof:true,prof_active:false". The official image adds this env variable.
+## Default is true.
+enable_heap_profiling = true

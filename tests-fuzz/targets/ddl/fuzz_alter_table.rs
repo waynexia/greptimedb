@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use arbitrary::{Arbitrary, Unstructured};
 use common_telemetry::info;
+use datatypes::prelude::{ConcreteDataType, DataType};
 use libfuzzer_sys::fuzz_target;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaChaRng;
@@ -26,7 +27,7 @@ use snafu::ResultExt;
 use sqlx::{MySql, Pool};
 use strum::{EnumIter, IntoEnumIterator};
 use tests_fuzz::context::{TableContext, TableContextRef};
-use tests_fuzz::error::{self, Result};
+use tests_fuzz::error::{self, Result, UnexpectedSnafu};
 use tests_fuzz::fake::{
     merge_two_word_map_fn, random_capitalize_map, uppercase_and_keyword_backtick_map,
     MappedGenerator, WordGenerator,
@@ -76,9 +77,9 @@ enum AlterTableKind {
 
 fn generate_create_table_expr<R: Rng + 'static>(rng: &mut R) -> Result<CreateTableExpr> {
     let max_columns = get_gt_fuzz_input_max_columns();
-    let columns = rng.gen_range(2..max_columns);
+    let columns = rng.random_range(2..max_columns);
     let mut with_clause = HashMap::new();
-    if rng.gen_bool(0.5) {
+    if rng.random_bool(0.5) {
         with_clause.insert("append_mode".to_string(), "true".to_string());
     }
     let create_table_generator = CreateTableExprGeneratorBuilder::default()
@@ -94,12 +95,69 @@ fn generate_create_table_expr<R: Rng + 'static>(rng: &mut R) -> Result<CreateTab
     create_table_generator.generate(rng)
 }
 
+/// Returns the insert sql that insert one row of non-default value in table
+#[allow(unused)]
+fn generate_insert_table_sql<R: Rng + 'static>(
+    rng: &mut R,
+    create_table_expr: &CreateTableExpr,
+) -> Result<String> {
+    use datatypes::value::Value;
+    let mut column_names = vec![];
+    let mut column_values = vec![];
+    for column in &create_table_expr.columns {
+        if column.is_time_index() {
+            continue;
+        }
+
+        let marker_name = &column.name;
+        let marker_value = match column.column_type {
+            ConcreteDataType::Boolean(_) => Value::Boolean(true),
+            ConcreteDataType::Int16(_) => Value::Int16(42),
+            ConcreteDataType::Int32(_) => Value::Int32(42),
+            ConcreteDataType::Int64(_) => Value::Int64(42),
+            ConcreteDataType::Float32(_) => Value::from(42.0f32),
+            ConcreteDataType::Float64(_) => Value::from(42.0f64),
+            ConcreteDataType::String(_) => Value::from("How many roads must a man walk down?"),
+            _ => UnexpectedSnafu {
+                violated: format!(
+                    "Unexpected datatype, found {} in create-table={:?}",
+                    column.column_type, create_table_expr
+                ),
+            }
+            .fail()?,
+        };
+        column_names.push(marker_name.to_string());
+        column_values.push(marker_value.to_string());
+    }
+
+    let table_name = &create_table_expr.table_name;
+
+    let ts_column = create_table_expr
+        .columns
+        .iter()
+        .find(|c| c.is_time_index())
+        .unwrap();
+
+    let ts_column_name = &ts_column.name;
+    let ts_column_value = ts_column.column_type.default_value();
+
+    let concat_column_names = column_names.join(",");
+
+    let concat_column_values = column_values.join(",");
+
+    let sql = format!(
+        "INSERT INTO {table_name} ({concat_column_names}, {ts_column_name}) VALUES ({concat_column_values}, \"{ts_column_value}\");"
+    );
+
+    Ok(sql)
+}
+
 fn generate_alter_table_expr<R: Rng + 'static>(
     table_ctx: TableContextRef,
     rng: &mut R,
 ) -> Result<AlterTableExpr> {
     let kinds = AlterTableKind::iter().collect::<Vec<_>>();
-    match kinds[rng.gen_range(0..kinds.len())] {
+    match kinds[rng.random_range(0..kinds.len())] {
         AlterTableKind::DropColumn if !droppable_columns(&table_ctx.columns).is_empty() => {
             AlterExprDropColumnGeneratorBuilder::default()
                 .table_ctx(table_ctx)
@@ -138,7 +196,7 @@ fn generate_alter_table_expr<R: Rng + 'static>(
             expr_generator.generate(rng)
         }
         _ => {
-            let location = rng.gen_bool(0.5);
+            let location = rng.random_bool(0.5);
             let expr_generator = AlterExprAddColumnGeneratorBuilder::default()
                 .table_ctx(table_ctx)
                 .location(location)
@@ -153,7 +211,7 @@ impl Arbitrary<'_> for FuzzInput {
     fn arbitrary(u: &mut Unstructured<'_>) -> arbitrary::Result<Self> {
         let seed = u.int_in_range(u64::MIN..=u64::MAX)?;
         let mut rng = ChaChaRng::seed_from_u64(seed);
-        let actions = rng.gen_range(1..256);
+        let actions = rng.random_range(1..256);
 
         Ok(FuzzInput { seed, actions })
     }
@@ -173,6 +231,13 @@ async fn execute_alter_table(ctx: FuzzContext, input: FuzzInput) -> Result<()> {
         .context(error::ExecuteQuerySnafu { sql: &sql })?;
     info!("Create table: {sql}, result: {result:?}");
 
+    let insert = generate_insert_table_sql(&mut rng, &expr)?;
+    let result = sqlx::query(&insert)
+        .execute(&ctx.greptime)
+        .await
+        .context(error::ExecuteQuerySnafu { sql: &insert })?;
+    info!("Insert Into table: {insert}, result: {result:?}");
+
     // Alter table actions
     let mut table_ctx = Arc::new(TableContext::from(&expr));
     for _ in 0..input.actions {
@@ -186,6 +251,14 @@ async fn execute_alter_table(ctx: FuzzContext, input: FuzzInput) -> Result<()> {
         info!("Alter table: {sql}, result: {result:?}");
         // Applies changes
         table_ctx = Arc::new(Arc::unwrap_or_clone(table_ctx).alter(expr).unwrap());
+
+        // validate value
+        validator::column::valid_marker_value(
+            &ctx.greptime,
+            "public".into(),
+            table_ctx.name.clone(),
+        )
+        .await?;
 
         // Validates columns
         let mut column_entries = validator::column::fetch_columns(
@@ -223,6 +296,15 @@ async fn execute_alter_table(ctx: FuzzContext, input: FuzzInput) -> Result<()> {
                     assert_eq!(a, b);
                 }
             });
+
+        // select from table to make sure the table is still ok
+        let sql = format!("SELECT * FROM {}", table_ctx.name);
+        let result = sqlx::query(&sql)
+            .persistent(false)
+            .execute(&ctx.greptime)
+            .await
+            .context(error::ExecuteQuerySnafu { sql: &sql })?;
+        info!("Select from table: {sql}, result: {result:?}");
     }
 
     // Cleans up

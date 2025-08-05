@@ -12,22 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod clamp;
+pub mod clamp;
 mod modulo;
-mod pow;
 mod rate;
 
 use std::fmt;
-use std::sync::Arc;
 
-pub use clamp::ClampFunction;
+pub use clamp::{ClampFunction, ClampMaxFunction, ClampMinFunction};
 use common_query::error::{GeneralDataFusionSnafu, Result};
 use common_query::prelude::Signature;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::Volatility;
 use datatypes::prelude::ConcreteDataType;
 use datatypes::vectors::VectorRef;
-pub use pow::PowFunction;
 pub use rate::RateFunction;
 use snafu::ResultExt;
 
@@ -39,11 +36,12 @@ pub(crate) struct MathFunction;
 
 impl MathFunction {
     pub fn register(registry: &FunctionRegistry) {
-        registry.register(Arc::new(ModuloFunction));
-        registry.register(Arc::new(PowFunction));
-        registry.register(Arc::new(RateFunction));
-        registry.register(Arc::new(RangeFunction));
-        registry.register(Arc::new(ClampFunction));
+        registry.register_scalar(ModuloFunction);
+        registry.register_scalar(RateFunction);
+        registry.register_scalar(RangeFunction);
+        registry.register_scalar(ClampFunction);
+        registry.register_scalar(ClampMinFunction);
+        registry.register_scalar(ClampMaxFunction);
     }
 }
 
@@ -80,7 +78,7 @@ impl Function for RangeFunction {
         Signature::variadic_any(Volatility::Immutable)
     }
 
-    fn eval(&self, _func_ctx: FunctionContext, _columns: &[VectorRef]) -> Result<VectorRef> {
+    fn eval(&self, _func_ctx: &FunctionContext, _columns: &[VectorRef]) -> Result<VectorRef> {
         Err(DataFusionError::Internal(
             "range_fn just a empty function used in range select, It should not be eval!".into(),
         ))

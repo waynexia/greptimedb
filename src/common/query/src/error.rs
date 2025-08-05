@@ -24,32 +24,15 @@ use datatypes::arrow::datatypes::DataType as ArrowDatatype;
 use datatypes::error::Error as DataTypeError;
 use datatypes::prelude::ConcreteDataType;
 use snafu::{Location, Snafu};
-use statrs::StatsError;
 
 #[derive(Snafu)]
 #[snafu(visibility(pub))]
 #[stack_trace_debug]
 pub enum Error {
-    #[snafu(display("Failed to execute function"))]
-    ExecuteFunction {
-        #[snafu(source)]
-        error: DataFusionError,
-        #[snafu(implicit)]
-        location: Location,
-    },
-
     #[snafu(display("Unsupported input datatypes {:?} in function {}", datatypes, function))]
     UnsupportedInputDataType {
         function: String,
         datatypes: Vec<ConcreteDataType>,
-        #[snafu(implicit)]
-        location: Location,
-    },
-
-    #[snafu(display("Failed to generate function"))]
-    GenerateFunction {
-        #[snafu(source)]
-        error: StatsError,
         #[snafu(implicit)]
         location: Location,
     },
@@ -105,12 +88,6 @@ pub enum Error {
         location: Location,
     },
 
-    #[snafu(display("unexpected: not constant column"))]
-    InvalidInputCol {
-        #[snafu(implicit)]
-        location: Location,
-    },
-
     #[snafu(display("General DataFusion error"))]
     GeneralDataFusion {
         #[snafu(source)]
@@ -124,13 +101,6 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
         source: common_recordbatch::error::Error,
-    },
-
-    #[snafu(display("Failed to convert arrow schema"))]
-    ConvertArrowSchema {
-        #[snafu(implicit)]
-        location: Location,
-        source: DataTypeError,
     },
 
     #[snafu(display("Failed to cast array to {:?}", typ))]
@@ -256,22 +226,17 @@ impl ErrorExt for Error {
             Error::CreateAccumulator { .. }
             | Error::DowncastVector { .. }
             | Error::InvalidInputState { .. }
-            | Error::InvalidInputCol { .. }
-            | Error::GenerateFunction { .. }
             | Error::BadAccumulatorImpl { .. }
             | Error::ToScalarValue { .. }
             | Error::GetScalarVector { .. }
             | Error::ArrowCompute { .. }
             | Error::FlownodeNotFound { .. } => StatusCode::EngineExecuteQuery,
 
-            Error::ExecuteFunction { error, .. } | Error::GeneralDataFusion { error, .. } => {
-                datafusion_status_code::<Self>(error, None)
-            }
+            Error::GeneralDataFusion { error, .. } => datafusion_status_code::<Self>(error, None),
 
             Error::InvalidInputType { source, .. }
             | Error::IntoVector { source, .. }
             | Error::FromScalarValue { source, .. }
-            | Error::ConvertArrowSchema { source, .. }
             | Error::FromArrowArray { source, .. }
             | Error::InvalidVectorString { source, .. } => source.status_code(),
 
@@ -322,6 +287,7 @@ pub fn datafusion_status_code<T: ErrorExt + 'static>(
                 default_status.unwrap_or(StatusCode::EngineExecuteQuery)
             }
         }
+        DataFusionError::Diagnostic(_, e) => datafusion_status_code::<T>(e, default_status),
         _ => default_status.unwrap_or(StatusCode::EngineExecuteQuery),
     }
 }

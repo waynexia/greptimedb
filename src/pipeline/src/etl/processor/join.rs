@@ -13,18 +13,18 @@
 // limitations under the License.
 
 use snafu::OptionExt;
+use vrl::prelude::Bytes;
+use vrl::value::{KeyString, Value as VrlValue};
 
-use crate::etl::error::{
+use crate::error::{
     Error, JoinSeparatorRequiredSnafu, KeyMustBeStringSnafu, ProcessorExpectStringSnafu,
-    ProcessorMissingFieldSnafu, Result,
+    ProcessorMissingFieldSnafu, Result, ValueMustBeMapSnafu,
 };
 use crate::etl::field::Fields;
 use crate::etl::processor::{
     yaml_bool, yaml_new_field, yaml_new_fields, yaml_string, Processor, FIELDS_NAME, FIELD_NAME,
     IGNORE_MISSING_NAME, SEPARATOR_NAME,
 };
-use crate::etl::value::{Array, Value};
-use crate::etl::PipelineMap;
 
 pub(crate) const PROCESSOR_JOIN: &str = "join";
 
@@ -37,14 +37,14 @@ pub struct JoinProcessor {
 }
 
 impl JoinProcessor {
-    fn process(&self, arr: &Array) -> Result<Value> {
+    fn process(&self, arr: &[VrlValue]) -> Result<VrlValue> {
         let val = arr
             .iter()
-            .map(|v| v.to_str_value())
-            .collect::<Vec<String>>()
+            .map(|v| v.to_string_lossy())
+            .collect::<Vec<_>>()
             .join(&self.separator);
 
-        Ok(Value::String(val))
+        Ok(VrlValue::Bytes(Bytes::from(val)))
     }
 }
 
@@ -95,16 +95,17 @@ impl Processor for JoinProcessor {
         self.ignore_missing
     }
 
-    fn exec_mut(&self, val: &mut PipelineMap) -> Result<()> {
+    fn exec_mut(&self, mut val: VrlValue) -> Result<VrlValue> {
         for field in self.fields.iter() {
             let index = field.input_field();
+            let val = val.as_object_mut().context(ValueMustBeMapSnafu)?;
             match val.get(index) {
-                Some(Value::Array(arr)) => {
+                Some(VrlValue::Array(arr)) => {
                     let result = self.process(arr)?;
                     let output_index = field.target_or_input_field();
-                    val.insert(output_index.to_string(), result);
+                    val.insert(KeyString::from(output_index.to_string()), result);
                 }
-                Some(Value::Null) | None => {
+                Some(VrlValue::Null) | None => {
                     if !self.ignore_missing {
                         return ProcessorMissingFieldSnafu {
                             processor: self.kind(),
@@ -123,15 +124,17 @@ impl Processor for JoinProcessor {
             }
         }
 
-        Ok(())
+        Ok(val)
     }
 }
 
 #[cfg(test)]
 mod tests {
 
+    use vrl::prelude::Bytes;
+    use vrl::value::Value as VrlValue;
+
     use crate::etl::processor::join::JoinProcessor;
-    use crate::etl::value::Value;
 
     #[test]
     fn test_join_processor() {
@@ -141,11 +144,10 @@ mod tests {
         };
 
         let arr = vec![
-            Value::String("a".to_string()),
-            Value::String("b".to_string()),
-        ]
-        .into();
+            VrlValue::Bytes(Bytes::from("a")),
+            VrlValue::Bytes(Bytes::from("b")),
+        ];
         let result = processor.process(&arr).unwrap();
-        assert_eq!(result, Value::String("a-b".to_string()));
+        assert_eq!(result, VrlValue::Bytes(Bytes::from("a-b")));
     }
 }

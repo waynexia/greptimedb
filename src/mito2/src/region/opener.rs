@@ -14,32 +14,41 @@
 
 //! Region opener.
 
+use std::any::TypeId;
 use std::collections::HashMap;
-use std::sync::atomic::AtomicI64;
+use std::sync::atomic::{AtomicI64, AtomicU64};
 use std::sync::Arc;
 
 use common_telemetry::{debug, error, info, warn};
 use common_wal::options::WalOptions;
 use futures::future::BoxFuture;
 use futures::StreamExt;
+use log_store::kafka::log_store::KafkaLogStore;
+use log_store::raft_engine::log_store::RaftEngineLogStore;
 use object_store::manager::ObjectStoreManagerRef;
 use object_store::util::{join_dir, normalize_dir};
 use snafu::{ensure, OptionExt, ResultExt};
 use store_api::logstore::provider::Provider;
 use store_api::logstore::LogStore;
-use store_api::metadata::{ColumnMetadata, RegionMetadata, RegionMetadataBuilder};
+use store_api::metadata::{
+    ColumnMetadata, RegionMetadata, RegionMetadataBuilder, RegionMetadataRef,
+};
 use store_api::region_engine::RegionRole;
+use store_api::region_request::PathType;
 use store_api::storage::{ColumnId, RegionId};
 
 use crate::access_layer::AccessLayer;
 use crate::cache::CacheManagerRef;
 use crate::config::MitoConfig;
+use crate::error;
 use crate::error::{
     EmptyRegionDirSnafu, InvalidMetadataSnafu, ObjectStoreNotFoundSnafu, RegionCorruptedSnafu,
     Result, StaleLogEntrySnafu,
 };
+use crate::manifest::action::RegionManifest;
 use crate::manifest::manager::{RegionManifestManager, RegionManifestOptions};
 use crate::manifest::storage::manifest_compress_type;
+use crate::memtable::bulk::part::BulkPart;
 use crate::memtable::time_partition::TimePartitions;
 use crate::memtable::MemtableBuilderProvider;
 use crate::region::options::RegionOptions;
@@ -53,6 +62,7 @@ use crate::schedule::scheduler::SchedulerRef;
 use crate::sst::file_purger::LocalFilePurger;
 use crate::sst::index::intermediate::IntermediateManager;
 use crate::sst::index::puffin_manager::PuffinManagerFactory;
+use crate::sst::location::region_dir_from_table_dir;
 use crate::time_provider::TimeProviderRef;
 use crate::wal::entry_reader::WalEntryReader;
 use crate::wal::{EntryId, Wal};
@@ -63,7 +73,8 @@ pub(crate) struct RegionOpener {
     metadata_builder: Option<RegionMetadataBuilder>,
     memtable_builder_provider: MemtableBuilderProvider,
     object_store_manager: ObjectStoreManagerRef,
-    region_dir: String,
+    table_dir: String,
+    path_type: PathType,
     purge_scheduler: SchedulerRef,
     options: Option<RegionOptions>,
     cache_manager: Option<CacheManagerRef>,
@@ -81,7 +92,8 @@ impl RegionOpener {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         region_id: RegionId,
-        region_dir: &str,
+        table_dir: &str,
+        path_type: PathType,
         memtable_builder_provider: MemtableBuilderProvider,
         object_store_manager: ObjectStoreManagerRef,
         purge_scheduler: SchedulerRef,
@@ -94,7 +106,8 @@ impl RegionOpener {
             metadata_builder: None,
             memtable_builder_provider,
             object_store_manager,
-            region_dir: normalize_dir(region_dir),
+            table_dir: normalize_dir(table_dir),
+            path_type,
             purge_scheduler,
             options: None,
             cache_manager: None,
@@ -111,6 +124,11 @@ impl RegionOpener {
     pub(crate) fn metadata_builder(mut self, builder: RegionMetadataBuilder) -> Self {
         self.metadata_builder = Some(builder);
         self
+    }
+
+    /// Computes the region directory from table_dir and region_id.
+    fn region_dir(&self) -> String {
+        region_dir_from_table_dir(&self.table_dir, self.region_id, self.path_type)
     }
 
     /// Builds the region metadata.
@@ -171,6 +189,7 @@ impl RegionOpener {
         wal: &Wal<S>,
     ) -> Result<MitoRegion> {
         let region_id = self.region_id;
+        let region_dir = self.region_dir();
         let metadata = self.build_metadata()?;
         // Tries to open the region.
         match self.maybe_open(config, wal).await {
@@ -191,27 +210,29 @@ impl RegionOpener {
             Ok(None) => {
                 debug!(
                     "No data under directory {}, region_id: {}",
-                    self.region_dir, self.region_id
+                    region_dir, self.region_id
                 );
             }
             Err(e) => {
                 warn!(e;
                     "Failed to open region {} before creating it, region_dir: {}",
-                    self.region_id, self.region_dir
+                    self.region_id, region_dir
                 );
             }
         }
         // Safety: must be set before calling this method.
         let options = self.options.take().unwrap();
-        let object_store = self.object_store(&options.storage)?.clone();
-        let provider = self.provider(&options.wal_options);
+        let object_store = get_object_store(&options.storage, &self.object_store_manager)?;
+        let provider = self.provider::<S>(&options.wal_options)?;
         let metadata = Arc::new(metadata);
         // Create a manifest manager for this region and writes regions to the manifest file.
-        let region_manifest_options = self.manifest_options(config, &options)?;
+        let region_manifest_options =
+            Self::manifest_options(config, &options, &region_dir, &self.object_store_manager)?;
         let manifest_manager = RegionManifestManager::new(
             metadata.clone(),
             region_manifest_options,
             self.stats.total_manifest_size.clone(),
+            self.stats.manifest_version.clone(),
         )
         .await?;
 
@@ -236,7 +257,8 @@ impl RegionOpener {
             .build();
         let version_control = Arc::new(VersionControl::new(version));
         let access_layer = Arc::new(AccessLayer::new(
-            self.region_dir,
+            self.table_dir.clone(),
+            self.path_type,
             object_store,
             self.puffin_manager_factory,
             self.intermediate_manager,
@@ -261,6 +283,7 @@ impl RegionOpener {
             last_flush_millis: AtomicI64::new(now),
             last_compaction_millis: AtomicI64::new(now),
             time_provider: self.time_provider.clone(),
+            topic_latest_entry_id: AtomicU64::new(0),
             memtable_builder,
             stats: self.stats,
         })
@@ -275,12 +298,13 @@ impl RegionOpener {
         wal: &Wal<S>,
     ) -> Result<MitoRegion> {
         let region_id = self.region_id;
+        let region_dir = self.region_dir();
         let region = self
             .maybe_open(config, wal)
             .await?
             .context(EmptyRegionDirSnafu {
                 region_id,
-                region_dir: self.region_dir,
+                region_dir: &region_dir,
             })?;
 
         ensure!(
@@ -297,10 +321,29 @@ impl RegionOpener {
         Ok(region)
     }
 
-    fn provider(&self, wal_options: &WalOptions) -> Provider {
+    fn provider<S: LogStore>(&self, wal_options: &WalOptions) -> Result<Provider> {
         match wal_options {
-            WalOptions::RaftEngine => Provider::raft_engine_provider(self.region_id.as_u64()),
-            WalOptions::Kafka(options) => Provider::kafka_provider(options.topic.to_string()),
+            WalOptions::RaftEngine => {
+                ensure!(
+                    TypeId::of::<RaftEngineLogStore>() == TypeId::of::<S>(),
+                    error::IncompatibleWalProviderChangeSnafu {
+                        global: "`kafka`",
+                        region: "`raft_engine`",
+                    }
+                );
+                Ok(Provider::raft_engine_provider(self.region_id.as_u64()))
+            }
+            WalOptions::Kafka(options) => {
+                ensure!(
+                    TypeId::of::<KafkaLogStore>() == TypeId::of::<S>(),
+                    error::IncompatibleWalProviderChangeSnafu {
+                        global: "`raft_engine`",
+                        region: "`kafka`",
+                    }
+                );
+                Ok(Provider::kafka_provider(options.topic.to_string()))
+            }
+            WalOptions::Noop => Ok(Provider::noop_provider()),
         }
     }
 
@@ -312,10 +355,16 @@ impl RegionOpener {
     ) -> Result<Option<MitoRegion>> {
         let region_options = self.options.as_ref().unwrap().clone();
 
-        let region_manifest_options = self.manifest_options(config, &region_options)?;
+        let region_manifest_options = Self::manifest_options(
+            config,
+            &region_options,
+            &self.region_dir(),
+            &self.object_store_manager,
+        )?;
         let Some(manifest_manager) = RegionManifestManager::open(
             region_manifest_options,
             self.stats.total_manifest_size.clone(),
+            self.stats.manifest_version.clone(),
         )
         .await?
         else {
@@ -326,18 +375,22 @@ impl RegionOpener {
         let metadata = manifest.metadata.clone();
 
         let region_id = self.region_id;
-        let provider = self.provider(&region_options.wal_options);
+        let provider = self.provider::<S>(&region_options.wal_options)?;
         let wal_entry_reader = self
             .wal_entry_reader
             .take()
             .unwrap_or_else(|| wal.wal_entry_reader(&provider, region_id, None));
         let on_region_opened = wal.on_region_opened();
-        let object_store = self.object_store(&region_options.storage)?.clone();
+        let object_store = get_object_store(&region_options.storage, &self.object_store_manager)?;
 
-        debug!("Open region {} with options: {:?}", region_id, self.options);
+        debug!(
+            "Open region {} at {} with options: {:?}",
+            region_id, self.table_dir, self.options
+        );
 
         let access_layer = Arc::new(AccessLayer::new(
-            self.region_dir.clone(),
+            self.table_dir.clone(),
+            self.path_type,
             object_store,
             self.puffin_manager_factory.clone(),
             self.intermediate_manager.clone(),
@@ -394,8 +447,8 @@ impl RegionOpener {
             .await?;
         } else {
             info!(
-                "Skip the WAL replay for region: {}, manifest version: {}",
-                region_id, manifest.manifest_version
+                "Skip the WAL replay for region: {}, manifest version: {}, flushed_entry_id: {}",
+                region_id, manifest.manifest_version, flushed_entry_id
             );
         }
         let now = self.time_provider.current_time_millis();
@@ -414,6 +467,7 @@ impl RegionOpener {
             last_flush_millis: AtomicI64::new(now),
             last_compaction_millis: AtomicI64::new(now),
             time_provider: self.time_provider.clone(),
+            topic_latest_entry_id: AtomicU64::new(0),
             memtable_builder,
             stats: self.stats.clone(),
         };
@@ -422,13 +476,14 @@ impl RegionOpener {
 
     /// Returns a new manifest options.
     fn manifest_options(
-        &self,
         config: &MitoConfig,
         options: &RegionOptions,
+        region_dir: &str,
+        object_store_manager: &ObjectStoreManagerRef,
     ) -> Result<RegionManifestOptions> {
-        let object_store = self.object_store(&options.storage)?.clone();
+        let object_store = get_object_store(&options.storage, object_store_manager)?;
         Ok(RegionManifestOptions {
-            manifest_dir: new_manifest_dir(&self.region_dir),
+            manifest_dir: new_manifest_dir(region_dir),
             object_store,
             // We don't allow users to set the compression algorithm as we use it as a file suffix.
             // Currently, the manifest storage doesn't have good support for changing compression algorithms.
@@ -436,19 +491,74 @@ impl RegionOpener {
             checkpoint_distance: config.manifest_checkpoint_distance,
         })
     }
+}
 
-    /// Returns an object store corresponding to `name`. If `name` is `None`, this method returns the default object store.
-    fn object_store(&self, name: &Option<String>) -> Result<&object_store::ObjectStore> {
-        if let Some(name) = name {
-            Ok(self
-                .object_store_manager
-                .find(name)
-                .context(ObjectStoreNotFoundSnafu {
-                    object_store: name.to_string(),
-                })?)
-        } else {
-            Ok(self.object_store_manager.default_object_store())
+/// Returns an object store corresponding to `name`. If `name` is `None`, this method returns the default object store.
+pub fn get_object_store(
+    name: &Option<String>,
+    object_store_manager: &ObjectStoreManagerRef,
+) -> Result<object_store::ObjectStore> {
+    if let Some(name) = name {
+        Ok(object_store_manager
+            .find(name)
+            .with_context(|| ObjectStoreNotFoundSnafu {
+                object_store: name.to_string(),
+            })?
+            .clone())
+    } else {
+        Ok(object_store_manager.default_object_store().clone())
+    }
+}
+
+/// A loader for loading metadata from a region dir.
+pub struct RegionMetadataLoader {
+    config: Arc<MitoConfig>,
+    object_store_manager: ObjectStoreManagerRef,
+}
+
+impl RegionMetadataLoader {
+    /// Creates a new `RegionOpenerBuilder`.
+    pub fn new(config: Arc<MitoConfig>, object_store_manager: ObjectStoreManagerRef) -> Self {
+        Self {
+            config,
+            object_store_manager,
         }
+    }
+
+    /// Loads the metadata of the region from the region dir.
+    pub async fn load(
+        &self,
+        region_dir: &str,
+        region_options: &RegionOptions,
+    ) -> Result<Option<RegionMetadataRef>> {
+        let manifest = self.load_manifest(region_dir, region_options).await?;
+        Ok(manifest.map(|m| m.metadata.clone()))
+    }
+
+    /// Loads the manifest of the region from the region dir.
+    pub async fn load_manifest(
+        &self,
+        region_dir: &str,
+        region_options: &RegionOptions,
+    ) -> Result<Option<Arc<RegionManifest>>> {
+        let region_manifest_options = RegionOpener::manifest_options(
+            &self.config,
+            region_options,
+            region_dir,
+            &self.object_store_manager,
+        )?;
+        let Some(manifest_manager) = RegionManifestManager::open(
+            region_manifest_options,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+
+        let manifest = manifest_manager.manifest();
+        Ok(Some(manifest))
     }
 }
 
@@ -552,18 +662,32 @@ where
             );
         }
 
+        for bulk_entry in entry.bulk_entries {
+            let part = BulkPart::try_from(bulk_entry)?;
+            rows_replayed += part.num_rows();
+            ensure!(
+                region_write_ctx.push_bulk(OptionOutputTx::none(), part),
+                RegionCorruptedSnafu {
+                    region_id,
+                    reason: "unable to replay memtable with bulk entries",
+                }
+            );
+        }
+
         // set next_entry_id and write to memtable.
         region_write_ctx.set_next_entry_id(last_entry_id + 1);
         region_write_ctx.write_memtable().await;
+        region_write_ctx.write_bulk().await;
     }
 
     // TODO(weny): We need to update `flushed_entry_id` in the region manifest
     // to avoid reading potentially incomplete entries in the future.
     (on_region_opened)(region_id, flushed_entry_id, provider).await?;
 
+    let series_count = version_control.current().series_count();
     info!(
-        "Replay WAL for region: {}, rows recovered: {}, last entry id: {}",
-        region_id, rows_replayed, last_entry_id
+        "Replay WAL for region: {}, rows recovered: {}, last entry id: {}, total timeseries replayed: {}",
+        region_id, rows_replayed, last_entry_id, series_count
     );
     Ok(last_entry_id)
 }

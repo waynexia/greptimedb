@@ -19,9 +19,12 @@ use common_procedure::ProcedureManagerRef;
 use snafu::ResultExt;
 
 pub mod region_migration;
+#[cfg(any(test, feature = "testing"))]
+pub mod test_util;
 #[cfg(test)]
 mod tests;
 pub mod utils;
+pub mod wal_prune;
 
 #[derive(Clone)]
 pub struct ProcedureManagerListenerAdapter(pub ProcedureManagerRef);

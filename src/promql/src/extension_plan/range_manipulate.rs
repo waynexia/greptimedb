@@ -42,7 +42,7 @@ use greptime_proto::substrait_extension as pb;
 use prost::Message;
 use snafu::ResultExt;
 
-use crate::error::{DataFusionPlanningSnafu, DeserializeSnafu, Result};
+use crate::error::{DeserializeSnafu, Result};
 use crate::extension_plan::{Millisecond, METRIC_NUM_SERIES};
 use crate::metrics::PROMQL_SERIES_COUNT;
 use crate::range_array::RangeArray;
@@ -158,10 +158,12 @@ impl RangeManipulate {
 
     pub fn to_execution_plan(&self, exec_input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
         let output_schema: SchemaRef = SchemaRef::new(self.output_schema.as_ref().into());
+        let properties = exec_input.properties();
         let properties = PlanProperties::new(
             EquivalenceProperties::new(output_schema.clone()),
-            exec_input.properties().partitioning.clone(),
-            exec_input.properties().execution_mode,
+            properties.partitioning.clone(),
+            properties.emission_type,
+            properties.boundedness,
         );
         Arc::new(RangeManipulateExec {
             start: self.start,
@@ -192,20 +194,26 @@ impl RangeManipulate {
 
     pub fn deserialize(bytes: &[u8]) -> Result<Self> {
         let pb_range_manipulate = pb::RangeManipulate::decode(bytes).context(DeserializeSnafu)?;
+        let empty_schema = Arc::new(DFSchema::empty());
         let placeholder_plan = LogicalPlan::EmptyRelation(EmptyRelation {
             produce_one_row: false,
-            schema: Arc::new(DFSchema::empty()),
+            schema: empty_schema.clone(),
         });
-        Self::new(
-            pb_range_manipulate.start,
-            pb_range_manipulate.end,
-            pb_range_manipulate.interval,
-            pb_range_manipulate.range,
-            pb_range_manipulate.time_index,
-            pb_range_manipulate.tag_columns,
-            placeholder_plan,
-        )
-        .context(DataFusionPlanningSnafu)
+
+        // Unlike `Self::new()`, this method doesn't check the input schema as it will fail
+        // because the input schema is empty.
+        // But this is Ok since datafusion guarantees to call `with_exprs_and_inputs` for the
+        // deserialized plan.
+        Ok(Self {
+            start: pb_range_manipulate.start,
+            end: pb_range_manipulate.end,
+            interval: pb_range_manipulate.interval,
+            range: pb_range_manipulate.range,
+            time_index: pb_range_manipulate.time_index,
+            field_columns: pb_range_manipulate.tag_columns,
+            input: placeholder_plan,
+            output_schema: empty_schema,
+        })
     }
 }
 
@@ -268,13 +276,18 @@ impl UserDefinedLogicalNodeCore for RangeManipulate {
     fn with_exprs_and_inputs(
         &self,
         _exprs: Vec<Expr>,
-        inputs: Vec<LogicalPlan>,
+        mut inputs: Vec<LogicalPlan>,
     ) -> DataFusionResult<Self> {
-        if inputs.is_empty() {
+        if inputs.len() != 1 {
             return Err(DataFusionError::Internal(
-                "RangeManipulate should have at least one input".to_string(),
+                "RangeManipulate should have at exact one input".to_string(),
             ));
         }
+
+        let input: LogicalPlan = inputs.pop().unwrap();
+        let input_schema = input.schema();
+        let output_schema =
+            Self::calculate_output_schema(input_schema, &self.time_index, &self.field_columns)?;
 
         Ok(Self {
             start: self.start,
@@ -283,8 +296,8 @@ impl UserDefinedLogicalNodeCore for RangeManipulate {
             range: self.range,
             time_index: self.time_index.clone(),
             field_columns: self.field_columns.clone(),
-            input: inputs.into_iter().next().unwrap(),
-            output_schema: self.output_schema.clone(),
+            input,
+            output_schema,
         })
     }
 }
@@ -327,7 +340,14 @@ impl ExecutionPlan for RangeManipulateExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::SinglePartition]
+        let input_requirement = self.input.required_input_distribution();
+        if input_requirement.is_empty() {
+            // if the input is EmptyMetric, its required_input_distribution() is empty so we can't
+            // use its input distribution.
+            vec![Distribution::UnspecifiedDistribution]
+        } else {
+            input_requirement
+        }
     }
 
     fn with_new_children(
@@ -336,10 +356,12 @@ impl ExecutionPlan for RangeManipulateExec {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         assert!(!children.is_empty());
         let exec_input = children[0].clone();
+        let properties = exec_input.properties();
         let properties = PlanProperties::new(
             EquivalenceProperties::new(self.output_schema.clone()),
-            exec_input.properties().partitioning.clone(),
-            exec_input.properties().execution_mode,
+            properties.partitioning.clone(),
+            properties.emission_type,
+            properties.boundedness,
         );
         Ok(Arc::new(Self {
             start: self.start,
@@ -474,12 +496,13 @@ impl Stream for RangeManipulateStream {
     type Item = DataFusionResult<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let timer = std::time::Instant::now();
         let poll = loop {
             match ready!(self.input.poll_next_unpin(cx)) {
                 Some(Ok(batch)) => {
+                    let timer = std::time::Instant::now();
                     let result = self.manipulate(batch);
                     if let Ok(None) = result {
+                        self.metric.elapsed_compute().add_elapsed(timer);
                         continue;
                     } else {
                         self.num_series.add(1);
@@ -505,7 +528,7 @@ impl RangeManipulateStream {
     pub fn manipulate(&self, input: RecordBatch) -> DataFusionResult<Option<RecordBatch>> {
         let mut other_columns = (0..input.columns().len()).collect::<HashSet<_>>();
         // calculate the range
-        let ranges = self.calculate_range(&input)?;
+        let (ranges, (start, end)) = self.calculate_range(&input)?;
         // ignore this if all ranges are empty
         if ranges.iter().all(|(_, len)| *len == 0) {
             return Ok(None);
@@ -537,7 +560,12 @@ impl RangeManipulateStream {
             new_columns[index] = compute::take(&input.column(index), &take_indices, None)?;
         }
         // replace timestamp with the aligned one
-        new_columns[self.time_index] = self.aligned_ts_array.clone();
+        let new_time_index = if ranges.len() != self.aligned_ts_array.len() {
+            Self::build_aligned_ts_array(start, end, self.interval)
+        } else {
+            self.aligned_ts_array.clone()
+        };
+        new_columns[self.time_index] = new_time_index;
 
         RecordBatch::try_new(self.output_schema.clone(), new_columns)
             .map(Some)
@@ -550,7 +578,14 @@ impl RangeManipulateStream {
         ))
     }
 
-    fn calculate_range(&self, input: &RecordBatch) -> DataFusionResult<Vec<(u32, u32)>> {
+    /// Return values:
+    /// - A vector of tuples where each tuple contains the start index and length of the range.
+    /// - A tuple of the actual start/end timestamp used to calculate the range.
+    #[allow(clippy::type_complexity)]
+    fn calculate_range(
+        &self,
+        input: &RecordBatch,
+    ) -> DataFusionResult<(Vec<(u32, u32)>, (i64, i64))> {
         let ts_column = input
             .column(self.time_index)
             .as_any()
@@ -561,30 +596,65 @@ impl RangeManipulateStream {
                 )
             })?;
 
-        let mut ranges = vec![];
+        let len = ts_column.len();
+        if len == 0 {
+            return Ok((vec![], (self.start, self.end)));
+        }
+
+        // shorten the range to calculate
+        let first_ts = ts_column.value(0);
+        let first_ts_aligned = (first_ts / self.interval) * self.interval;
+        let last_ts = ts_column.value(ts_column.len() - 1);
+        let last_ts_aligned = ((last_ts + self.range) / self.interval) * self.interval;
+        let start = self.start.max(first_ts_aligned);
+        let end = self.end.min(last_ts_aligned);
+        if start > end {
+            return Ok((vec![], (start, end)));
+        }
+        let mut ranges = Vec::with_capacity(((self.end - self.start) / self.interval + 1) as usize);
 
         // calculate for every aligned timestamp (`curr_ts`), assume the ts column is ordered.
-        for curr_ts in (self.start..=self.end).step_by(self.interval as _) {
+        let mut range_start_index = 0usize;
+        let mut last_range_start = 0;
+        let mut start_delta = 0;
+        for curr_ts in (start..=end).step_by(self.interval as _) {
+            // determine range start
+            let start_ts = curr_ts - self.range;
+
+            // advance cursor based on last range
             let mut range_start = ts_column.len();
             let mut range_end = 0;
-            for (index, ts) in ts_column.values().iter().enumerate() {
-                if ts + self.range >= curr_ts {
-                    range_start = range_start.min(index);
+            let mut cursor = range_start_index + start_delta;
+            // search back to keep the result correct
+            while cursor < ts_column.len() && ts_column.value(cursor) > start_ts && cursor > 0 {
+                cursor -= 1;
+            }
+
+            while cursor < ts_column.len() {
+                let ts = ts_column.value(cursor);
+                if range_start > cursor && ts >= start_ts {
+                    range_start = cursor;
+                    range_start_index = range_start;
                 }
-                if *ts <= curr_ts {
-                    range_end = range_end.max(index);
+                if ts <= curr_ts {
+                    range_end = range_end.max(cursor);
                 } else {
+                    range_start_index = range_start_index.checked_sub(1usize).unwrap_or_default();
                     break;
                 }
+                cursor += 1;
             }
             if range_start > range_end {
                 ranges.push((0, 0));
+                start_delta = 0;
             } else {
                 ranges.push((range_start as _, (range_end + 1 - range_start) as _));
+                start_delta = range_start - last_range_start;
+                last_range_start = range_start;
             }
         }
 
-        Ok(ranges)
+        Ok((ranges, (start, end)))
     }
 }
 
@@ -596,8 +666,8 @@ mod test {
     };
     use datafusion::common::ToDFSchema;
     use datafusion::physical_expr::Partitioning;
+    use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
     use datafusion::physical_plan::memory::MemoryExec;
-    use datafusion::physical_plan::ExecutionMode;
     use datafusion::prelude::SessionContext;
     use datatypes::arrow::array::TimestampMillisecondArray;
 
@@ -656,7 +726,8 @@ mod test {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(manipulate_output_schema.clone()),
             Partitioning::UnknownPartitioning(1),
-            ExecutionMode::Bounded,
+            EmissionType::Incremental,
+            Boundedness::Bounded,
         );
         let normalize_exec = Arc::new(RangeManipulateExec {
             start,
@@ -729,7 +800,10 @@ mod test {
                 ranges: [Some(0..1), Some(0..2), Some(0..3), Some(0..4), Some(1..5), Some(2..5), Some(3..6), Some(4..6), Some(5..7), Some(5..8), Some(6..10)] \
             }",
 );
-        do_normalize_test(0, 310_000, 30_000, 90_000, expected).await;
+        do_normalize_test(0, 310_000, 30_000, 90_000, expected.clone()).await;
+
+        // dump large range
+        do_normalize_test(-300000, 310_000, 30_000, 90_000, expected).await;
     }
 
     #[tokio::test]

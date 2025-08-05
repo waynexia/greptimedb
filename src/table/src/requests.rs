@@ -14,24 +14,31 @@
 
 //! Table and TableEngine requests
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::str::FromStr;
 
 use common_base::readable_size::ReadableSize;
+use common_datasource::object_store::oss::is_supported_in_oss;
 use common_datasource::object_store::s3::is_supported_in_s3;
 use common_query::AddColumnLocation;
 use common_time::range::TimestampRange;
 use common_time::TimeToLive;
 use datatypes::data_type::ConcreteDataType;
 use datatypes::prelude::VectorRef;
-use datatypes::schema::{ColumnSchema, FulltextOptions, SkippingIndexOptions};
+use datatypes::schema::{
+    ColumnDefaultConstraint, ColumnSchema, FulltextOptions, SkippingIndexOptions,
+};
 use greptime_proto::v1::region::compact_request;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use store_api::metric_engine_consts::{
     is_metric_engine_option_key, LOGICAL_TABLE_METADATA_KEY, PHYSICAL_TABLE_METADATA_KEY,
 };
-use store_api::mito_engine_options::is_mito_engine_option_key;
+use store_api::mito_engine_options::{
+    is_mito_engine_option_key, APPEND_MODE_KEY, COMPACTION_TYPE, MEMTABLE_TYPE, MERGE_MODE_KEY,
+    TWCS_FALLBACK_TO_LOCAL, TWCS_MAX_OUTPUT_FILE_SIZE, TWCS_TIME_WINDOW, TWCS_TRIGGER_FILE_NUM,
+};
 use store_api::region_request::{SetRegionOption, UnsetRegionOption};
 
 use crate::error::{ParseTableOptionSnafu, Result};
@@ -43,9 +50,60 @@ pub const FILE_TABLE_LOCATION_KEY: &str = "location";
 pub const FILE_TABLE_PATTERN_KEY: &str = "pattern";
 pub const FILE_TABLE_FORMAT_KEY: &str = "format";
 
+pub const TABLE_DATA_MODEL: &str = "table_data_model";
+pub const TABLE_DATA_MODEL_TRACE_V1: &str = "greptime_trace_v1";
+
+pub const OTLP_METRIC_COMPAT_KEY: &str = "otlp_metric_compat";
+pub const OTLP_METRIC_COMPAT_PROM: &str = "prom";
+
+pub const VALID_TABLE_OPTION_KEYS: [&str; 12] = [
+    // common keys:
+    WRITE_BUFFER_SIZE_KEY,
+    TTL_KEY,
+    STORAGE_KEY,
+    COMMENT_KEY,
+    SKIP_WAL_KEY,
+    // file engine keys:
+    FILE_TABLE_LOCATION_KEY,
+    FILE_TABLE_FORMAT_KEY,
+    FILE_TABLE_PATTERN_KEY,
+    // metric engine keys:
+    PHYSICAL_TABLE_METADATA_KEY,
+    LOGICAL_TABLE_METADATA_KEY,
+    // table model info
+    TABLE_DATA_MODEL,
+    OTLP_METRIC_COMPAT_KEY,
+];
+
+// Valid option keys when creating a db.
+static VALID_DB_OPT_KEYS: Lazy<HashSet<&str>> = Lazy::new(|| {
+    let mut set = HashSet::new();
+    set.insert(TTL_KEY);
+    set.insert(STORAGE_KEY);
+    set.insert(MEMTABLE_TYPE);
+    set.insert(APPEND_MODE_KEY);
+    set.insert(MERGE_MODE_KEY);
+    set.insert(SKIP_WAL_KEY);
+    set.insert(COMPACTION_TYPE);
+    set.insert(TWCS_FALLBACK_TO_LOCAL);
+    set.insert(TWCS_TIME_WINDOW);
+    set.insert(TWCS_TRIGGER_FILE_NUM);
+    set.insert(TWCS_MAX_OUTPUT_FILE_SIZE);
+    set
+});
+
+/// Returns true if the `key` is a valid key for database.
+pub fn validate_database_option(key: &str) -> bool {
+    VALID_DB_OPT_KEYS.contains(&key)
+}
+
 /// Returns true if the `key` is a valid key for any engine or storage.
 pub fn validate_table_option(key: &str) -> bool {
     if is_supported_in_s3(key) {
+        return true;
+    }
+
+    if is_supported_in_oss(key) {
         return true;
     }
 
@@ -57,21 +115,7 @@ pub fn validate_table_option(key: &str) -> bool {
         return true;
     }
 
-    [
-        // common keys:
-        WRITE_BUFFER_SIZE_KEY,
-        TTL_KEY,
-        STORAGE_KEY,
-        COMMENT_KEY,
-        // file engine keys:
-        FILE_TABLE_LOCATION_KEY,
-        FILE_TABLE_FORMAT_KEY,
-        FILE_TABLE_PATTERN_KEY,
-        // metric engine keys:
-        PHYSICAL_TABLE_METADATA_KEY,
-        LOGICAL_TABLE_METADATA_KEY,
-    ]
-    .contains(&key)
+    VALID_TABLE_OPTION_KEYS.contains(&key)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -81,6 +125,8 @@ pub struct TableOptions {
     pub write_buffer_size: Option<ReadableSize>,
     /// Time-to-live of table. Expired data will be automatically purged.
     pub ttl: Option<TimeToLive>,
+    /// Skip wal write for this table.
+    pub skip_wal: bool,
     /// Extra options that may not applicable to all table engines.
     pub extra_options: HashMap<String, String>,
 }
@@ -90,6 +136,7 @@ pub const TTL_KEY: &str = store_api::mito_engine_options::TTL_KEY;
 pub const STORAGE_KEY: &str = "storage";
 pub const COMMENT_KEY: &str = "comment";
 pub const AUTO_CREATE_TABLE_KEY: &str = "auto_create_table";
+pub const SKIP_WAL_KEY: &str = store_api::mito_engine_options::SKIP_WAL_KEY;
 
 impl TableOptions {
     pub fn try_from_iter<T: ToString, U: IntoIterator<Item = (T, T)>>(
@@ -124,6 +171,16 @@ impl TableOptions {
             options.ttl = Some(ttl_value);
         }
 
+        if let Some(skip_wal) = kvs.get(SKIP_WAL_KEY) {
+            options.skip_wal = skip_wal.parse().map_err(|_| {
+                ParseTableOptionSnafu {
+                    key: SKIP_WAL_KEY,
+                    value: skip_wal,
+                }
+                .build()
+            })?;
+        }
+
         options.extra_options = HashMap::from_iter(
             kvs.into_iter()
                 .filter(|(k, _)| k != WRITE_BUFFER_SIZE_KEY && k != TTL_KEY),
@@ -142,6 +199,10 @@ impl fmt::Display for TableOptions {
 
         if let Some(ttl) = self.ttl.map(|ttl| ttl.to_string()) {
             key_vals.push(format!("{}={}", TTL_KEY, ttl));
+        }
+
+        if self.skip_wal {
+            key_vals.push(format!("{}={}", SKIP_WAL_KEY, self.skip_wal));
         }
 
         for (k, v) in &self.extra_options {
@@ -222,16 +283,28 @@ pub enum AlterKind {
     UnsetTableOptions {
         keys: Vec<UnsetRegionOption>,
     },
-    SetIndex {
-        options: SetIndexOptions,
+    SetIndexes {
+        options: Vec<SetIndexOption>,
     },
-    UnsetIndex {
-        options: UnsetIndexOptions,
+    UnsetIndexes {
+        options: Vec<UnsetIndexOption>,
+    },
+    DropDefaults {
+        names: Vec<String>,
+    },
+    SetDefaults {
+        defaults: Vec<SetDefaultRequest>,
     },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum SetIndexOptions {
+pub struct SetDefaultRequest {
+    pub column_name: String,
+    pub default_constraint: Option<ColumnDefaultConstraint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SetIndexOption {
     Fulltext {
         column_name: String,
         options: FulltextOptions,
@@ -245,11 +318,33 @@ pub enum SetIndexOptions {
     },
 }
 
+impl SetIndexOption {
+    /// Returns the column name of the index option.
+    pub fn column_name(&self) -> &str {
+        match self {
+            SetIndexOption::Fulltext { column_name, .. } => column_name,
+            SetIndexOption::Inverted { column_name, .. } => column_name,
+            SetIndexOption::Skipping { column_name, .. } => column_name,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum UnsetIndexOptions {
+pub enum UnsetIndexOption {
     Fulltext { column_name: String },
     Inverted { column_name: String },
     Skipping { column_name: String },
+}
+
+impl UnsetIndexOption {
+    /// Returns the column name of the index option.
+    pub fn column_name(&self) -> &str {
+        match self {
+            UnsetIndexOption::Fulltext { column_name, .. } => column_name,
+            UnsetIndexOption::Inverted { column_name, .. } => column_name,
+            UnsetIndexOption::Skipping { column_name, .. } => column_name,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -378,6 +473,7 @@ mod tests {
             write_buffer_size: None,
             ttl: Some(Duration::from_secs(1000).into()),
             extra_options: HashMap::new(),
+            skip_wal: false,
         };
         let serialized = serde_json::to_string(&options).unwrap();
         let deserialized: TableOptions = serde_json::from_str(&serialized).unwrap();
@@ -390,6 +486,7 @@ mod tests {
             write_buffer_size: Some(ReadableSize::mb(128)),
             ttl: Some(Duration::from_secs(1000).into()),
             extra_options: HashMap::new(),
+            skip_wal: false,
         };
         let serialized_map = HashMap::from(&options);
         let serialized = TableOptions::try_from_iter(&serialized_map).unwrap();
@@ -399,6 +496,7 @@ mod tests {
             write_buffer_size: None,
             ttl: Default::default(),
             extra_options: HashMap::new(),
+            skip_wal: false,
         };
         let serialized_map = HashMap::from(&options);
         let serialized = TableOptions::try_from_iter(&serialized_map).unwrap();
@@ -408,6 +506,7 @@ mod tests {
             write_buffer_size: Some(ReadableSize::mb(128)),
             ttl: Some(Duration::from_secs(1000).into()),
             extra_options: HashMap::from([("a".to_string(), "A".to_string())]),
+            skip_wal: false,
         };
         let serialized_map = HashMap::from(&options);
         let serialized = TableOptions::try_from_iter(&serialized_map).unwrap();
@@ -420,6 +519,7 @@ mod tests {
             write_buffer_size: Some(ReadableSize::mb(128)),
             ttl: Some(Duration::from_secs(1000).into()),
             extra_options: HashMap::new(),
+            skip_wal: false,
         };
 
         assert_eq!(
@@ -431,10 +531,22 @@ mod tests {
             write_buffer_size: Some(ReadableSize::mb(128)),
             ttl: Some(Duration::from_secs(1000).into()),
             extra_options: HashMap::from([("a".to_string(), "A".to_string())]),
+            skip_wal: false,
         };
 
         assert_eq!(
             "write_buffer_size=128.0MiB ttl=16m 40s a=A",
+            options.to_string()
+        );
+
+        let options = TableOptions {
+            write_buffer_size: Some(ReadableSize::mb(128)),
+            ttl: Some(Duration::from_secs(1000).into()),
+            extra_options: HashMap::new(),
+            skip_wal: true,
+        };
+        assert_eq!(
+            "write_buffer_size=128.0MiB ttl=16m 40s skip_wal=true",
             options.to_string()
         );
     }

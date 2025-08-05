@@ -13,33 +13,37 @@
 // limitations under the License.
 
 mod runner;
-mod rwlock;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use backon::ExponentialBuilder;
+use common_error::ext::BoxedError;
 use common_runtime::{RepeatedTask, TaskFunction};
 use common_telemetry::tracing_context::{FutureExt, TracingContext};
 use common_telemetry::{error, info, tracing};
-use snafu::{ensure, ResultExt};
+use snafu::{ensure, OptionExt, ResultExt};
 use tokio::sync::watch::{self, Receiver, Sender};
 use tokio::sync::{Mutex as TokioMutex, Notify};
 
-use self::rwlock::KeyRwLock;
 use crate::error::{
-    self, DuplicateProcedureSnafu, Error, LoaderConflictSnafu, ManagerNotStartSnafu, Result,
-    StartRemoveOutdatedMetaTaskSnafu, StopRemoveOutdatedMetaTaskSnafu,
+    self, CheckStatusSnafu, DuplicateProcedureSnafu, Error, LoaderConflictSnafu,
+    ManagerNotStartSnafu, ManagerPasuedSnafu, PoisonKeyNotDefinedSnafu, ProcedureNotFoundSnafu,
+    Result, StartRemoveOutdatedMetaTaskSnafu, StopRemoveOutdatedMetaTaskSnafu,
+    TooManyRunningProceduresSnafu,
 };
 use crate::local::runner::Runner;
-use crate::procedure::{BoxedProcedureLoader, InitProcedureState, ProcedureInfo};
+use crate::procedure::{BoxedProcedureLoader, InitProcedureState, PoisonKeys, ProcedureInfo};
+use crate::rwlock::{KeyRwLock, OwnedKeyRwLockGuard};
+use crate::store::poison_store::PoisonStoreRef;
 use crate::store::{ProcedureMessage, ProcedureMessages, ProcedureStore, StateStoreRef};
 use crate::{
-    BoxedProcedure, ContextProvider, LockKey, ProcedureId, ProcedureManager, ProcedureState,
-    ProcedureWithId, Watcher,
+    BoxedProcedure, ContextProvider, LockKey, PoisonKey, ProcedureId, ProcedureManager,
+    ProcedureState, ProcedureWithId, StringKey, Watcher,
 };
 
 /// The expired time of a procedure's metadata.
@@ -65,6 +69,8 @@ pub(crate) struct ProcedureMeta {
     child_notify: Notify,
     /// Lock required by this procedure.
     lock_key: LockKey,
+    /// Poison keys that may cause this procedure to become poisoned during execution.
+    poison_keys: PoisonKeys,
     /// Sender to notify the procedure state.
     state_sender: Sender<ProcedureState>,
     /// Receiver to watch the procedure state.
@@ -83,6 +89,7 @@ impl ProcedureMeta {
         procedure_state: ProcedureState,
         parent_id: Option<ProcedureId>,
         lock_key: LockKey,
+        poison_keys: PoisonKeys,
         type_name: &str,
     ) -> ProcedureMeta {
         let (state_sender, state_receiver) = watch::channel(procedure_state);
@@ -91,6 +98,7 @@ impl ProcedureMeta {
             parent_id,
             child_notify: Notify::new(),
             lock_key,
+            poison_keys,
             state_sender,
             state_receiver,
             children: Mutex::new(Vec::new()),
@@ -147,22 +155,90 @@ type ProcedureMetaRef = Arc<ProcedureMeta>;
 /// Procedure loaded from store.
 struct LoadedProcedure {
     procedure: BoxedProcedure,
-    parent_id: Option<ProcedureId>,
     step: u32,
+}
+
+/// The dynamic lock for procedure execution.
+///
+/// Unlike the procedure-level locks, these locks are acquired dynamically by the procedure
+/// during execution. They are only held when the procedure specifically needs these keys
+/// and are released as soon as the procedure no longer needs them.
+/// This allows for more fine-grained concurrency control during procedure execution.
+pub(crate) type DynamicKeyLock = Arc<KeyRwLock<String>>;
+
+/// Acquires a dynamic key lock for the given key.
+///
+/// This function takes a reference to the dynamic key lock and a pointer to the key.
+/// It then matches the key type and acquires the appropriate lock.
+pub async fn acquire_dynamic_key_lock(
+    lock: &DynamicKeyLock,
+    key: &StringKey,
+) -> DynamicKeyLockGuard {
+    match key {
+        StringKey::Share(key) => {
+            let guard = lock.read(key.to_string()).await;
+            DynamicKeyLockGuard {
+                guard: Some(OwnedKeyRwLockGuard::from(guard)),
+                key: key.to_string(),
+                lock: lock.clone(),
+            }
+        }
+        StringKey::Exclusive(key) => {
+            let guard = lock.write(key.to_string()).await;
+            DynamicKeyLockGuard {
+                guard: Some(OwnedKeyRwLockGuard::from(guard)),
+                key: key.to_string(),
+                lock: lock.clone(),
+            }
+        }
+    }
+}
+/// A guard for the dynamic key lock.
+///
+/// This guard is used to release the lock when the procedure no longer needs it.
+/// It also ensures that the lock is cleaned up when the guard is dropped.
+pub struct DynamicKeyLockGuard {
+    guard: Option<OwnedKeyRwLockGuard>,
+    key: String,
+    lock: DynamicKeyLock,
+}
+
+impl Drop for DynamicKeyLockGuard {
+    fn drop(&mut self) {
+        if let Some(guard) = self.guard.take() {
+            drop(guard);
+        }
+        self.lock.clean_keys(&[self.key.to_string()]);
+    }
 }
 
 /// Shared context of the manager.
 pub(crate) struct ManagerContext {
     /// Procedure loaders. The key is the type name of the procedure which the loader returns.
     loaders: Mutex<HashMap<String, BoxedProcedureLoader>>,
+    /// The key lock for the procedure.
+    ///
+    /// The lock keys are defined in `Procedure::lock_key()`.
+    /// These locks are acquired before the procedure starts and released after the procedure finishes.
+    /// They ensure exclusive access to resources throughout the entire procedure lifecycle.
     key_lock: KeyRwLock<String>,
+    /// The dynamic lock for procedure execution.
+    ///
+    /// Unlike the procedure-level locks, these locks are acquired dynamically by the procedure
+    /// during execution. They are only held when the procedure specifically needs these keys
+    /// and are released as soon as the procedure no longer needs them.
+    /// This allows for more fine-grained concurrency control during procedure execution.
+    dynamic_key_lock: DynamicKeyLock,
+    /// Procedures in the manager.
     procedures: RwLock<HashMap<ProcedureId, ProcedureMetaRef>>,
-    /// Messages loaded from the procedure store.
-    messages: Mutex<HashMap<ProcedureId, ProcedureMessage>>,
+    /// Running procedures.
+    running_procedures: Mutex<HashSet<ProcedureId>>,
     /// Ids and finished time of finished procedures.
     finished_procedures: Mutex<VecDeque<(ProcedureId, Instant)>>,
     /// Running flag.
     running: Arc<AtomicBool>,
+    /// Poison manager.
+    poison_manager: PoisonStoreRef,
 }
 
 #[async_trait]
@@ -170,18 +246,53 @@ impl ContextProvider for ManagerContext {
     async fn procedure_state(&self, procedure_id: ProcedureId) -> Result<Option<ProcedureState>> {
         Ok(self.state(procedure_id))
     }
+
+    async fn procedure_state_receiver(
+        &self,
+        procedure_id: ProcedureId,
+    ) -> Result<Option<Receiver<ProcedureState>>> {
+        Ok(self.state_receiver(procedure_id))
+    }
+
+    async fn try_put_poison(&self, key: &PoisonKey, procedure_id: ProcedureId) -> Result<()> {
+        {
+            // validate the procedure exists
+            let procedures = self.procedures.read().unwrap();
+            let procedure = procedures
+                .get(&procedure_id)
+                .context(ProcedureNotFoundSnafu { procedure_id })?;
+
+            // validate the poison key is defined
+            ensure!(
+                procedure.poison_keys.contains(key),
+                PoisonKeyNotDefinedSnafu {
+                    key: key.clone(),
+                    procedure_id
+                }
+            );
+        }
+        let key = key.to_string();
+        let procedure_id = procedure_id.to_string();
+        self.poison_manager.try_put_poison(key, procedure_id).await
+    }
+
+    async fn acquire_lock(&self, key: &StringKey) -> DynamicKeyLockGuard {
+        acquire_dynamic_key_lock(&self.dynamic_key_lock, key).await
+    }
 }
 
 impl ManagerContext {
     /// Returns a new [ManagerContext].
-    fn new() -> ManagerContext {
+    fn new(poison_manager: PoisonStoreRef) -> ManagerContext {
         ManagerContext {
             key_lock: KeyRwLock::new(),
+            dynamic_key_lock: Arc::new(KeyRwLock::new()),
             loaders: Mutex::new(HashMap::new()),
             procedures: RwLock::new(HashMap::new()),
-            messages: Mutex::new(HashMap::new()),
+            running_procedures: Mutex::new(HashSet::new()),
             finished_procedures: Mutex::new(VecDeque::new()),
             running: Arc::new(AtomicBool::new(false)),
+            poison_manager,
         }
     }
 
@@ -210,18 +321,27 @@ impl ManagerContext {
         procedures.contains_key(&procedure_id)
     }
 
+    /// Returns the number of running procedures.
+    fn num_running_procedures(&self) -> usize {
+        self.running_procedures.lock().unwrap().len()
+    }
+
     /// Try to insert the `procedure` to the context if there is no procedure
     /// with same [ProcedureId].
     ///
     /// Returns `false` if there is already a procedure using the same [ProcedureId].
     fn try_insert_procedure(&self, meta: ProcedureMetaRef) -> bool {
+        let procedure_id = meta.id;
         let mut procedures = self.procedures.write().unwrap();
-        if procedures.contains_key(&meta.id) {
-            return false;
+        match procedures.entry(procedure_id) {
+            Entry::Occupied(_) => return false,
+            Entry::Vacant(vacant_entry) => {
+                vacant_entry.insert(meta);
+            }
         }
 
-        let old = procedures.insert(meta.id, meta);
-        debug_assert!(old.is_none());
+        let mut running_procedures = self.running_procedures.lock().unwrap();
+        running_procedures.insert(procedure_id);
 
         true
     }
@@ -230,6 +350,14 @@ impl ManagerContext {
     fn state(&self, procedure_id: ProcedureId) -> Option<ProcedureState> {
         let procedures = self.procedures.read().unwrap();
         procedures.get(&procedure_id).map(|meta| meta.state())
+    }
+
+    /// Returns the [Receiver<ProcedureState>] of specific `procedure_id`.
+    fn state_receiver(&self, procedure_id: ProcedureId) -> Option<Receiver<ProcedureState>> {
+        let procedures = self.procedures.read().unwrap();
+        procedures
+            .get(&procedure_id)
+            .map(|meta| meta.state_receiver.clone())
     }
 
     /// Returns the [ProcedureMeta] of all procedures.
@@ -264,16 +392,6 @@ impl ManagerContext {
         }
     }
 
-    /// Load procedure with specific `procedure_id` from cached [ProcedureMessage]s.
-    fn load_one_procedure(&self, procedure_id: ProcedureId) -> Option<LoadedProcedure> {
-        let message = {
-            let messages = self.messages.lock().unwrap();
-            messages.get(&procedure_id).cloned()?
-        };
-
-        self.load_one_procedure_from_message(procedure_id, &message)
-    }
-
     /// Load procedure from specific [ProcedureMessage].
     fn load_one_procedure_from_message(
         &self,
@@ -301,7 +419,6 @@ impl ManagerContext {
 
         Some(LoadedProcedure {
             procedure,
-            parent_id: message.parent_id,
             step: message.step,
         })
     }
@@ -350,23 +467,19 @@ impl ManagerContext {
         }
     }
 
-    /// Remove cached [ProcedureMessage] by ids.
-    fn remove_messages(&self, procedure_ids: &[ProcedureId]) {
-        let mut messages = self.messages.lock().unwrap();
-        for procedure_id in procedure_ids {
-            let _ = messages.remove(procedure_id);
-        }
-    }
-
     /// Clean resources of finished procedures.
     fn on_procedures_finish(&self, procedure_ids: &[ProcedureId]) {
-        self.remove_messages(procedure_ids);
-
         // Since users need to query the procedure state, so we can't remove the
         // meta of the procedure directly.
         let now = Instant::now();
         let mut finished_procedures = self.finished_procedures.lock().unwrap();
         finished_procedures.extend(procedure_ids.iter().map(|id| (*id, now)));
+
+        // Remove the procedures from the running set.
+        let mut running_procedures = self.running_procedures.lock().unwrap();
+        for procedure_id in procedure_ids {
+            running_procedures.remove(procedure_id);
+        }
     }
 
     /// Remove metadata of outdated procedures.
@@ -410,6 +523,7 @@ pub struct ManagerConfig {
     pub retry_delay: Duration,
     pub remove_outdated_meta_task_interval: Duration,
     pub remove_outdated_meta_ttl: Duration,
+    pub max_running_procedures: usize,
 }
 
 impl Default for ManagerConfig {
@@ -420,8 +534,17 @@ impl Default for ManagerConfig {
             retry_delay: Duration::from_millis(500),
             remove_outdated_meta_task_interval: Duration::from_secs(60 * 10),
             remove_outdated_meta_ttl: META_TTL,
+            max_running_procedures: 128,
         }
     }
+}
+
+type PauseAwareRef = Arc<dyn PauseAware>;
+
+#[async_trait]
+pub trait PauseAware: Send + Sync {
+    /// Returns true if the procedure manager is paused.
+    async fn is_paused(&self) -> std::result::Result<bool, BoxedError>;
 }
 
 /// A [ProcedureManager] that maintains procedure states locally.
@@ -433,12 +556,18 @@ pub struct LocalManager {
     /// GC task.
     remove_outdated_meta_task: TokioMutex<Option<RepeatedTask<Error>>>,
     config: ManagerConfig,
+    pause_aware: Option<PauseAwareRef>,
 }
 
 impl LocalManager {
     /// Create a new [LocalManager] with specific `config`.
-    pub fn new(config: ManagerConfig, state_store: StateStoreRef) -> LocalManager {
-        let manager_ctx = Arc::new(ManagerContext::new());
+    pub fn new(
+        config: ManagerConfig,
+        state_store: StateStoreRef,
+        poison_store: PoisonStoreRef,
+        pause_aware: Option<PauseAwareRef>,
+    ) -> LocalManager {
+        let manager_ctx = Arc::new(ManagerContext::new(poison_store));
 
         LocalManager {
             manager_ctx,
@@ -447,6 +576,7 @@ impl LocalManager {
             retry_delay: config.retry_delay,
             remove_outdated_meta_task: TokioMutex::new(None),
             config,
+            pause_aware,
         }
     }
 
@@ -476,6 +606,7 @@ impl LocalManager {
             procedure_state,
             None,
             procedure.lock_key(),
+            procedure.poison_keys(),
             procedure.type_name(),
         ));
         let runner = Runner {
@@ -491,6 +622,13 @@ impl LocalManager {
         };
 
         let watcher = meta.state_receiver.clone();
+
+        ensure!(
+            self.manager_ctx.num_running_procedures() < self.config.max_running_procedures,
+            TooManyRunningProceduresSnafu {
+                max_running_procedures: self.config.max_running_procedures,
+            }
+        );
 
         // Inserts meta into the manager before actually spawnd the runner.
         ensure!(
@@ -609,6 +747,17 @@ impl LocalManager {
         let loaders = self.manager_ctx.loaders.lock().unwrap();
         loaders.contains_key(name)
     }
+
+    async fn check_status(&self) -> Result<()> {
+        if let Some(pause_aware) = self.pause_aware.as_ref() {
+            ensure!(
+                !pause_aware.is_paused().await.context(CheckStatusSnafu)?,
+                ManagerPasuedSnafu
+            );
+        }
+
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -664,6 +813,7 @@ impl ProcedureManager for LocalManager {
             !self.manager_ctx.contains_procedure(procedure_id),
             DuplicateProcedureSnafu { procedure_id }
         );
+        self.check_status().await?;
 
         self.submit_root(
             procedure.id,
@@ -718,6 +868,7 @@ pub(crate) mod test_util {
             ProcedureState::Running,
             None,
             LockKey::default(),
+            PoisonKeys::default(),
             "ProcedureAdapter",
         )
     }
@@ -741,11 +892,17 @@ mod tests {
     use super::*;
     use crate::error::{self, Error};
     use crate::store::state_store::ObjectStateStore;
+    use crate::test_util::InMemoryPoisonStore;
     use crate::{Context, Procedure, Status};
+
+    fn new_test_manager_context() -> ManagerContext {
+        let poison_manager = Arc::new(InMemoryPoisonStore::default());
+        ManagerContext::new(poison_manager)
+    }
 
     #[test]
     fn test_manager_context() {
-        let ctx = ManagerContext::new();
+        let ctx = new_test_manager_context();
         let meta = Arc::new(test_util::procedure_meta_for_test());
 
         assert!(!ctx.contains_procedure(meta.id));
@@ -761,7 +918,7 @@ mod tests {
 
     #[test]
     fn test_manager_context_insert_duplicate() {
-        let ctx = ManagerContext::new();
+        let ctx = new_test_manager_context();
         let meta = Arc::new(test_util::procedure_meta_for_test());
 
         assert!(ctx.try_insert_procedure(meta.clone()));
@@ -783,7 +940,7 @@ mod tests {
 
     #[test]
     fn test_procedures_in_tree() {
-        let ctx = ManagerContext::new();
+        let ctx = new_test_manager_context();
         let root = Arc::new(test_util::procedure_meta_for_test());
         assert!(ctx.try_insert_procedure(root.clone()));
 
@@ -807,6 +964,7 @@ mod tests {
     struct ProcedureToLoad {
         content: String,
         lock_key: LockKey,
+        poison_keys: PoisonKeys,
     }
 
     #[async_trait]
@@ -826,6 +984,10 @@ mod tests {
         fn lock_key(&self) -> LockKey {
             self.lock_key.clone()
         }
+
+        fn poison_keys(&self) -> PoisonKeys {
+            self.poison_keys.clone()
+        }
     }
 
     impl ProcedureToLoad {
@@ -833,6 +995,7 @@ mod tests {
             ProcedureToLoad {
                 content: content.to_string(),
                 lock_key: LockKey::default(),
+                poison_keys: PoisonKeys::default(),
             }
         }
 
@@ -855,7 +1018,8 @@ mod tests {
             ..Default::default()
         };
         let state_store = Arc::new(ObjectStateStore::new(test_util::new_object_store(&dir)));
-        let manager = LocalManager::new(config, state_store);
+        let poison_manager = Arc::new(InMemoryPoisonStore::new());
+        let manager = LocalManager::new(config, state_store, poison_manager, None);
         manager.manager_ctx.start();
 
         manager
@@ -879,7 +1043,8 @@ mod tests {
             ..Default::default()
         };
         let state_store = Arc::new(ObjectStateStore::new(object_store.clone()));
-        let manager = LocalManager::new(config, state_store);
+        let poison_manager = Arc::new(InMemoryPoisonStore::new());
+        let manager = LocalManager::new(config, state_store, poison_manager, None);
         manager.manager_ctx.start();
 
         manager
@@ -932,7 +1097,8 @@ mod tests {
             ..Default::default()
         };
         let state_store = Arc::new(ObjectStateStore::new(test_util::new_object_store(&dir)));
-        let manager = LocalManager::new(config, state_store);
+        let poison_manager = Arc::new(InMemoryPoisonStore::new());
+        let manager = LocalManager::new(config, state_store, poison_manager, None);
         manager.manager_ctx.start();
 
         let procedure_id = ProcedureId::random();
@@ -983,7 +1149,8 @@ mod tests {
             ..Default::default()
         };
         let state_store = Arc::new(ObjectStateStore::new(test_util::new_object_store(&dir)));
-        let manager = LocalManager::new(config, state_store);
+        let poison_manager = Arc::new(InMemoryPoisonStore::new());
+        let manager = LocalManager::new(config, state_store, poison_manager, None);
         manager.manager_ctx.start();
 
         #[derive(Debug)]
@@ -1022,6 +1189,10 @@ mod tests {
             fn lock_key(&self) -> LockKey {
                 LockKey::single_exclusive("test.submit")
             }
+
+            fn poison_keys(&self) -> PoisonKeys {
+                PoisonKeys::default()
+            }
         }
 
         let check_procedure = |procedure| async {
@@ -1059,7 +1230,8 @@ mod tests {
             ..Default::default()
         };
         let state_store = Arc::new(ObjectStateStore::new(test_util::new_object_store(&dir)));
-        let manager = LocalManager::new(config, state_store);
+        let poison_manager = Arc::new(InMemoryPoisonStore::new());
+        let manager = LocalManager::new(config, state_store, poison_manager, None);
 
         let mut procedure = ProcedureToLoad::new("submit");
         procedure.lock_key = LockKey::single_exclusive("test.submit");
@@ -1086,7 +1258,8 @@ mod tests {
             ..Default::default()
         };
         let state_store = Arc::new(ObjectStateStore::new(test_util::new_object_store(&dir)));
-        let manager = LocalManager::new(config, state_store);
+        let poison_manager = Arc::new(InMemoryPoisonStore::new());
+        let manager = LocalManager::new(config, state_store, poison_manager, None);
 
         manager.start().await.unwrap();
         manager.stop().await.unwrap();
@@ -1119,9 +1292,11 @@ mod tests {
             retry_delay: Duration::from_millis(500),
             remove_outdated_meta_task_interval: Duration::from_millis(1),
             remove_outdated_meta_ttl: Duration::from_millis(1),
+            max_running_procedures: 128,
         };
         let state_store = Arc::new(ObjectStateStore::new(object_store.clone()));
-        let manager = LocalManager::new(config, state_store);
+        let poison_manager = Arc::new(InMemoryPoisonStore::new());
+        let manager = LocalManager::new(config, state_store, poison_manager, None);
         manager.manager_ctx.set_running();
 
         let mut procedure = ProcedureToLoad::new("submit");
@@ -1191,11 +1366,76 @@ mod tests {
             .is_none());
     }
 
+    #[tokio::test]
+    async fn test_too_many_running_procedures() {
+        let dir = create_temp_dir("too_many_running_procedures");
+        let config = ManagerConfig {
+            parent_path: "data/".to_string(),
+            max_retry_times: 3,
+            retry_delay: Duration::from_millis(500),
+            max_running_procedures: 1,
+            ..Default::default()
+        };
+        let state_store = Arc::new(ObjectStateStore::new(test_util::new_object_store(&dir)));
+        let poison_manager = Arc::new(InMemoryPoisonStore::new());
+        let manager = LocalManager::new(config, state_store, poison_manager, None);
+        manager.manager_ctx.set_running();
+
+        manager
+            .manager_ctx
+            .running_procedures
+            .lock()
+            .unwrap()
+            .insert(ProcedureId::random());
+        manager.start().await.unwrap();
+
+        // Submit a new procedure should fail.
+        let mut procedure = ProcedureToLoad::new("submit");
+        procedure.lock_key = LockKey::single_exclusive("test.submit");
+        let procedure_id = ProcedureId::random();
+        let err = manager
+            .submit(ProcedureWithId {
+                id: procedure_id,
+                procedure: Box::new(procedure),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::TooManyRunningProcedures { .. }));
+
+        manager
+            .manager_ctx
+            .running_procedures
+            .lock()
+            .unwrap()
+            .clear();
+
+        // Submit a new procedure should succeed.
+        let mut procedure = ProcedureToLoad::new("submit");
+        procedure.lock_key = LockKey::single_exclusive("test.submit");
+        assert!(manager
+            .submit(ProcedureWithId {
+                id: procedure_id,
+                procedure: Box::new(procedure),
+            })
+            .await
+            .is_ok());
+        assert!(manager
+            .procedure_state(procedure_id)
+            .await
+            .unwrap()
+            .is_some());
+        // Wait for the procedure done.
+        let mut watcher = manager.procedure_watcher(procedure_id).unwrap();
+        watcher.changed().await.unwrap();
+        assert!(watcher.borrow().is_done());
+    }
+
     #[derive(Debug)]
     struct ProcedureToRecover {
         content: String,
         lock_key: LockKey,
         notify: Option<Arc<Notify>>,
+        poison_keys: PoisonKeys,
     }
 
     #[async_trait]
@@ -1220,6 +1460,10 @@ mod tests {
             self.notify.as_ref().unwrap().notify_one();
             Ok(())
         }
+
+        fn poison_keys(&self) -> PoisonKeys {
+            self.poison_keys.clone()
+        }
     }
 
     impl ProcedureToRecover {
@@ -1227,6 +1471,7 @@ mod tests {
             ProcedureToRecover {
                 content: content.to_string(),
                 lock_key: LockKey::default(),
+                poison_keys: PoisonKeys::default(),
                 notify: None,
             }
         }
@@ -1236,6 +1481,7 @@ mod tests {
                 let procedure = ProcedureToRecover {
                     content: json.to_string(),
                     lock_key: LockKey::default(),
+                    poison_keys: PoisonKeys::default(),
                     notify: Some(notify.clone()),
                 };
                 Ok(Box::new(procedure) as _)
@@ -1256,7 +1502,8 @@ mod tests {
             ..Default::default()
         };
         let state_store = Arc::new(ObjectStateStore::new(object_store.clone()));
-        let manager = LocalManager::new(config, state_store);
+        let poison_manager = Arc::new(InMemoryPoisonStore::new());
+        let manager = LocalManager::new(config, state_store, poison_manager, None);
         manager.manager_ctx.start();
 
         let notify = Arc::new(Notify::new());

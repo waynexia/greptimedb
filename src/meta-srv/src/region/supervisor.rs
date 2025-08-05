@@ -12,31 +12,43 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use common_meta::datanode::Stat;
 use common_meta::ddl::{DetectingRegion, RegionFailureDetectorController};
-use common_meta::key::maintenance::MaintenanceModeManagerRef;
+use common_meta::key::runtime_switch::RuntimeSwitchManagerRef;
+use common_meta::key::table_route::{TableRouteKey, TableRouteValue};
+use common_meta::key::{MetadataKey, MetadataValue};
+use common_meta::kv_backend::KvBackendRef;
 use common_meta::leadership_notifier::LeadershipChangeListener;
-use common_meta::peer::PeerLookupServiceRef;
-use common_meta::{ClusterId, DatanodeId};
+use common_meta::peer::{Peer, PeerLookupServiceRef};
+use common_meta::range_stream::{PaginationStream, DEFAULT_PAGE_SIZE};
+use common_meta::rpc::store::RangeRequest;
+use common_meta::DatanodeId;
 use common_runtime::JoinHandle;
-use common_telemetry::{error, info, warn};
+use common_telemetry::{debug, error, info, warn};
 use common_time::util::current_time_millis;
-use error::Error::{MigrationRunning, TableRouteNotFound};
-use snafu::{OptionExt, ResultExt};
+use error::Error::{LeaderPeerChanged, MigrationRunning, RegionMigrated, TableRouteNotFound};
+use futures::{StreamExt, TryStreamExt};
+use snafu::{ensure, ResultExt};
 use store_api::storage::RegionId;
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::time::{interval, MissedTickBehavior};
+use tokio::sync::oneshot;
+use tokio::time::{interval, interval_at, MissedTickBehavior};
 
 use crate::error::{self, Result};
 use crate::failure_detector::PhiAccrualFailureDetectorOptions;
-use crate::metasrv::{SelectorContext, SelectorRef};
-use crate::procedure::region_migration::manager::RegionMigrationManagerRef;
-use crate::procedure::region_migration::RegionMigrationProcedureTask;
+use crate::metasrv::{RegionStatAwareSelectorRef, SelectTarget, SelectorContext, SelectorRef};
+use crate::procedure::region_migration::manager::{
+    RegionMigrationManagerRef, RegionMigrationTriggerReason,
+};
+use crate::procedure::region_migration::{
+    RegionMigrationProcedureTask, DEFAULT_REGION_MIGRATION_TIMEOUT,
+};
 use crate::region::failure_detector::RegionFailureDetector;
 use crate::selector::SelectorOptions;
 
@@ -45,7 +57,6 @@ use crate::selector::SelectorOptions;
 /// and a timestamp indicating when the heartbeat was sent.
 #[derive(Debug)]
 pub(crate) struct DatanodeHeartbeat {
-    cluster_id: ClusterId,
     datanode_id: DatanodeId,
     // TODO(weny): Considers collecting the memtable size in regions.
     regions: Vec<RegionId>,
@@ -55,7 +66,6 @@ pub(crate) struct DatanodeHeartbeat {
 impl From<&Stat> for DatanodeHeartbeat {
     fn from(value: &Stat) -> Self {
         DatanodeHeartbeat {
-            cluster_id: value.cluster_id,
             datanode_id: value.id,
             regions: value.region_stats.iter().map(|x| x.id).collect(),
             timestamp: value.timestamp_millis,
@@ -69,6 +79,9 @@ impl From<&Stat> for DatanodeHeartbeat {
 ///
 /// Variants:
 /// - `Tick`: This event is used to trigger region failure detection periodically.
+/// - `InitializeAllRegions`: This event is used to initialize all region failure detectors.
+/// - `RegisterFailureDetectors`: This event is used to register failure detectors for regions.
+/// - `DeregisterFailureDetectors`: This event is used to deregister failure detectors for regions.
 /// - `HeartbeatArrived`: This event presents the metasrv received [`DatanodeHeartbeat`] from the datanodes.
 /// - `Clear`: This event is used to reset the state of the supervisor, typically used
 ///   when a system-wide reset or reinitialization is needed.
@@ -77,6 +90,7 @@ impl From<&Stat> for DatanodeHeartbeat {
 ///   of the supervisor during tests.
 pub(crate) enum Event {
     Tick,
+    InitializeAllRegions(tokio::sync::oneshot::Sender<()>),
     RegisterFailureDetectors(Vec<DetectingRegion>),
     DeregisterFailureDetectors(Vec<DetectingRegion>),
     HeartbeatArrived(DatanodeHeartbeat),
@@ -101,6 +115,7 @@ impl Debug for Event {
             Self::Tick => write!(f, "Tick"),
             Self::HeartbeatArrived(arg0) => f.debug_tuple("HeartbeatArrived").field(arg0).finish(),
             Self::Clear => write!(f, "Clear"),
+            Self::InitializeAllRegions(_) => write!(f, "InspectAndRegisterRegions"),
             Self::RegisterFailureDetectors(arg0) => f
                 .debug_tuple("RegisterFailureDetectors")
                 .field(arg0)
@@ -126,6 +141,12 @@ pub struct RegionSupervisorTicker {
     /// The interval of tick.
     tick_interval: Duration,
 
+    /// The delay before initializing all region failure detectors.
+    initialization_delay: Duration,
+
+    /// The retry period for initializing all region failure detectors.
+    initialization_retry_period: Duration,
+
     /// Sends [Event]s.
     sender: Sender<Event>,
 }
@@ -148,10 +169,21 @@ impl LeadershipChangeListener for RegionSupervisorTicker {
 }
 
 impl RegionSupervisorTicker {
-    pub(crate) fn new(tick_interval: Duration, sender: Sender<Event>) -> Self {
+    pub(crate) fn new(
+        tick_interval: Duration,
+        initialization_delay: Duration,
+        initialization_retry_period: Duration,
+        sender: Sender<Event>,
+    ) -> Self {
+        info!(
+            "RegionSupervisorTicker is created, tick_interval: {:?}, initialization_delay: {:?}, initialization_retry_period: {:?}",
+            tick_interval, initialization_delay, initialization_retry_period
+        );
         Self {
             tick_handle: Mutex::new(None),
             tick_interval,
+            initialization_delay,
+            initialization_retry_period,
             sender,
         }
     }
@@ -162,15 +194,39 @@ impl RegionSupervisorTicker {
         if handle.is_none() {
             let sender = self.sender.clone();
             let tick_interval = self.tick_interval;
+            let initialization_delay = self.initialization_delay;
+
+            let mut initialization_interval = interval_at(
+                tokio::time::Instant::now() + initialization_delay,
+                self.initialization_retry_period,
+            );
+            initialization_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            common_runtime::spawn_global(async move {
+                loop {
+                    initialization_interval.tick().await;
+                    let (tx, rx) = oneshot::channel();
+                    if sender.send(Event::InitializeAllRegions(tx)).await.is_err() {
+                        info!("EventReceiver is dropped, region failure detectors initialization loop is stopped");
+                        break;
+                    }
+                    if rx.await.is_ok() {
+                        info!("All region failure detectors are initialized.");
+                        break;
+                    }
+                }
+            });
+
+            let sender = self.sender.clone();
             let ticker_loop = tokio::spawn(async move {
-                let mut interval = interval(tick_interval);
-                interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                let mut tick_interval = interval(tick_interval);
+                tick_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
                 if let Err(err) = sender.send(Event::Clear).await {
                     warn!(err; "EventReceiver is dropped, failed to send Event::Clear");
                     return;
                 }
                 loop {
-                    interval.tick().await;
+                    tick_interval.tick().await;
                     if sender.send(Event::Tick).await.is_err() {
                         info!("EventReceiver is dropped, tick loop is stopped");
                         break;
@@ -201,24 +257,36 @@ pub type RegionSupervisorRef = Arc<RegionSupervisor>;
 
 /// The default tick interval.
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(1);
+/// The default initialization retry period.
+pub const DEFAULT_INITIALIZATION_RETRY_PERIOD: Duration = Duration::from_secs(60);
+
+/// Selector for region supervisor.
+pub enum RegionSupervisorSelector {
+    NaiveSelector(SelectorRef),
+    RegionStatAwareSelector(RegionStatAwareSelectorRef),
+}
 
 /// The [`RegionSupervisor`] is used to detect Region failures
 /// and initiate Region failover upon detection, ensuring uninterrupted region service.
 pub struct RegionSupervisor {
     /// Used to detect the failure of regions.
     failure_detector: RegionFailureDetector,
+    /// Tracks the number of failovers for each region.
+    failover_counts: HashMap<DetectingRegion, u32>,
     /// Receives [Event]s.
     receiver: Receiver<Event>,
     /// The context of [`SelectorRef`]
     selector_context: SelectorContext,
     /// Candidate node selector.
-    selector: SelectorRef,
+    selector: RegionSupervisorSelector,
     /// Region migration manager.
     region_migration_manager: RegionMigrationManagerRef,
     /// The maintenance mode manager.
-    maintenance_mode_manager: MaintenanceModeManagerRef,
+    runtime_switch_manager: RuntimeSwitchManagerRef,
     /// Peer lookup service
     peer_lookup: PeerLookupServiceRef,
+    /// The kv backend.
+    kv_backend: KvBackendRef,
 }
 
 /// Controller for managing failure detectors for regions.
@@ -281,23 +349,27 @@ impl RegionSupervisor {
         tokio::sync::mpsc::channel(1024)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         event_receiver: Receiver<Event>,
         options: PhiAccrualFailureDetectorOptions,
         selector_context: SelectorContext,
-        selector: SelectorRef,
+        selector: RegionSupervisorSelector,
         region_migration_manager: RegionMigrationManagerRef,
-        maintenance_mode_manager: MaintenanceModeManagerRef,
+        runtime_switch_manager: RuntimeSwitchManagerRef,
         peer_lookup: PeerLookupServiceRef,
+        kv_backend: KvBackendRef,
     ) -> Self {
         Self {
             failure_detector: RegionFailureDetector::new(options),
+            failover_counts: HashMap::new(),
             receiver: event_receiver,
             selector_context,
             selector,
             region_migration_manager,
-            maintenance_mode_manager,
+            runtime_switch_manager,
             peer_lookup,
+            kv_backend,
         }
     }
 
@@ -305,6 +377,26 @@ impl RegionSupervisor {
     pub(crate) async fn run(&mut self) {
         while let Some(event) = self.receiver.recv().await {
             match event {
+                Event::InitializeAllRegions(sender) => {
+                    match self.is_maintenance_mode_enabled().await {
+                        Ok(false) => {}
+                        Ok(true) => {
+                            warn!("Skipping initialize all regions since maintenance mode is enabled.");
+                            continue;
+                        }
+                        Err(err) => {
+                            error!(err; "Failed to check maintenance mode during initialize all regions.");
+                            continue;
+                        }
+                    }
+
+                    if let Err(err) = self.initialize_all().await {
+                        error!(err; "Failed to initialize all regions.");
+                    } else {
+                        // Ignore the error.
+                        let _ = sender.send(());
+                    }
+                }
                 Event::Tick => {
                     let regions = self.detect_region_failure();
                     self.handle_region_failures(regions).await;
@@ -326,6 +418,59 @@ impl RegionSupervisor {
         info!("RegionSupervisor is stopped!");
     }
 
+    async fn initialize_all(&self) -> Result<()> {
+        let now = Instant::now();
+        let regions = self.regions();
+        let req = RangeRequest::new().with_prefix(TableRouteKey::range_prefix());
+        let stream = PaginationStream::new(self.kv_backend.clone(), req, DEFAULT_PAGE_SIZE, |kv| {
+            TableRouteKey::from_bytes(&kv.key).map(|v| (v.table_id, kv.value))
+        })
+        .into_stream();
+
+        let mut stream = stream
+            .map_ok(|(_, value)| {
+                TableRouteValue::try_from_raw_value(&value)
+                    .context(error::TableMetadataManagerSnafu)
+            })
+            .boxed();
+        let mut detecting_regions = Vec::new();
+        while let Some(route) = stream
+            .try_next()
+            .await
+            .context(error::TableMetadataManagerSnafu)?
+        {
+            let route = route?;
+            if !route.is_physical() {
+                continue;
+            }
+
+            let physical_table_route = route.into_physical_table_route();
+            physical_table_route
+                .region_routes
+                .iter()
+                .for_each(|region_route| {
+                    if !regions.contains(&region_route.region.id) {
+                        if let Some(leader_peer) = &region_route.leader_peer {
+                            detecting_regions.push((leader_peer.id, region_route.region.id));
+                        }
+                    }
+                });
+        }
+
+        let num_detecting_regions = detecting_regions.len();
+        if !detecting_regions.is_empty() {
+            self.register_failure_detectors(detecting_regions).await;
+        }
+
+        info!(
+            "Initialize {} region failure detectors, elapsed: {:?}",
+            num_detecting_regions,
+            now.elapsed()
+        );
+
+        Ok(())
+    }
+
     async fn register_failure_detectors(&self, detecting_regions: Vec<DetectingRegion>) {
         let ts_millis = current_time_millis();
         for region in detecting_regions {
@@ -335,20 +480,24 @@ impl RegionSupervisor {
         }
     }
 
-    async fn deregister_failure_detectors(&self, detecting_regions: Vec<DetectingRegion>) {
+    async fn deregister_failure_detectors(&mut self, detecting_regions: Vec<DetectingRegion>) {
         for region in detecting_regions {
-            self.failure_detector.remove(&region)
+            self.failure_detector.remove(&region);
+            self.failover_counts.remove(&region);
         }
     }
 
-    async fn handle_region_failures(&self, mut regions: Vec<(ClusterId, DatanodeId, RegionId)>) {
+    async fn handle_region_failures(&mut self, mut regions: Vec<(DatanodeId, RegionId)>) {
         if regions.is_empty() {
             return;
         }
         match self.is_maintenance_mode_enabled().await {
             Ok(false) => {}
             Ok(true) => {
-                info!("Maintenance mode is enabled, skip failover");
+                warn!(
+                    "Skipping failover since maintenance mode is enabled. Detected region failures: {:?}",
+                    regions
+                );
                 return;
             }
             Err(err) => {
@@ -357,77 +506,206 @@ impl RegionSupervisor {
             }
         }
 
+        // Extracts regions that are migrating(failover), which means they are already being triggered failover.
         let migrating_regions = regions
-            .extract_if(.., |(_, _, region_id)| {
+            .extract_if(.., |(_, region_id)| {
                 self.region_migration_manager.tracker().contains(*region_id)
             })
             .collect::<Vec<_>>();
 
-        for (cluster_id, datanode_id, region_id) in migrating_regions {
-            self.failure_detector
-                .remove(&(cluster_id, datanode_id, region_id));
+        for (datanode_id, region_id) in migrating_regions {
+            debug!(
+                "Removed region failover for region: {region_id}, datanode: {datanode_id} because it's migrating"
+            );
         }
 
-        warn!("Detects region failures: {:?}", regions);
-        for (cluster_id, datanode_id, region_id) in regions {
-            match self.do_failover(cluster_id, datanode_id, region_id).await {
-                Ok(_) => self
-                    .failure_detector
-                    .remove(&(cluster_id, datanode_id, region_id)),
-                Err(err) => {
-                    error!(err; "Failed to execute region failover for region: {region_id}, datanode: {datanode_id}");
+        if regions.is_empty() {
+            // If all detected regions are failover or migrating, just return.
+            return;
+        }
+
+        let mut grouped_regions: HashMap<u64, Vec<RegionId>> =
+            HashMap::with_capacity(regions.len());
+        for (datanode_id, region_id) in regions {
+            grouped_regions
+                .entry(datanode_id)
+                .or_default()
+                .push(region_id);
+        }
+
+        for (datanode_id, regions) in grouped_regions {
+            warn!(
+                "Detects region failures on datanode: {}, regions: {:?}",
+                datanode_id, regions
+            );
+            // We can't use `grouped_regions.keys().cloned().collect::<Vec<_>>()` here
+            // because there may be false positives in failure detection on the datanode.
+            // So we only consider the datanode that reports the failure.
+            let failed_datanodes = [datanode_id];
+            match self
+                .generate_failover_tasks(datanode_id, &regions, &failed_datanodes)
+                .await
+            {
+                Ok(tasks) => {
+                    for (task, count) in tasks {
+                        let region_id = task.region_id;
+                        let datanode_id = task.from_peer.id;
+                        if let Err(err) = self.do_failover(task, count).await {
+                            error!(err; "Failed to execute region failover for region: {}, datanode: {}", region_id, datanode_id);
+                        }
+                    }
                 }
+                Err(err) => error!(err; "Failed to generate failover tasks"),
             }
         }
     }
 
     pub(crate) async fn is_maintenance_mode_enabled(&self) -> Result<bool> {
-        self.maintenance_mode_manager
+        self.runtime_switch_manager
             .maintenance_mode()
             .await
-            .context(error::MaintenanceModeManagerSnafu)
+            .context(error::RuntimeSwitchManagerSnafu)
     }
 
-    async fn do_failover(
+    async fn select_peers(
         &self,
-        cluster_id: ClusterId,
-        datanode_id: DatanodeId,
-        region_id: RegionId,
-    ) -> Result<()> {
+        from_peer_id: DatanodeId,
+        regions: &[RegionId],
+        failure_datanodes: &[DatanodeId],
+    ) -> Result<Vec<(RegionId, Peer)>> {
+        let exclude_peer_ids = HashSet::from_iter(failure_datanodes.iter().cloned());
+        match &self.selector {
+            RegionSupervisorSelector::NaiveSelector(selector) => {
+                let opt = SelectorOptions {
+                    min_required_items: regions.len(),
+                    allow_duplication: true,
+                    exclude_peer_ids,
+                };
+                let peers = selector.select(&self.selector_context, opt).await?;
+                ensure!(
+                    peers.len() == regions.len(),
+                    error::NoEnoughAvailableNodeSnafu {
+                        required: regions.len(),
+                        available: peers.len(),
+                        select_target: SelectTarget::Datanode,
+                    }
+                );
+                let region_peers = regions
+                    .iter()
+                    .zip(peers)
+                    .map(|(region_id, peer)| (*region_id, peer))
+                    .collect::<Vec<_>>();
+
+                Ok(region_peers)
+            }
+            RegionSupervisorSelector::RegionStatAwareSelector(selector) => {
+                let peers = selector
+                    .select(
+                        &self.selector_context,
+                        from_peer_id,
+                        regions,
+                        exclude_peer_ids,
+                    )
+                    .await?;
+                ensure!(
+                    peers.len() == regions.len(),
+                    error::NoEnoughAvailableNodeSnafu {
+                        required: regions.len(),
+                        available: peers.len(),
+                        select_target: SelectTarget::Datanode,
+                    }
+                );
+
+                Ok(peers)
+            }
+        }
+    }
+
+    async fn generate_failover_tasks(
+        &mut self,
+        from_peer_id: DatanodeId,
+        regions: &[RegionId],
+        failed_datanodes: &[DatanodeId],
+    ) -> Result<Vec<(RegionMigrationProcedureTask, u32)>> {
+        let mut tasks = Vec::with_capacity(regions.len());
         let from_peer = self
             .peer_lookup
-            .datanode(cluster_id, datanode_id)
+            .datanode(from_peer_id)
             .await
-            .context(error::LookupPeerSnafu {
-                peer_id: datanode_id,
-            })?
-            .context(error::PeerUnavailableSnafu {
-                peer_id: datanode_id,
-            })?;
-        let mut peers = self
-            .selector
-            .select(
-                cluster_id,
-                &self.selector_context,
-                SelectorOptions {
-                    min_required_items: 1,
-                    allow_duplication: false,
-                },
-            )
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| Peer::empty(from_peer_id));
+
+        let region_peers = self
+            .select_peers(from_peer_id, regions, failed_datanodes)
             .await?;
-        let to_peer = peers.remove(0);
-        let task = RegionMigrationProcedureTask {
-            cluster_id,
-            region_id,
-            from_peer,
-            to_peer,
-            timeout: Duration::from_secs(60),
-        };
+
+        for (region_id, peer) in region_peers {
+            let count = *self
+                .failover_counts
+                .entry((from_peer_id, region_id))
+                .and_modify(|count| *count += 1)
+                .or_insert(1);
+            let task = RegionMigrationProcedureTask {
+                region_id,
+                from_peer: from_peer.clone(),
+                to_peer: peer,
+                timeout: DEFAULT_REGION_MIGRATION_TIMEOUT * count,
+                trigger_reason: RegionMigrationTriggerReason::Failover,
+            };
+            tasks.push((task, count));
+        }
+
+        Ok(tasks)
+    }
+
+    async fn do_failover(&mut self, task: RegionMigrationProcedureTask, count: u32) -> Result<()> {
+        let from_peer_id = task.from_peer.id;
+        let to_peer_id = task.to_peer.id;
+        let region_id = task.region_id;
+
+        info!(
+            "Failover for region: {}, from_peer: {}, to_peer: {}, timeout: {:?}, tries: {}",
+            task.region_id, task.from_peer, task.to_peer, task.timeout, count
+        );
 
         if let Err(err) = self.region_migration_manager.submit_procedure(task).await {
             return match err {
+                RegionMigrated { .. } => {
+                    info!(
+                        "Region has been migrated to target peer: {}, removed failover detector for region: {}, datanode: {}",
+                        to_peer_id, region_id, from_peer_id
+                    );
+                    self.deregister_failure_detectors(vec![(from_peer_id, region_id)])
+                        .await;
+                    Ok(())
+                }
                 // Returns Ok if it's running or table is dropped.
-                MigrationRunning { .. } | TableRouteNotFound { .. } => Ok(()),
+                MigrationRunning { .. } => {
+                    info!(
+                        "Another region migration is running, skip failover for region: {}, datanode: {}",
+                        region_id, from_peer_id
+                    );
+                    Ok(())
+                }
+                TableRouteNotFound { .. } => {
+                    self.deregister_failure_detectors(vec![(from_peer_id, region_id)])
+                        .await;
+                    info!(
+                        "Table route is not found, the table is dropped, removed failover detector for region: {}, datanode: {}",
+                        region_id, from_peer_id
+                    );
+                    Ok(())
+                }
+                LeaderPeerChanged { .. } => {
+                    self.deregister_failure_detectors(vec![(from_peer_id, region_id)])
+                        .await;
+                    info!(
+                        "Region's leader peer changed, removed failover detector for region: {}, datanode: {}",
+                        region_id, from_peer_id
+                    );
+                    Ok(())
+                }
                 err => Err(err),
             };
         };
@@ -436,7 +714,7 @@ impl RegionSupervisor {
     }
 
     /// Detects the failure of regions.
-    fn detect_region_failure(&self) -> Vec<(ClusterId, DatanodeId, RegionId)> {
+    fn detect_region_failure(&self) -> Vec<(DatanodeId, RegionId)> {
         self.failure_detector
             .iter()
             .filter_map(|e| {
@@ -455,10 +733,18 @@ impl RegionSupervisor {
             .collect::<Vec<_>>()
     }
 
+    /// Returns all regions that registered in the failure detector.
+    fn regions(&self) -> HashSet<RegionId> {
+        self.failure_detector
+            .iter()
+            .map(|e| e.region_ident().1)
+            .collect::<HashSet<_>>()
+    }
+
     /// Updates the state of corresponding failure detectors.
     fn on_heartbeat_arrived(&self, heartbeat: DatanodeHeartbeat) {
         for region_id in heartbeat.regions {
-            let detecting_region = (heartbeat.cluster_id, heartbeat.datanode_id, region_id);
+            let detecting_region = (heartbeat.datanode_id, region_id);
             let mut detector = self
                 .failure_detector
                 .region_failure_detector(detecting_region);
@@ -474,13 +760,22 @@ impl RegionSupervisor {
 #[cfg(test)]
 pub(crate) mod tests {
     use std::assert_matches::assert_matches;
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    use common_meta::ddl::test_util::{
+        test_create_logical_table_task, test_create_physical_table_task,
+    };
     use common_meta::ddl::RegionFailureDetectorController;
-    use common_meta::key::maintenance;
+    use common_meta::key::table_route::{
+        LogicalTableRouteValue, PhysicalTableRouteValue, TableRouteValue,
+    };
+    use common_meta::key::{runtime_switch, TableMetadataManager};
     use common_meta::peer::Peer;
+    use common_meta::rpc::router::{Region, RegionRoute};
     use common_meta::test_util::NoopPeerLookupService;
+    use common_telemetry::info;
     use common_time::util::current_time_millis;
     use rand::Rng;
     use store_api::storage::RegionId;
@@ -488,6 +783,7 @@ pub(crate) mod tests {
     use tokio::sync::oneshot;
     use tokio::time::sleep;
 
+    use super::RegionSupervisorSelector;
     use crate::procedure::region_migration::manager::RegionMigrationManager;
     use crate::procedure::region_migration::test_util::TestingEnv;
     use crate::region::supervisor::{
@@ -505,20 +801,22 @@ pub(crate) mod tests {
             env.procedure_manager().clone(),
             context_factory,
         ));
-        let maintenance_mode_manager =
-            Arc::new(maintenance::MaintenanceModeManager::new(env.kv_backend()));
+        let runtime_switch_manager =
+            Arc::new(runtime_switch::RuntimeSwitchManager::new(env.kv_backend()));
         let peer_lookup = Arc::new(NoopPeerLookupService);
         let (tx, rx) = RegionSupervisor::channel();
+        let kv_backend = env.kv_backend();
 
         (
             RegionSupervisor::new(
                 rx,
                 Default::default(),
                 selector_context,
-                selector,
+                RegionSupervisorSelector::NaiveSelector(selector),
                 region_migration_manager,
-                maintenance_mode_manager,
+                runtime_switch_manager,
                 peer_lookup,
+                kv_backend,
             ),
             tx,
         )
@@ -531,7 +829,6 @@ pub(crate) mod tests {
 
         sender
             .send(Event::HeartbeatArrived(DatanodeHeartbeat {
-                cluster_id: 0,
                 datanode_id: 0,
                 regions: vec![RegionId::new(1, 1)],
                 timestamp: 100,
@@ -541,7 +838,7 @@ pub(crate) mod tests {
         let (tx, rx) = oneshot::channel();
         sender.send(Event::Dump(tx)).await.unwrap();
         let detector = rx.await.unwrap();
-        assert!(detector.contains(&(0, 0, RegionId::new(1, 1))));
+        assert!(detector.contains(&(0, RegionId::new(1, 1))));
 
         // Clear up
         sender.send(Event::Clear).await.unwrap();
@@ -550,12 +847,11 @@ pub(crate) mod tests {
         assert!(rx.await.unwrap().is_empty());
 
         fn generate_heartbeats(datanode_id: u64, region_ids: Vec<u32>) -> Vec<DatanodeHeartbeat> {
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             let start = current_time_millis();
             (0..2000)
                 .map(|i| DatanodeHeartbeat {
-                    timestamp: start + i * 1000 + rng.gen_range(0..100),
-                    cluster_id: 0,
+                    timestamp: start + i * 1000 + rng.random_range(0..100),
                     datanode_id,
                     regions: region_ids
                         .iter()
@@ -605,6 +901,8 @@ pub(crate) mod tests {
         let ticker = RegionSupervisorTicker {
             tick_handle: Mutex::new(None),
             tick_interval: Duration::from_millis(10),
+            initialization_delay: Duration::from_millis(100),
+            initialization_retry_period: Duration::from_millis(100),
             sender: tx,
         };
         // It's ok if we start the ticker again.
@@ -614,9 +912,114 @@ pub(crate) mod tests {
             ticker.stop();
             assert!(!rx.is_empty());
             while let Ok(event) = rx.try_recv() {
-                assert_matches!(event, Event::Tick | Event::Clear);
+                assert_matches!(
+                    event,
+                    Event::Tick | Event::Clear | Event::InitializeAllRegions(_)
+                );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_initialize_all_regions_event_handling() {
+        common_telemetry::init_default_ut_logging();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+        let ticker = RegionSupervisorTicker {
+            tick_handle: Mutex::new(None),
+            tick_interval: Duration::from_millis(1000),
+            initialization_delay: Duration::from_millis(50),
+            initialization_retry_period: Duration::from_millis(50),
+            sender: tx,
+        };
+        ticker.start();
+        sleep(Duration::from_millis(60)).await;
+        let handle = tokio::spawn(async move {
+            let mut counter = 0;
+            while let Some(event) = rx.recv().await {
+                if let Event::InitializeAllRegions(tx) = event {
+                    if counter == 0 {
+                        // Ignore the first event
+                        counter += 1;
+                        continue;
+                    }
+                    tx.send(()).unwrap();
+                    info!("Responded initialize all regions event");
+                    break;
+                }
+            }
+            rx
+        });
+
+        let rx = handle.await.unwrap();
+        for _ in 0..3 {
+            sleep(Duration::from_millis(100)).await;
+            assert!(rx.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_initialize_all_regions() {
+        common_telemetry::init_default_ut_logging();
+        let (mut supervisor, sender) = new_test_supervisor();
+        let table_metadata_manager = TableMetadataManager::new(supervisor.kv_backend.clone());
+
+        // Create a physical table metadata
+        let table_id = 1024;
+        let mut create_physical_table_task = test_create_physical_table_task("my_physical_table");
+        create_physical_table_task.set_table_id(table_id);
+        let table_info = create_physical_table_task.table_info;
+        let table_route = PhysicalTableRouteValue::new(vec![RegionRoute {
+            region: Region {
+                id: RegionId::new(table_id, 0),
+                ..Default::default()
+            },
+            leader_peer: Some(Peer::empty(1)),
+            ..Default::default()
+        }]);
+        let table_route_value = TableRouteValue::Physical(table_route);
+        table_metadata_manager
+            .create_table_metadata(table_info, table_route_value, HashMap::new())
+            .await
+            .unwrap();
+
+        // Create a logical table metadata
+        let logical_table_id = 1025;
+        let mut test_create_logical_table_task = test_create_logical_table_task("my_logical_table");
+        test_create_logical_table_task.set_table_id(logical_table_id);
+        let table_info = test_create_logical_table_task.table_info;
+        let table_route = LogicalTableRouteValue::new(1024, vec![RegionId::new(1025, 0)]);
+        let table_route_value = TableRouteValue::Logical(table_route);
+        table_metadata_manager
+            .create_table_metadata(table_info, table_route_value, HashMap::new())
+            .await
+            .unwrap();
+        tokio::spawn(async move { supervisor.run().await });
+        let (tx, rx) = oneshot::channel();
+        sender.send(Event::InitializeAllRegions(tx)).await.unwrap();
+        assert!(rx.await.is_ok());
+
+        let (tx, rx) = oneshot::channel();
+        sender.send(Event::Dump(tx)).await.unwrap();
+        let detector = rx.await.unwrap();
+        assert_eq!(detector.len(), 1);
+        assert!(detector.contains(&(1, RegionId::new(1024, 0))));
+    }
+
+    #[tokio::test]
+    async fn test_initialize_all_regions_with_maintenance_mode() {
+        common_telemetry::init_default_ut_logging();
+        let (mut supervisor, sender) = new_test_supervisor();
+
+        supervisor
+            .runtime_switch_manager
+            .set_maintenance_mode()
+            .await
+            .unwrap();
+        tokio::spawn(async move { supervisor.run().await });
+        let (tx, rx) = oneshot::channel();
+        sender.send(Event::InitializeAllRegions(tx)).await.unwrap();
+        // The sender is dropped, so the receiver will receive an error.
+        assert!(rx.await.is_err());
     }
 
     #[tokio::test]
@@ -624,7 +1027,7 @@ pub(crate) mod tests {
         let (mut supervisor, sender) = new_test_supervisor();
         let controller = RegionFailureDetectorControl::new(sender.clone());
         tokio::spawn(async move { supervisor.run().await });
-        let detecting_region = (0, 1, RegionId::new(1, 1));
+        let detecting_region = (1, RegionId::new(1, 1));
         controller
             .register_failure_detectors(vec![detecting_region])
             .await;

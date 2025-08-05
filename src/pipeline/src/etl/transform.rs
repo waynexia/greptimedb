@@ -15,40 +15,30 @@
 pub mod index;
 pub mod transformer;
 
-use snafu::OptionExt;
+use api::v1::value::ValueData;
+use api::v1::ColumnDataType;
+use chrono::Utc;
+use snafu::{ensure, OptionExt};
 
-use crate::etl::error::{Error, Result};
+use crate::error::{
+    Error, KeyMustBeStringSnafu, Result, TransformElementMustBeMapSnafu,
+    TransformFieldMustBeSetSnafu, TransformOnFailureInvalidValueSnafu, TransformTypeMustBeSetSnafu,
+    UnsupportedTypeInPipelineSnafu,
+};
+use crate::etl::field::Fields;
+use crate::etl::processor::{yaml_bool, yaml_new_field, yaml_new_fields, yaml_string};
 use crate::etl::transform::index::Index;
-use crate::etl::value::Value;
+use crate::etl::value::{parse_str_type, parse_str_value};
 
 const TRANSFORM_FIELD: &str = "field";
 const TRANSFORM_FIELDS: &str = "fields";
 const TRANSFORM_TYPE: &str = "type";
 const TRANSFORM_INDEX: &str = "index";
+const TRANSFORM_TAG: &str = "tag";
 const TRANSFORM_DEFAULT: &str = "default";
 const TRANSFORM_ON_FAILURE: &str = "on_failure";
 
 pub use transformer::greptime::GreptimeTransformer;
-
-use super::error::{
-    KeyMustBeStringSnafu, TransformElementMustBeMapSnafu, TransformOnFailureInvalidValueSnafu,
-    TransformTypeMustBeSetSnafu,
-};
-use super::field::Fields;
-use super::processor::{yaml_new_field, yaml_new_fields, yaml_string};
-use super::value::Timestamp;
-use super::PipelineMap;
-
-pub trait Transformer: std::fmt::Debug + Sized + Send + Sync + 'static {
-    type Output;
-    type VecOutput;
-
-    fn new(transforms: Transforms) -> Result<Self>;
-    fn schemas(&self) -> &Vec<greptime_proto::v1::ColumnSchema>;
-    fn transforms(&self) -> &Transforms;
-    fn transforms_mut(&mut self) -> &mut Transforms;
-    fn transform_mut(&self, val: &mut PipelineMap) -> Result<Self::VecOutput>;
-}
 
 /// On Failure behavior when transform fails
 #[derive(Debug, Clone, Default, Copy)]
@@ -102,9 +92,10 @@ impl TryFrom<&Vec<yaml_rust::Yaml>> for Transforms {
     type Error = Error;
 
     fn try_from(docs: &Vec<yaml_rust::Yaml>) -> Result<Self> {
-        let mut transforms = Vec::with_capacity(100);
-        let mut all_output_keys: Vec<String> = Vec::with_capacity(100);
-        let mut all_required_keys = Vec::with_capacity(100);
+        let mut transforms = Vec::with_capacity(32);
+        let mut all_output_keys: Vec<String> = Vec::with_capacity(32);
+        let mut all_required_keys = Vec::with_capacity(32);
+
         for doc in docs {
             let transform_builder: Transform = doc
                 .as_hash()
@@ -137,44 +128,107 @@ impl TryFrom<&Vec<yaml_rust::Yaml>> for Transforms {
 #[derive(Debug, Clone)]
 pub struct Transform {
     pub fields: Fields,
-
-    pub type_: Value,
-
-    pub default: Option<Value>,
-
+    pub type_: ColumnDataType,
+    pub default: Option<ValueData>,
     pub index: Option<Index>,
-
+    pub tag: bool,
     pub on_failure: Option<OnFailure>,
 }
 
-impl Default for Transform {
-    fn default() -> Self {
-        Transform {
-            fields: Fields::default(),
-            type_: Value::Null,
-            default: None,
-            index: None,
-            on_failure: None,
-        }
-    }
-}
+// valid types
+// ColumnDataType::Int8
+// ColumnDataType::Int16
+// ColumnDataType::Int32
+// ColumnDataType::Int64
+// ColumnDataType::Uint8
+// ColumnDataType::Uint16
+// ColumnDataType::Uint32
+// ColumnDataType::Uint64
+// ColumnDataType::Float32
+// ColumnDataType::Float64
+// ColumnDataType::Boolean
+// ColumnDataType::String
+// ColumnDataType::TimestampNanosecond
+// ColumnDataType::TimestampMicrosecond
+// ColumnDataType::TimestampMillisecond
+// ColumnDataType::TimestampSecond
+// ColumnDataType::Binary
 
 impl Transform {
-    pub(crate) fn get_default(&self) -> Option<&Value> {
+    pub(crate) fn get_default(&self) -> Option<&ValueData> {
         self.default.as_ref()
     }
 
-    pub(crate) fn get_type_matched_default_val(&self) -> &Value {
-        &self.type_
+    pub(crate) fn get_type_matched_default_val(&self) -> Result<ValueData> {
+        get_default_for_type(&self.type_)
     }
 
-    pub(crate) fn get_default_value_when_data_is_none(&self) -> Option<Value> {
-        if matches!(self.type_, Value::Timestamp(_)) && self.index.is_some_and(|i| i == Index::Time)
-        {
-            return Some(Value::Timestamp(Timestamp::default()));
+    pub(crate) fn get_default_value_when_data_is_none(&self) -> Option<ValueData> {
+        if is_timestamp_type(&self.type_) && self.index.is_some_and(|i| i == Index::Time) {
+            let now = Utc::now();
+            match self.type_ {
+                ColumnDataType::TimestampSecond => {
+                    return Some(ValueData::TimestampSecondValue(now.timestamp()));
+                }
+                ColumnDataType::TimestampMillisecond => {
+                    return Some(ValueData::TimestampMillisecondValue(now.timestamp_millis()));
+                }
+                ColumnDataType::TimestampMicrosecond => {
+                    return Some(ValueData::TimestampMicrosecondValue(now.timestamp_micros()));
+                }
+                ColumnDataType::TimestampNanosecond => {
+                    return Some(ValueData::TimestampNanosecondValue(
+                        now.timestamp_nanos_opt()?,
+                    ));
+                }
+                _ => {}
+            }
         }
         None
     }
+
+    pub(crate) fn is_timeindex(&self) -> bool {
+        self.index.is_some_and(|i| i == Index::Time)
+    }
+}
+
+fn is_timestamp_type(ty: &ColumnDataType) -> bool {
+    matches!(
+        ty,
+        ColumnDataType::TimestampSecond
+            | ColumnDataType::TimestampMillisecond
+            | ColumnDataType::TimestampMicrosecond
+            | ColumnDataType::TimestampNanosecond
+    )
+}
+
+fn get_default_for_type(ty: &ColumnDataType) -> Result<ValueData> {
+    let v = match ty {
+        ColumnDataType::Boolean => ValueData::BoolValue(false),
+        ColumnDataType::Int8 => ValueData::I8Value(0),
+        ColumnDataType::Int16 => ValueData::I16Value(0),
+        ColumnDataType::Int32 => ValueData::I32Value(0),
+        ColumnDataType::Int64 => ValueData::I64Value(0),
+        ColumnDataType::Uint8 => ValueData::U8Value(0),
+        ColumnDataType::Uint16 => ValueData::U16Value(0),
+        ColumnDataType::Uint32 => ValueData::U32Value(0),
+        ColumnDataType::Uint64 => ValueData::U64Value(0),
+        ColumnDataType::Float32 => ValueData::F32Value(0.0),
+        ColumnDataType::Float64 => ValueData::F64Value(0.0),
+        ColumnDataType::Binary => ValueData::BinaryValue(jsonb::Value::Null.to_vec()),
+        ColumnDataType::String => ValueData::StringValue(String::new()),
+
+        ColumnDataType::TimestampSecond => ValueData::TimestampSecondValue(0),
+        ColumnDataType::TimestampMillisecond => ValueData::TimestampMillisecondValue(0),
+        ColumnDataType::TimestampMicrosecond => ValueData::TimestampMicrosecondValue(0),
+        ColumnDataType::TimestampNanosecond => ValueData::TimestampNanosecondValue(0),
+
+        _ => UnsupportedTypeInPipelineSnafu {
+            ty: ty.as_str_name(),
+        }
+        .fail()?,
+    };
+    Ok(v)
 }
 
 impl TryFrom<&yaml_rust::yaml::Hash> for Transform {
@@ -182,10 +236,12 @@ impl TryFrom<&yaml_rust::yaml::Hash> for Transform {
 
     fn try_from(hash: &yaml_rust::yaml::Hash) -> Result<Self> {
         let mut fields = Fields::default();
-        let mut type_ = Value::Null;
         let mut default = None;
         let mut index = None;
+        let mut tag = false;
         let mut on_failure = None;
+
+        let mut type_ = None;
 
         for (k, v) in hash {
             let key = k
@@ -202,7 +258,7 @@ impl TryFrom<&yaml_rust::yaml::Hash> for Transform {
 
                 TRANSFORM_TYPE => {
                     let t = yaml_string(v, TRANSFORM_TYPE)?;
-                    type_ = Value::parse_str_type(&t)?;
+                    type_ = Some(parse_str_type(&t)?);
                 }
 
                 TRANSFORM_INDEX => {
@@ -210,8 +266,22 @@ impl TryFrom<&yaml_rust::yaml::Hash> for Transform {
                     index = Some(index_str.try_into()?);
                 }
 
+                TRANSFORM_TAG => {
+                    tag = yaml_bool(v, TRANSFORM_TAG)?;
+                }
+
                 TRANSFORM_DEFAULT => {
-                    default = Some(Value::try_from(v)?);
+                    default = match v {
+                        yaml_rust::Yaml::Real(r) => Some(r.clone()),
+                        yaml_rust::Yaml::Integer(i) => Some(i.to_string()),
+                        yaml_rust::Yaml::String(s) => Some(s.clone()),
+                        yaml_rust::Yaml::Boolean(b) => Some(b.to_string()),
+                        yaml_rust::Yaml::Array(_)
+                        | yaml_rust::Yaml::Hash(_)
+                        | yaml_rust::Yaml::Alias(_)
+                        | yaml_rust::Yaml::Null
+                        | yaml_rust::Yaml::BadValue => None,
+                    };
                 }
 
                 TRANSFORM_ON_FAILURE => {
@@ -222,31 +292,28 @@ impl TryFrom<&yaml_rust::yaml::Hash> for Transform {
                 _ => {}
             }
         }
-        let mut final_default = None;
 
-        if let Some(default_value) = default {
-            match (&type_, &default_value) {
-                (Value::Null, _) => {
-                    return TransformTypeMustBeSetSnafu {
-                        fields: format!("{:?}", fields),
-                        default: default_value.to_string(),
-                    }
-                    .fail();
-                }
-                (_, Value::Null) => {} // if default is not set, then it will be regarded as default null
-                (_, _) => {
-                    let target = type_.parse_str_value(default_value.to_str_value().as_str())?;
-                    final_default = Some(target);
-                    on_failure = Some(OnFailure::Default);
-                }
-            }
-        }
+        // ensure fields and type
+        ensure!(!fields.is_empty(), TransformFieldMustBeSetSnafu);
+        let type_ = type_.context(TransformTypeMustBeSetSnafu {
+            fields: format!("{:?}", fields),
+        })?;
+
+        let final_default = if let Some(default_value) = default {
+            let target = parse_str_value(&type_, &default_value)?;
+            on_failure = Some(OnFailure::Default);
+            Some(target)
+        } else {
+            None
+        };
+
         let builder = Transform {
             fields,
             type_,
             default: final_default,
             index,
             on_failure,
+            tag,
         };
 
         Ok(builder)

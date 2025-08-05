@@ -20,14 +20,15 @@ use std::time::{Duration, Instant};
 
 use api::v1::meta::mailbox_message::Payload;
 use api::v1::meta::{
-    HeartbeatRequest, HeartbeatResponse, MailboxMessage, RegionLease, RequestHeader,
-    ResponseHeader, Role, PROTOCOL_VERSION,
+    HeartbeatRequest, HeartbeatResponse, MailboxMessage, RegionLease, ResponseHeader, Role,
+    PROTOCOL_VERSION,
 };
 use check_leader_handler::CheckLeaderHandler;
 use collect_cluster_info_handler::{
     CollectDatanodeClusterInfoHandler, CollectFlownodeClusterInfoHandler,
     CollectFrontendClusterInfoHandler,
 };
+use collect_leader_region_handler::CollectLeaderRegionHandler;
 use collect_stats_handler::CollectStatsHandler;
 use common_base::Plugins;
 use common_meta::datanode::Stat;
@@ -49,7 +50,7 @@ use response_header_handler::ResponseHeaderHandler;
 use snafu::{OptionExt, ResultExt};
 use store_api::storage::RegionId;
 use tokio::sync::mpsc::Sender;
-use tokio::sync::{oneshot, Notify, RwLock};
+use tokio::sync::{oneshot, watch, Notify, RwLock};
 
 use crate::error::{self, DeserializeFromJsonSnafu, Result, UnexpectedInstructionReplySnafu};
 use crate::handler::flow_state_handler::FlowStateHandler;
@@ -62,6 +63,7 @@ use crate::service::mailbox::{
 
 pub mod check_leader_handler;
 pub mod collect_cluster_info_handler;
+pub mod collect_leader_region_handler;
 pub mod collect_stats_handler;
 pub mod extract_stat_handler;
 pub mod failure_handler;
@@ -96,7 +98,7 @@ pub trait HeartbeatHandler: Send + Sync {
 /// HandleControl
 ///
 /// Controls process of handling heartbeat request.
-#[derive(PartialEq)]
+#[derive(PartialEq, Debug)]
 pub enum HandleControl {
     Continue,
     Done,
@@ -146,24 +148,42 @@ impl PusherId {
     }
 }
 
+/// The receiver of the deregister signal.
+pub type DeregisterSignalReceiver = watch::Receiver<bool>;
+
 /// The pusher of the heartbeat response.
 pub struct Pusher {
     sender: Sender<std::result::Result<HeartbeatResponse, tonic::Status>>,
+    // The sender of the deregister signal.
+    // default is false, means the pusher is not deregistered.
+    // when the pusher is deregistered, the sender will be notified.
+    deregister_signal_sender: watch::Sender<bool>,
+    deregister_signal_receiver: DeregisterSignalReceiver,
+
     res_header: ResponseHeader,
 }
 
+impl Drop for Pusher {
+    fn drop(&mut self) {
+        // Ignore the error here.
+        // if all the receivers have been dropped, means no body cares the deregister signal.
+        let _ = self.deregister_signal_sender.send(true);
+    }
+}
+
 impl Pusher {
-    pub fn new(
-        sender: Sender<std::result::Result<HeartbeatResponse, tonic::Status>>,
-        req_header: &RequestHeader,
-    ) -> Self {
+    pub fn new(sender: Sender<std::result::Result<HeartbeatResponse, tonic::Status>>) -> Self {
         let res_header = ResponseHeader {
             protocol_version: PROTOCOL_VERSION,
-            cluster_id: req_header.cluster_id,
             ..Default::default()
         };
-
-        Self { sender, res_header }
+        let (deregister_signal_sender, deregister_signal_receiver) = watch::channel(false);
+        Self {
+            sender,
+            deregister_signal_sender,
+            deregister_signal_receiver,
+            res_header,
+        }
     }
 
     #[inline]
@@ -187,19 +207,26 @@ impl Pusher {
 pub struct Pushers(Arc<RwLock<BTreeMap<String, Pusher>>>);
 
 impl Pushers {
-    async fn push(&self, pusher_id: PusherId, mailbox_message: MailboxMessage) -> Result<()> {
+    async fn push(
+        &self,
+        pusher_id: PusherId,
+        mailbox_message: MailboxMessage,
+    ) -> Result<DeregisterSignalReceiver> {
         let pusher_id = pusher_id.string_key();
         let pushers = self.0.read().await;
         let pusher = pushers
             .get(&pusher_id)
             .context(error::PusherNotFoundSnafu { pusher_id })?;
+
         pusher
             .push(HeartbeatResponse {
                 header: Some(pusher.header()),
                 mailbox_message: Some(mailbox_message),
                 ..Default::default()
             })
-            .await
+            .await?;
+
+        Ok(pusher.deregister_signal_receiver.clone())
     }
 
     async fn broadcast(
@@ -335,7 +362,7 @@ pub struct HeartbeatMailbox {
 }
 
 impl HeartbeatMailbox {
-    pub(crate) fn json_reply(msg: &MailboxMessage) -> Result<InstructionReply> {
+    pub fn json_reply(msg: &MailboxMessage) -> Result<InstructionReply> {
         let Payload::Json(payload) =
             msg.payload
                 .as_ref()
@@ -348,7 +375,7 @@ impl HeartbeatMailbox {
 
     /// Parses the [Instruction] from [MailboxMessage].
     #[cfg(test)]
-    pub(crate) fn json_instruction(msg: &MailboxMessage) -> Result<Instruction> {
+    pub fn json_instruction(msg: &MailboxMessage) -> Result<Instruction> {
         let Payload::Json(payload) =
             msg.payload
                 .as_ref()
@@ -446,12 +473,29 @@ impl Mailbox for HeartbeatMailbox {
         let (tx, rx) = oneshot::channel();
         let _ = self.senders.insert(message_id, tx);
         let deadline = Instant::now() + timeout;
-        let _ = self.timeouts.insert(message_id, deadline);
+        self.timeouts.insert(message_id, deadline);
         self.timeout_notify.notify_one();
+
+        let deregister_signal_receiver = self.pushers.push(pusher_id, msg).await?;
+
+        Ok(MailboxReceiver::new(
+            message_id,
+            rx,
+            deregister_signal_receiver,
+            *ch,
+        ))
+    }
+
+    async fn send_oneway(&self, ch: &Channel, mut msg: MailboxMessage) -> Result<()> {
+        let message_id = 0; // one-way message, same as `broadcast`
+        msg.id = message_id;
+
+        let pusher_id = ch.pusher_id();
+        debug!("Sending mailbox message {msg:?} to {pusher_id}");
 
         self.pushers.push(pusher_id, msg).await?;
 
-        Ok(MailboxReceiver::new(message_id, rx, *ch))
+        Ok(())
     }
 
     async fn broadcast(&self, ch: &BroadcastChannel, msg: &MailboxMessage) -> Result<()> {
@@ -574,6 +618,7 @@ impl HeartbeatHandlerGroupBuilder {
         if let Some(publish_heartbeat_handler) = publish_heartbeat_handler {
             self.add_handler_last(publish_heartbeat_handler);
         }
+        self.add_handler_last(CollectLeaderRegionHandler);
         self.add_handler_last(CollectStatsHandler::new(self.flush_stats_factor));
         self.add_handler_last(RemapFlowPeerHandler::default());
 
@@ -772,7 +817,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use api::v1::meta::{MailboxMessage, RequestHeader, Role, PROTOCOL_VERSION};
+    use api::v1::meta::{MailboxMessage, Role};
     use common_meta::kv_backend::memory::MemoryKvBackend;
     use common_meta::sequence::SequenceBuilder;
     use tokio::sync::mpsc;
@@ -798,7 +843,7 @@ mod tests {
 
         mailbox.on_recv(id, Ok(resp_msg)).await.unwrap();
 
-        let recv_msg = receiver.await.unwrap().unwrap();
+        let recv_msg = receiver.await.unwrap();
         assert_eq!(recv_msg.id, id);
         assert_eq!(recv_msg.timestamp_millis, 456);
         assert_eq!(recv_msg.subject, "resp-test".to_string());
@@ -807,19 +852,15 @@ mod tests {
     #[tokio::test]
     async fn test_mailbox_timeout() {
         let (_, receiver) = push_msg_via_mailbox().await;
-        let res = receiver.await.unwrap();
+        let res = receiver.await;
         assert!(res.is_err());
     }
 
     async fn push_msg_via_mailbox() -> (MailboxRef, MailboxReceiver) {
         let datanode_id = 12;
         let (pusher_tx, mut pusher_rx) = mpsc::channel(16);
-        let res_header = RequestHeader {
-            protocol_version: PROTOCOL_VERSION,
-            ..Default::default()
-        };
         let pusher_id = PusherId::new(Role::Datanode, datanode_id);
-        let pusher: Pusher = Pusher::new(pusher_tx, &res_header);
+        let pusher: Pusher = Pusher::new(pusher_tx);
         let handler_group = HeartbeatHandlerGroup::default();
         handler_group.register_pusher(pusher_id, pusher).await;
 
@@ -856,7 +897,7 @@ mod tests {
             .unwrap();
 
         let handlers = group.handlers;
-        assert_eq!(13, handlers.len());
+        assert_eq!(14, handlers.len());
 
         let names = [
             "ResponseHeaderHandler",
@@ -870,6 +911,7 @@ mod tests {
             "CollectFlownodeClusterInfoHandler",
             "MailboxHandler",
             "FilterInactiveRegionStatsHandler",
+            "CollectLeaderRegionHandler",
             "CollectStatsHandler",
             "RemapFlowPeerHandler",
         ];
@@ -892,7 +934,7 @@ mod tests {
 
         let group = builder.build().unwrap();
         let handlers = group.handlers;
-        assert_eq!(14, handlers.len());
+        assert_eq!(15, handlers.len());
 
         let names = [
             "ResponseHeaderHandler",
@@ -907,6 +949,7 @@ mod tests {
             "MailboxHandler",
             "CollectStatsHandler",
             "FilterInactiveRegionStatsHandler",
+            "CollectLeaderRegionHandler",
             "CollectStatsHandler",
             "RemapFlowPeerHandler",
         ];
@@ -926,7 +969,7 @@ mod tests {
 
         let group = builder.build().unwrap();
         let handlers = group.handlers;
-        assert_eq!(14, handlers.len());
+        assert_eq!(15, handlers.len());
 
         let names = [
             "CollectStatsHandler",
@@ -941,6 +984,7 @@ mod tests {
             "CollectFlownodeClusterInfoHandler",
             "MailboxHandler",
             "FilterInactiveRegionStatsHandler",
+            "CollectLeaderRegionHandler",
             "CollectStatsHandler",
             "RemapFlowPeerHandler",
         ];
@@ -960,7 +1004,7 @@ mod tests {
 
         let group = builder.build().unwrap();
         let handlers = group.handlers;
-        assert_eq!(14, handlers.len());
+        assert_eq!(15, handlers.len());
 
         let names = [
             "ResponseHeaderHandler",
@@ -975,6 +1019,7 @@ mod tests {
             "MailboxHandler",
             "CollectStatsHandler",
             "FilterInactiveRegionStatsHandler",
+            "CollectLeaderRegionHandler",
             "CollectStatsHandler",
             "RemapFlowPeerHandler",
         ];
@@ -994,7 +1039,7 @@ mod tests {
 
         let group = builder.build().unwrap();
         let handlers = group.handlers;
-        assert_eq!(14, handlers.len());
+        assert_eq!(15, handlers.len());
 
         let names = [
             "ResponseHeaderHandler",
@@ -1008,6 +1053,7 @@ mod tests {
             "CollectFlownodeClusterInfoHandler",
             "MailboxHandler",
             "FilterInactiveRegionStatsHandler",
+            "CollectLeaderRegionHandler",
             "CollectStatsHandler",
             "ResponseHeaderHandler",
             "RemapFlowPeerHandler",
@@ -1028,7 +1074,7 @@ mod tests {
 
         let group = builder.build().unwrap();
         let handlers = group.handlers;
-        assert_eq!(13, handlers.len());
+        assert_eq!(14, handlers.len());
 
         let names = [
             "ResponseHeaderHandler",
@@ -1042,6 +1088,7 @@ mod tests {
             "CollectFlownodeClusterInfoHandler",
             "CollectStatsHandler",
             "FilterInactiveRegionStatsHandler",
+            "CollectLeaderRegionHandler",
             "CollectStatsHandler",
             "RemapFlowPeerHandler",
         ];
@@ -1061,7 +1108,7 @@ mod tests {
 
         let group = builder.build().unwrap();
         let handlers = group.handlers;
-        assert_eq!(13, handlers.len());
+        assert_eq!(14, handlers.len());
 
         let names = [
             "ResponseHeaderHandler",
@@ -1075,6 +1122,7 @@ mod tests {
             "CollectFlownodeClusterInfoHandler",
             "MailboxHandler",
             "FilterInactiveRegionStatsHandler",
+            "CollectLeaderRegionHandler",
             "ResponseHeaderHandler",
             "RemapFlowPeerHandler",
         ];
@@ -1094,7 +1142,7 @@ mod tests {
 
         let group = builder.build().unwrap();
         let handlers = group.handlers;
-        assert_eq!(13, handlers.len());
+        assert_eq!(14, handlers.len());
 
         let names = [
             "CollectStatsHandler",
@@ -1108,6 +1156,7 @@ mod tests {
             "CollectFlownodeClusterInfoHandler",
             "MailboxHandler",
             "FilterInactiveRegionStatsHandler",
+            "CollectLeaderRegionHandler",
             "CollectStatsHandler",
             "RemapFlowPeerHandler",
         ];
@@ -1135,5 +1184,15 @@ mod tests {
             .replace_handler("NotExists", CollectStatsHandler::default())
             .unwrap_err();
         assert_matches!(err, error::Error::HandlerNotFound { .. });
+    }
+
+    #[tokio::test]
+    async fn test_pusher_drop() {
+        let (tx, _rx) = mpsc::channel(1);
+        let pusher = Pusher::new(tx);
+        let mut deregister_signal_tx = pusher.deregister_signal_receiver.clone();
+
+        drop(pusher);
+        deregister_signal_tx.changed().await.unwrap();
     }
 }

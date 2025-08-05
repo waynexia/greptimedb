@@ -1,6 +1,3 @@
-## The running mode of the flownode. It can be `standalone` or `distributed`.
-mode = "distributed"
-
 ## The flownode identifier and should be unique in the cluster.
 ## @toml2docs:none-default
 node_id = 14
@@ -10,6 +7,29 @@ node_id = 14
 ## The number of flow worker in flownode.
 ## Not setting(or set to 0) this value will use the number of CPU cores divided by 2.
 #+num_workers=0
+[flow.batching_mode]
+## The default batching engine query timeout is 10 minutes.
+#+query_timeout="600s"
+## will output a warn log for any query that runs for more that this threshold
+#+slow_query_threshold="60s"
+## The minimum duration between two queries execution by batching mode task
+#+experimental_min_refresh_duration="5s"
+## The gRPC connection timeout
+#+grpc_conn_timeout="5s"
+## The gRPC max retry number
+#+experimental_grpc_max_retries=3
+## Flow wait for available frontend timeout,
+## if failed to find available frontend after frontend_scan_timeout elapsed, return error
+## which prevent flownode from starting
+#+experimental_frontend_scan_timeout="30s"
+## Frontend activity timeout
+## if frontend is down(not sending heartbeat) for more than frontend_activity_timeout,
+## it will be removed from the list that flownode use to connect
+#+experimental_frontend_activity_timeout="60s"
+## Maximum number of filters allowed in a single query
+#+experimental_max_filter_num_per_query=20
+## Time window merge distance
+#+experimental_time_window_merge_threshold=3
 
 ## The gRPC server options.
 [grpc]
@@ -30,7 +50,7 @@ max_send_message_size = "512MB"
 ## The address to bind the HTTP server.
 addr = "127.0.0.1:4000"
 ## HTTP request timeout. Set to 0 to disable timeout.
-timeout = "30s"
+timeout = "0s"
 ## HTTP request body limit.
 ## The following units are supported: `B`, `KB`, `KiB`, `MB`, `MiB`, `GB`, `GiB`, `TB`, `TiB`, `PB`, `PiB`.
 ## Set to 0 to disable limit.
@@ -76,7 +96,7 @@ retry_interval = "3s"
 ## The logging options.
 [logging]
 ## The directory to store the log files. If set to empty, logs will not be written to files.
-dir = "/tmp/greptimedb/logs"
+dir = "./greptimedb_data/logs"
 
 ## The log level. Can be `info`/`debug`/`warn`/`error`.
 ## @toml2docs:none-default
@@ -86,7 +106,7 @@ level = "info"
 enable_otlp_tracing = false
 
 ## The OTLP tracing endpoint.
-otlp_endpoint = "http://localhost:4317"
+otlp_endpoint = "http://localhost:4318"
 
 ## Whether to append logs to stdout.
 append_stdout = true
@@ -97,24 +117,14 @@ log_format = "text"
 ## The maximum amount of log files.
 max_log_files = 720
 
+## The OTLP tracing export protocol. Can be `grpc`/`http`.
+otlp_export_protocol = "http"
+
 ## The percentage of tracing will be sampled and exported.
 ## Valid range `[0, 1]`, 1 means all traces are sampled, 0 means all traces are not sampled, the default value is 1.
 ## ratio > 1 are treated as 1. Fractions < 0 are treated as 0
 [logging.tracing_sample_ratio]
 default_ratio = 1.0
-
-## The slow query log options.
-[logging.slow_query]
-## Whether to enable slow query log.
-enable = false
-
-## The threshold of slow query.
-## @toml2docs:none-default
-threshold = "10s"
-
-## The sampling ratio of slow query log. The value should be in the range of (0, 1].
-## @toml2docs:none-default
-sample_ratio = 1.0
 
 ## The tracing options. Only effect when compiled with `tokio-console` feature.
 #+ [tracing]
@@ -122,3 +132,15 @@ sample_ratio = 1.0
 ## @toml2docs:none-default
 #+ tokio_console_addr = "127.0.0.1"
 
+[query]
+## Parallelism of the query engine for query sent by flownode.
+## Default to 1, so it won't use too much cpu or memory
+parallelism = 1
+
+## The memory options.
+[memory]
+## Whether to enable heap profiling activation during startup.
+## When enabled, heap profiling will be activated if the `MALLOC_CONF` environment variable
+## is set to "prof:true,prof_active:false". The official image adds this env variable.
+## Default is true.
+enable_heap_profiling = true

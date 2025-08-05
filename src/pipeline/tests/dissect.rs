@@ -16,7 +16,7 @@ mod common;
 
 use greptime_proto::v1::value::ValueData::StringValue;
 use greptime_proto::v1::{ColumnDataType, SemanticType};
-use pipeline::json_to_intermediate_state;
+use pipeline::{setup_pipeline, PipelineContext};
 
 fn make_string_column_schema(name: String) -> greptime_proto::v1::ColumnSchema {
     common::make_column_schema(name, ColumnDataType::String, SemanticType::Field)
@@ -272,11 +272,19 @@ transform:
     let input_value = serde_json::from_str::<serde_json::Value>(input_str).unwrap();
 
     let yaml_content = pipeline::Content::Yaml(pipeline_yaml);
-    let pipeline: pipeline::Pipeline<pipeline::GreptimeTransformer> =
+    let pipeline: pipeline::Pipeline =
         pipeline::parse(&yaml_content).expect("failed to parse pipeline");
-    let mut result = json_to_intermediate_state(input_value).unwrap();
 
-    let row = pipeline.exec_mut(&mut result);
+    let (pipeline, mut schema_info, pipeline_def, pipeline_param) = setup_pipeline!(pipeline);
+    let pipeline_ctx = PipelineContext::new(
+        &pipeline_def,
+        &pipeline_param,
+        session::context::Channel::Unknown,
+    );
+
+    let result = input_value.into();
+
+    let row = pipeline.exec_mut(result, &pipeline_ctx, &mut schema_info);
 
     assert!(row.is_err());
     assert_eq!(row.err().unwrap().to_string(), "No matching pattern found");

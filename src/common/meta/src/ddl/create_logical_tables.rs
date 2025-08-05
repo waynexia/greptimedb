@@ -17,28 +17,34 @@ mod metadata;
 mod region_request;
 mod update_metadata;
 
+use api::region::RegionResponse;
 use api::v1::CreateTableExpr;
 use async_trait::async_trait;
+use common_catalog::consts::METRIC_ENGINE;
 use common_procedure::error::{FromJsonSnafu, Result as ProcedureResult, ToJsonSnafu};
 use common_procedure::{Context as ProcedureContext, LockKey, Procedure, Status};
-use common_telemetry::{debug, warn};
-use futures_util::future::join_all;
+use common_telemetry::{debug, error, warn};
+use futures::future;
+pub use region_request::create_region_request_builder;
 use serde::{Deserialize, Serialize};
-use snafu::{ensure, ResultExt};
+use snafu::ResultExt;
 use store_api::metadata::ColumnMetadata;
 use store_api::metric_engine_consts::ALTER_PHYSICAL_EXTENSION_KEY;
 use store_api::storage::{RegionId, RegionNumber};
 use strum::AsRefStr;
 use table::metadata::{RawTableInfo, TableId};
 
-use crate::ddl::utils::{add_peer_context_if_needed, handle_retry_error};
+use crate::ddl::utils::{
+    add_peer_context_if_needed, extract_column_metadatas, map_to_procedure_error,
+    sync_follower_regions,
+};
 use crate::ddl::DdlContext;
-use crate::error::{DecodeJsonSnafu, MetadataCorruptionSnafu, Result};
+use crate::error::Result;
 use crate::key::table_route::TableRouteValue;
 use crate::lock_key::{CatalogLock, SchemaLock, TableLock, TableNameLock};
+use crate::metrics;
 use crate::rpc::ddl::CreateTableTask;
 use crate::rpc::router::{find_leaders, RegionRoute};
-use crate::{metrics, ClusterId};
 
 pub struct CreateLogicalTablesProcedure {
     pub context: DdlContext,
@@ -49,7 +55,6 @@ impl CreateLogicalTablesProcedure {
     pub const TYPE_NAME: &'static str = "metasrv-procedure::CreateLogicalTables";
 
     pub fn new(
-        cluster_id: ClusterId,
         tasks: Vec<CreateTableTask>,
         physical_table_id: TableId,
         context: DdlContext,
@@ -57,7 +62,6 @@ impl CreateLogicalTablesProcedure {
         Self {
             context,
             data: CreateTablesData {
-                cluster_id,
                 state: CreateTablesState::Prepare,
                 tasks,
                 table_ids_already_exists: vec![],
@@ -158,39 +162,41 @@ impl CreateLogicalTablesProcedure {
             });
         }
 
-        // Collects response from datanodes.
-        let phy_raw_schemas = join_all(create_region_tasks)
+        let mut results = future::join_all(create_region_tasks)
             .await
             .into_iter()
-            .map(|res| res.map(|mut res| res.extensions.remove(ALTER_PHYSICAL_EXTENSION_KEY)))
             .collect::<Result<Vec<_>>>()?;
 
-        if phy_raw_schemas.is_empty() {
-            self.data.state = CreateTablesState::CreateMetadata;
-            return Ok(Status::executing(false));
-        }
-
-        // Verify all the physical schemas are the same
-        // Safety: previous check ensures this vec is not empty
-        let first = phy_raw_schemas.first().unwrap();
-        ensure!(
-            phy_raw_schemas.iter().all(|x| x == first),
-            MetadataCorruptionSnafu {
-                err_msg: "The physical schemas from datanodes are not the same."
-            }
-        );
-
-        // Decodes the physical raw schemas
-        if let Some(phy_raw_schemas) = first {
-            self.data.physical_columns =
-                ColumnMetadata::decode_list(phy_raw_schemas).context(DecodeJsonSnafu)?;
+        if let Some(column_metadatas) =
+            extract_column_metadatas(&mut results, ALTER_PHYSICAL_EXTENSION_KEY)?
+        {
+            self.data.physical_columns = column_metadatas;
         } else {
             warn!("creating logical table result doesn't contains extension key `{ALTER_PHYSICAL_EXTENSION_KEY}`,leaving the physical table's schema unchanged");
         }
 
+        self.submit_sync_region_requests(&results, region_routes)
+            .await;
         self.data.state = CreateTablesState::CreateMetadata;
-
         Ok(Status::executing(true))
+    }
+
+    async fn submit_sync_region_requests(
+        &self,
+        results: &[RegionResponse],
+        region_routes: &[RegionRoute],
+    ) {
+        if let Err(err) = sync_follower_regions(
+            &self.context,
+            self.data.physical_table_id,
+            results,
+            region_routes,
+            METRIC_ENGINE,
+        )
+        .await
+        {
+            error!(err; "Failed to sync regions for physical table_id: {}",self.data.physical_table_id);
+        }
     }
 }
 
@@ -212,7 +218,7 @@ impl Procedure for CreateLogicalTablesProcedure {
             CreateTablesState::DatanodeCreateRegions => self.on_datanode_create_regions().await,
             CreateTablesState::CreateMetadata => self.on_create_metadata().await,
         }
-        .map_err(handle_retry_error)
+        .map_err(map_to_procedure_error)
     }
 
     fn dump(&self) -> ProcedureResult<String> {
@@ -245,7 +251,6 @@ impl Procedure for CreateLogicalTablesProcedure {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateTablesData {
-    cluster_id: ClusterId,
     state: CreateTablesState,
     tasks: Vec<CreateTableTask>,
     table_ids_already_exists: Vec<Option<TableId>>,

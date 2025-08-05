@@ -15,9 +15,8 @@
 use std::sync::Arc;
 
 use common_error::ext::BoxedError;
-use common_function::aggr::{HllState, UddSketchState};
+use common_function::function::FunctionContext;
 use common_function::function_registry::FUNCTION_REGISTRY;
-use common_function::scalars::udf::create_udf;
 use common_query::error::RegisterUdfSnafu;
 use common_query::logical_plan::SubstraitPlanDecoder;
 use datafusion::catalog::CatalogProviderList;
@@ -27,8 +26,13 @@ use datafusion::execution::context::SessionState;
 use datafusion::execution::registry::SerializerRegistry;
 use datafusion::execution::{FunctionRegistry, SessionStateBuilder};
 use datafusion::logical_expr::LogicalPlan;
-use datafusion_expr::{ScalarUDF, UserDefinedLogicalNode};
+use datafusion_expr::UserDefinedLogicalNode;
 use greptime_proto::substrait_extension::MergeScan as PbMergeScan;
+use promql::functions::{
+    quantile_udaf, AbsentOverTime, AvgOverTime, Changes, CountOverTime, Delta, Deriv, HoltWinters,
+    IDelta, Increase, LastOverTime, MaxOverTime, MinOverTime, PredictLinear, PresentOverTime,
+    QuantileOverTime, Rate, Resets, Round, StddevOverTime, StdvarOverTime, SumOverTime,
+};
 use prost::Message;
 use session::context::QueryContextRef;
 use snafu::ResultExt;
@@ -119,17 +123,48 @@ impl SubstraitPlanDecoder for DefaultPlanDecoder {
         // if they have the same name as the default UDFs or their alias.
         // e.g. The default UDF `to_char()` has an alias `date_format()`, if we register a UDF with the name `date_format()`
         // before we build the session state, the UDF will be lost.
-        for func in FUNCTION_REGISTRY.functions() {
-            let udf: Arc<ScalarUDF> = Arc::new(
-                create_udf(func.clone(), self.query_ctx.clone(), Default::default()).into(),
-            );
+        for func in FUNCTION_REGISTRY.scalar_functions() {
+            let udf = func.provide(FunctionContext {
+                query_ctx: self.query_ctx.clone(),
+                state: Default::default(),
+            });
             session_state
-                .register_udf(udf)
+                .register_udf(Arc::new(udf))
                 .context(RegisterUdfSnafu { name: func.name() })?;
-            let _ = session_state.register_udaf(Arc::new(UddSketchState::udf_impl()));
-            let _ = session_state.register_udaf(Arc::new(HllState::state_udf_impl()));
-            let _ = session_state.register_udaf(Arc::new(HllState::merge_udf_impl()));
         }
+
+        for func in FUNCTION_REGISTRY.aggregate_functions() {
+            let name = func.name().to_string();
+            session_state
+                .register_udaf(Arc::new(func))
+                .context(RegisterUdfSnafu { name })?;
+        }
+
+        let _ = session_state.register_udaf(quantile_udaf());
+
+        let _ = session_state.register_udf(Arc::new(IDelta::<false>::scalar_udf()));
+        let _ = session_state.register_udf(Arc::new(IDelta::<true>::scalar_udf()));
+        let _ = session_state.register_udf(Arc::new(Rate::scalar_udf()));
+        let _ = session_state.register_udf(Arc::new(Increase::scalar_udf()));
+        let _ = session_state.register_udf(Arc::new(Delta::scalar_udf()));
+        let _ = session_state.register_udf(Arc::new(Resets::scalar_udf()));
+        let _ = session_state.register_udf(Arc::new(Changes::scalar_udf()));
+        let _ = session_state.register_udf(Arc::new(Deriv::scalar_udf()));
+        let _ = session_state.register_udf(Arc::new(Round::scalar_udf()));
+        let _ = session_state.register_udf(Arc::new(AvgOverTime::scalar_udf()));
+        let _ = session_state.register_udf(Arc::new(MinOverTime::scalar_udf()));
+        let _ = session_state.register_udf(Arc::new(MaxOverTime::scalar_udf()));
+        let _ = session_state.register_udf(Arc::new(SumOverTime::scalar_udf()));
+        let _ = session_state.register_udf(Arc::new(CountOverTime::scalar_udf()));
+        let _ = session_state.register_udf(Arc::new(LastOverTime::scalar_udf()));
+        let _ = session_state.register_udf(Arc::new(AbsentOverTime::scalar_udf()));
+        let _ = session_state.register_udf(Arc::new(PresentOverTime::scalar_udf()));
+        let _ = session_state.register_udf(Arc::new(StddevOverTime::scalar_udf()));
+        let _ = session_state.register_udf(Arc::new(StdvarOverTime::scalar_udf()));
+        let _ = session_state.register_udf(Arc::new(QuantileOverTime::scalar_udf()));
+        let _ = session_state.register_udf(Arc::new(PredictLinear::scalar_udf()));
+        let _ = session_state.register_udf(Arc::new(HoltWinters::scalar_udf()));
+
         let logical_plan = DFLogicalSubstraitConvertor
             .decode(message, session_state)
             .await
@@ -156,6 +191,7 @@ mod tests {
     use super::*;
     use crate::dummy_catalog::DummyCatalogList;
     use crate::optimizer::test_util::mock_table_provider;
+    use crate::options::QueryOptions;
     use crate::QueryEngineFactory;
 
     fn mock_plan(schema: SchemaRef) -> LogicalPlan {
@@ -174,7 +210,15 @@ mod tests {
     #[tokio::test]
     async fn test_serializer_decode_plan() {
         let catalog_list = catalog::memory::new_memory_catalog_manager().unwrap();
-        let factory = QueryEngineFactory::new(catalog_list, None, None, None, None, false);
+        let factory = QueryEngineFactory::new(
+            catalog_list,
+            None,
+            None,
+            None,
+            None,
+            false,
+            QueryOptions::default(),
+        );
 
         let engine = factory.query_engine();
 

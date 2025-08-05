@@ -15,7 +15,7 @@
 use std::collections::HashSet;
 use std::str::FromStr;
 
-use api::v1::meta::{HeartbeatRequest, RequestHeader};
+use api::v1::meta::{DatanodeWorkloads, HeartbeatRequest, RequestHeader};
 use common_time::util as time_util;
 use lazy_static::lazy_static;
 use regex::Regex;
@@ -25,8 +25,9 @@ use store_api::region_engine::{RegionRole, RegionStatistic};
 use store_api::storage::RegionId;
 use table::metadata::TableId;
 
+use crate::error;
 use crate::error::Result;
-use crate::{error, ClusterId};
+use crate::heartbeat::utils::get_datanode_workloads;
 
 pub(crate) const DATANODE_LEASE_PREFIX: &str = "__meta_datanode_lease";
 const INACTIVE_REGION_PREFIX: &str = "__meta_inactive_region";
@@ -48,11 +49,10 @@ lazy_static! {
 
 /// The key of the datanode stat in the storage.
 ///
-/// The format is `__meta_datanode_stat-{cluster_id}-{node_id}`.
+/// The format is `__meta_datanode_stat-0-{node_id}`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Stat {
     pub timestamp_millis: i64,
-    pub cluster_id: ClusterId,
     // The datanode Id.
     pub id: u64,
     // The datanode address.
@@ -66,6 +66,8 @@ pub struct Stat {
     pub region_stats: Vec<RegionStat>,
     // The node epoch is used to check whether the node has restarted or redeployed.
     pub node_epoch: u64,
+    /// The datanode workloads.
+    pub datanode_workloads: DatanodeWorkloads,
 }
 
 /// The statistics of a region.
@@ -91,8 +93,33 @@ pub struct RegionStat {
     pub manifest_size: u64,
     /// The size of the SST data files in bytes.
     pub sst_size: u64,
+    /// The num of the SST data files.
+    pub sst_num: u64,
     /// The size of the SST index files in bytes.
     pub index_size: u64,
+    /// The manifest infoof the region.
+    pub region_manifest: RegionManifestInfo,
+    /// The latest entry id of topic used by data.
+    /// **Only used by remote WAL prune.**
+    pub data_topic_latest_entry_id: u64,
+    /// The latest entry id of topic used by metadata.
+    /// **Only used by remote WAL prune.**
+    /// In mito engine, this is the same as `data_topic_latest_entry_id`.
+    pub metadata_topic_latest_entry_id: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum RegionManifestInfo {
+    Mito {
+        manifest_version: u64,
+        flushed_entry_id: u64,
+    },
+    Metric {
+        data_manifest_version: u64,
+        data_flushed_entry_id: u64,
+        metadata_manifest_version: u64,
+        metadata_flushed_entry_id: u64,
+    },
 }
 
 impl Stat {
@@ -102,10 +129,7 @@ impl Stat {
     }
 
     pub fn stat_key(&self) -> DatanodeStatKey {
-        DatanodeStatKey {
-            cluster_id: self.cluster_id,
-            node_id: self.id,
-        }
+        DatanodeStatKey { node_id: self.id }
     }
 
     /// Returns a tuple array containing [RegionId] and [RegionRole].
@@ -130,6 +154,43 @@ impl Stat {
         self.wcus = self.region_stats.iter().map(|s| s.wcus).sum();
         self.region_num = self.region_stats.len() as u64;
     }
+
+    pub fn memory_size(&self) -> usize {
+        // timestamp_millis, rcus, wcus
+        std::mem::size_of::<i64>() * 3 +
+        // id, region_num, node_epoch
+        std::mem::size_of::<u64>() * 3 +
+        // addr
+        std::mem::size_of::<String>() + self.addr.capacity() +
+        // region_stats
+        self.region_stats.iter().map(|s| s.memory_size()).sum::<usize>()
+    }
+}
+
+impl RegionStat {
+    pub fn memory_size(&self) -> usize {
+        // role
+        std::mem::size_of::<RegionRole>() +
+        // id
+        std::mem::size_of::<RegionId>() +
+        // rcus, wcus, approximate_bytes, num_rows
+        std::mem::size_of::<i64>() * 4 +
+        // memtable_size, manifest_size, sst_size, sst_num, index_size
+        std::mem::size_of::<u64>() * 5 +
+        // engine
+        std::mem::size_of::<String>() + self.engine.capacity() +
+        // region_manifest
+        self.region_manifest.memory_size()
+    }
+}
+
+impl RegionManifestInfo {
+    pub fn memory_size(&self) -> usize {
+        match self {
+            RegionManifestInfo::Mito { .. } => std::mem::size_of::<u64>() * 2,
+            RegionManifestInfo::Metric { .. } => std::mem::size_of::<u64>() * 4,
+        }
+    }
 }
 
 impl TryFrom<&HeartbeatRequest> for Stat {
@@ -141,19 +202,20 @@ impl TryFrom<&HeartbeatRequest> for Stat {
             peer,
             region_stats,
             node_epoch,
+            node_workloads,
             ..
         } = value;
 
         match (header, peer) {
-            (Some(header), Some(peer)) => {
+            (Some(_header), Some(peer)) => {
                 let region_stats = region_stats
                     .iter()
                     .map(RegionStat::from)
                     .collect::<Vec<_>>();
 
+                let datanode_workloads = get_datanode_workloads(node_workloads.as_ref());
                 Ok(Self {
                     timestamp_millis: time_util::current_time_millis(),
-                    cluster_id: header.cluster_id,
                     // datanode id
                     id: peer.id,
                     // datanode address
@@ -163,9 +225,35 @@ impl TryFrom<&HeartbeatRequest> for Stat {
                     region_num: region_stats.len() as u64,
                     region_stats,
                     node_epoch: *node_epoch,
+                    datanode_workloads,
                 })
             }
             (header, _) => Err(header.clone()),
+        }
+    }
+}
+
+impl From<store_api::region_engine::RegionManifestInfo> for RegionManifestInfo {
+    fn from(value: store_api::region_engine::RegionManifestInfo) -> Self {
+        match value {
+            store_api::region_engine::RegionManifestInfo::Mito {
+                manifest_version,
+                flushed_entry_id,
+            } => RegionManifestInfo::Mito {
+                manifest_version,
+                flushed_entry_id,
+            },
+            store_api::region_engine::RegionManifestInfo::Metric {
+                data_manifest_version,
+                data_flushed_entry_id,
+                metadata_manifest_version,
+                metadata_flushed_entry_id,
+            } => RegionManifestInfo::Metric {
+                data_manifest_version,
+                data_flushed_entry_id,
+                metadata_manifest_version,
+                metadata_flushed_entry_id,
+            },
         }
     }
 }
@@ -189,39 +277,35 @@ impl From<&api::v1::meta::RegionStat> for RegionStat {
             memtable_size: region_stat.memtable_size,
             manifest_size: region_stat.manifest_size,
             sst_size: region_stat.sst_size,
+            sst_num: region_stat.sst_num,
             index_size: region_stat.index_size,
+            region_manifest: region_stat.manifest.into(),
+            data_topic_latest_entry_id: region_stat.data_topic_latest_entry_id,
+            metadata_topic_latest_entry_id: region_stat.metadata_topic_latest_entry_id,
         }
     }
 }
 
 /// The key of the datanode stat in the memory store.
 ///
-/// The format is `__meta_datanode_stat-{cluster_id}-{node_id}`.
+/// The format is `__meta_datanode_stat-0-{node_id}`.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct DatanodeStatKey {
-    pub cluster_id: ClusterId,
     pub node_id: u64,
 }
 
 impl DatanodeStatKey {
     /// The key prefix.
     pub fn prefix_key() -> Vec<u8> {
-        format!("{DATANODE_STAT_PREFIX}-").into_bytes()
-    }
-
-    /// The key prefix with the cluster id.
-    pub fn key_prefix_with_cluster_id(cluster_id: ClusterId) -> String {
-        format!("{DATANODE_STAT_PREFIX}-{cluster_id}-")
+        // todo(hl): remove cluster id in prefix
+        format!("{DATANODE_STAT_PREFIX}-0-").into_bytes()
     }
 }
 
 impl From<DatanodeStatKey> for Vec<u8> {
     fn from(value: DatanodeStatKey) -> Self {
-        format!(
-            "{}-{}-{}",
-            DATANODE_STAT_PREFIX, value.cluster_id, value.node_id
-        )
-        .into_bytes()
+        // todo(hl): remove cluster id in prefix
+        format!("{}-0-{}", DATANODE_STAT_PREFIX, value.node_id).into_bytes()
     }
 }
 
@@ -234,20 +318,12 @@ impl FromStr for DatanodeStatKey {
             .context(error::InvalidStatKeySnafu { key })?;
 
         ensure!(caps.len() == 3, error::InvalidStatKeySnafu { key });
-
-        let cluster_id = caps[1].to_string();
         let node_id = caps[2].to_string();
-        let cluster_id: u64 = cluster_id.parse().context(error::ParseNumSnafu {
-            err_msg: format!("invalid cluster_id: {cluster_id}"),
-        })?;
         let node_id: u64 = node_id.parse().context(error::ParseNumSnafu {
             err_msg: format!("invalid node_id: {node_id}"),
         })?;
 
-        Ok(Self {
-            cluster_id,
-            node_id,
-        })
+        Ok(Self { node_id })
     }
 }
 
@@ -321,7 +397,6 @@ mod tests {
     #[test]
     fn test_stat_key() {
         let stat = Stat {
-            cluster_id: 3,
             id: 101,
             region_num: 10,
             ..Default::default()
@@ -329,14 +404,12 @@ mod tests {
 
         let stat_key = stat.stat_key();
 
-        assert_eq!(3, stat_key.cluster_id);
         assert_eq!(101, stat_key.node_id);
     }
 
     #[test]
     fn test_stat_val_round_trip() {
         let stat = Stat {
-            cluster_id: 0,
             id: 101,
             region_num: 100,
             ..Default::default()
@@ -351,7 +424,6 @@ mod tests {
         assert_eq!(1, stats.len());
 
         let stat = stats.first().unwrap();
-        assert_eq!(0, stat.cluster_id);
         assert_eq!(101, stat.id);
         assert_eq!(100, stat.region_num);
     }

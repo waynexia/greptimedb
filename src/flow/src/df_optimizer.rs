@@ -25,7 +25,6 @@ use datafusion::config::ConfigOptions;
 use datafusion::error::DataFusionError;
 use datafusion::functions_aggregate::count::count_udaf;
 use datafusion::functions_aggregate::sum::sum_udaf;
-use datafusion::optimizer::analyzer::count_wildcard_rule::CountWildcardRule;
 use datafusion::optimizer::analyzer::type_coercion::TypeCoercion;
 use datafusion::optimizer::common_subexpr_eliminate::CommonSubexprEliminate;
 use datafusion::optimizer::optimize_projections::OptimizeProjections;
@@ -39,8 +38,10 @@ use datafusion_common::tree_node::{
 use datafusion_common::{Column, DFSchema, ScalarValue};
 use datafusion_expr::utils::merge_schema;
 use datafusion_expr::{
-    BinaryExpr, Expr, Operator, Projection, ScalarUDFImpl, Signature, TypeSignature, Volatility,
+    BinaryExpr, ColumnarValue, Expr, Operator, Projection, ScalarFunctionArgs, ScalarUDFImpl,
+    Signature, TypeSignature, Volatility,
 };
+use query::optimizer::count_wildcard::CountWildcardToTimeIndexRule;
 use query::parser::QueryLanguageParser;
 use query::query_engine::DefaultSerializer;
 use query::QueryEngine;
@@ -60,9 +61,9 @@ pub async fn apply_df_optimizer(
 ) -> Result<datafusion_expr::LogicalPlan, Error> {
     let cfg = ConfigOptions::new();
     let analyzer = Analyzer::with_rules(vec![
-        Arc::new(CountWildcardRule::new()),
-        Arc::new(AvgExpandRule::new()),
-        Arc::new(TumbleExpandRule::new()),
+        Arc::new(CountWildcardToTimeIndexRule),
+        Arc::new(AvgExpandRule),
+        Arc::new(TumbleExpandRule),
         Arc::new(CheckGroupByRule::new()),
         Arc::new(TypeCoercion::new()),
     ]);
@@ -127,13 +128,7 @@ pub async fn sql_to_flow_plan(
 }
 
 #[derive(Debug)]
-struct AvgExpandRule {}
-
-impl AvgExpandRule {
-    pub fn new() -> Self {
-        Self {}
-    }
-}
+struct AvgExpandRule;
 
 impl AnalyzerRule for AvgExpandRule {
     fn analyze(
@@ -330,13 +325,7 @@ impl TreeNodeRewriter for ExpandAvgRewriter<'_> {
 
 /// expand tumble in aggr expr to tumble_start and tumble_end with column name like `window_start`
 #[derive(Debug)]
-struct TumbleExpandRule {}
-
-impl TumbleExpandRule {
-    pub fn new() -> Self {
-        Self {}
-    }
-}
+struct TumbleExpandRule;
 
 impl AnalyzerRule for TumbleExpandRule {
     fn analyze(
@@ -479,7 +468,7 @@ impl ScalarUDFImpl for TumbleExpand {
         match (arg_types.first(), arg_types.get(1), arg_types.get(2)) {
             (Some(ts), Some(window), opt) => {
                 use arrow_schema::DataType::*;
-                if !matches!(ts, Date32 | Date64 | Timestamp(_, _)) {
+                if !matches!(ts, Date32 | Timestamp(_, _)) {
                     return Err(DataFusionError::Plan(
                         format!("Expect timestamp column as first arg for tumble_start, found {:?}", ts)
                     ));
@@ -491,7 +480,7 @@ impl ScalarUDFImpl for TumbleExpand {
                 }
 
                 if let Some(start_time) = opt{
-                    if !matches!(start_time,  Utf8 | Date32 | Date64 | Timestamp(_, _)){
+                    if !matches!(start_time,  Utf8 | Date32 | Timestamp(_, _)){
                         return Err(DataFusionError::Plan(
                             format!("Expect start_time to either be date, timestamp or string, found {:?}", start_time)
                         ));
@@ -518,10 +507,10 @@ impl ScalarUDFImpl for TumbleExpand {
         })
     }
 
-    fn invoke(
+    fn invoke_with_args(
         &self,
-        _args: &[datafusion_expr::ColumnarValue],
-    ) -> Result<datafusion_expr::ColumnarValue, DataFusionError> {
+        _args: ScalarFunctionArgs,
+    ) -> datafusion_common::Result<ColumnarValue> {
         Err(DataFusionError::Plan(
             "This function should not be executed by datafusion".to_string(),
         ))

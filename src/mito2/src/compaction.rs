@@ -15,7 +15,7 @@
 mod buckets;
 pub mod compactor;
 pub mod picker;
-mod run;
+pub mod run;
 mod task;
 #[cfg(test)]
 mod test_util;
@@ -40,7 +40,6 @@ use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt};
 use store_api::metadata::RegionMetadataRef;
 use store_api::storage::{RegionId, TableId};
-use table::predicate::Predicate;
 use task::MAX_PARALLEL_COMPACTION;
 use tokio::sync::mpsc::{self, Sender};
 
@@ -57,13 +56,13 @@ use crate::error::{
 };
 use crate::metrics::{COMPACTION_STAGE_ELAPSED, INFLIGHT_COMPACTION_COUNT};
 use crate::read::projection::ProjectionMapper;
-use crate::read::scan_region::ScanInput;
+use crate::read::scan_region::{PredicateGroup, ScanInput};
 use crate::read::seq_scan::SeqScan;
 use crate::read::BoxedBatchReader;
 use crate::region::options::MergeMode;
 use crate::region::version::VersionControlRef;
 use crate::region::ManifestContextRef;
-use crate::request::{OptionOutputTx, OutputTx, WorkerRequest};
+use crate::request::{OptionOutputTx, OutputTx, WorkerRequestWithTime};
 use crate::schedule::remote_job_scheduler::{
     CompactionJob, DefaultNotifier, RemoteJob, RemoteJobSchedulerRef,
 };
@@ -78,7 +77,7 @@ pub struct CompactionRequest {
     pub(crate) current_version: CompactionVersion,
     pub(crate) access_layer: AccessLayerRef,
     /// Sender to send notification to the region worker.
-    pub(crate) request_sender: mpsc::Sender<WorkerRequest>,
+    pub(crate) request_sender: mpsc::Sender<WorkerRequestWithTime>,
     /// Waiters of the compaction request.
     pub(crate) waiters: Vec<OutputTx>,
     /// Start time of compaction task.
@@ -102,7 +101,7 @@ pub(crate) struct CompactionScheduler {
     /// Compacting regions.
     region_status: HashMap<RegionId, CompactionStatus>,
     /// Request sender of the worker that this scheduler belongs to.
-    request_sender: Sender<WorkerRequest>,
+    request_sender: Sender<WorkerRequestWithTime>,
     cache_manager: CacheManagerRef,
     engine_config: Arc<MitoConfig>,
     listener: WorkerListener,
@@ -113,7 +112,7 @@ pub(crate) struct CompactionScheduler {
 impl CompactionScheduler {
     pub(crate) fn new(
         scheduler: SchedulerRef,
-        request_sender: Sender<WorkerRequest>,
+        request_sender: Sender<WorkerRequestWithTime>,
         cache_manager: CacheManagerRef,
         engine_config: Arc<MitoConfig>,
         listener: WorkerListener,
@@ -329,7 +328,6 @@ impl CompactionScheduler {
 
         let compaction_region = CompactionRegion {
             region_id,
-            region_dir: access_layer.region_dir().to_string(),
             current_version: current_version.clone(),
             region_options: current_version.options.clone(),
             engine_config: engine_config.clone(),
@@ -369,6 +367,7 @@ impl CompactionScheduler {
                     picker_output: picker_output.clone(),
                     start_time,
                     waiters,
+                    ttl,
                 };
 
                 let result = remote_job_scheduler
@@ -560,7 +559,7 @@ impl CompactionStatus {
     #[allow(clippy::too_many_arguments)]
     fn new_compaction_request(
         &mut self,
-        request_sender: Sender<WorkerRequest>,
+        request_sender: Sender<WorkerRequestWithTime>,
         mut waiter: OptionOutputTx,
         engine_config: Arc<MitoConfig>,
         cache_manager: CacheManagerRef,
@@ -657,7 +656,7 @@ impl CompactionSstReaderBuilder<'_> {
 fn time_range_to_predicate(
     range: TimestampRange,
     metadata: &RegionMetadataRef,
-) -> Result<Option<Predicate>> {
+) -> Result<PredicateGroup> {
     let ts_col = metadata.time_index_column();
 
     // safety: time index column's type must be a valid timestamp type.
@@ -687,10 +686,12 @@ fn time_range_to_predicate(
                 .lt(ts_to_lit(*end, ts_col_unit)?)]
         }
         (None, None) => {
-            return Ok(None);
+            return Ok(PredicateGroup::default());
         }
     };
-    Ok(Some(Predicate::new(exprs)))
+
+    let predicate = PredicateGroup::new(metadata, &exprs);
+    Ok(predicate)
 }
 
 fn ts_to_lit(ts: Timestamp, ts_col_unit: TimeUnit) -> Result<Expr> {

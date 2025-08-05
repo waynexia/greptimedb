@@ -15,14 +15,16 @@
 #![doc = include_str!("../../../../README.md")]
 
 use clap::{Parser, Subcommand};
+use cmd::datanode::builder::InstanceBuilder;
 use cmd::error::{InitTlsProviderSnafu, Result};
 use cmd::options::GlobalOptions;
 use cmd::{cli, datanode, flownode, frontend, metasrv, standalone, App};
-use common_version::version;
+use common_base::Plugins;
+use common_version::{verbose_version, version};
 use servers::install_ring_crypto_provider;
 
 #[derive(Parser)]
-#[command(name = "greptime", author, version, long_version = version(), about)]
+#[command(name = "greptime", author, version, long_version = verbose_version(), about)]
 #[command(propagate_version = true)]
 pub(crate) struct Command {
     #[clap(subcommand)]
@@ -102,10 +104,10 @@ async fn main_body() -> Result<()> {
 async fn start(cli: Command) -> Result<()> {
     match cli.subcmd {
         SubCommand::Datanode(cmd) => {
-            cmd.build(cmd.load_options(&cli.global_options)?)
-                .await?
-                .run()
-                .await
+            let opts = cmd.load_options(&cli.global_options)?;
+            let plugins = Plugins::new();
+            let builder = InstanceBuilder::try_new_with_init(opts, plugins).await?;
+            cmd.build_with(builder).await?.run().await
         }
         SubCommand::Flownode(cmd) => {
             cmd.build(cmd.load_options(&cli.global_options)?)
@@ -141,10 +143,8 @@ async fn start(cli: Command) -> Result<()> {
 }
 
 fn setup_human_panic() {
-    human_panic::setup_panic!(
-        human_panic::Metadata::new("GreptimeDB", env!("CARGO_PKG_VERSION"))
-            .homepage("https://github.com/GreptimeTeam/greptimedb/discussions")
-    );
+    human_panic::setup_panic!(human_panic::Metadata::new("GreptimeDB", version())
+        .homepage("https://github.com/GreptimeTeam/greptimedb/discussions"));
 
     common_telemetry::set_panic_hook();
 }

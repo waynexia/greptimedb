@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
@@ -26,9 +27,10 @@ use crate::external_provider::ExternalTempFileProvider;
 use crate::fulltext_index::create::FulltextIndexCreator;
 use crate::fulltext_index::error::{
     AbortedSnafu, BiErrorsSnafu, BloomFilterFinishSnafu, ExternalSnafu, PuffinAddBlobSnafu, Result,
+    SerializeToJsonSnafu,
 };
 use crate::fulltext_index::tokenizer::{Analyzer, ChineseTokenizer, EnglishTokenizer};
-use crate::fulltext_index::Config;
+use crate::fulltext_index::{Config, KEY_FULLTEXT_CONFIG};
 
 const PIPE_BUFFER_SIZE_FOR_SENDING_BLOB: usize = 8192;
 
@@ -36,12 +38,14 @@ const PIPE_BUFFER_SIZE_FOR_SENDING_BLOB: usize = 8192;
 pub struct BloomFilterFulltextIndexCreator {
     inner: Option<BloomFilterCreator>,
     analyzer: Analyzer,
+    config: Config,
 }
 
 impl BloomFilterFulltextIndexCreator {
     pub fn new(
         config: Config,
         rows_per_segment: usize,
+        false_positive_rate: f64,
         intermediate_provider: Arc<dyn ExternalTempFileProvider>,
         global_memory_usage: Arc<AtomicUsize>,
         global_memory_usage_threshold: Option<usize>,
@@ -54,6 +58,7 @@ impl BloomFilterFulltextIndexCreator {
 
         let inner = BloomFilterCreator::new(
             rows_per_segment,
+            false_positive_rate,
             intermediate_provider,
             global_memory_usage,
             global_memory_usage_threshold,
@@ -61,6 +66,7 @@ impl BloomFilterFulltextIndexCreator {
         Self {
             inner: Some(inner),
             analyzer,
+            config,
         }
     }
 }
@@ -89,9 +95,17 @@ impl FulltextIndexCreator for BloomFilterFulltextIndexCreator {
 
         let (tx, rx) = tokio::io::duplex(PIPE_BUFFER_SIZE_FOR_SENDING_BLOB);
 
+        let property_key = KEY_FULLTEXT_CONFIG.to_string();
+        let property_value = serde_json::to_string(&self.config).context(SerializeToJsonSnafu)?;
+
         let (index_finish, puffin_add_blob) = futures::join!(
             creator.finish(tx.compat_write()),
-            puffin_writer.put_blob(blob_key, rx.compat(), put_options)
+            puffin_writer.put_blob(
+                blob_key,
+                rx.compat(),
+                put_options,
+                HashMap::from([(property_key, property_value)]),
+            )
         );
 
         match (

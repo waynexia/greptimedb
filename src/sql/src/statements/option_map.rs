@@ -82,9 +82,9 @@ impl OptionMap {
         let mut result = Vec::with_capacity(self.options.len() + self.secrets.len());
         for (k, v) in self.options.iter() {
             if k.contains(".") {
-                result.push(format!("'{k}' = '{}'", v.escape_default()));
+                result.push(format!("'{k}' = '{}'", v.escape_debug()));
             } else {
-                result.push(format!("{k} = '{}'", v.escape_default()));
+                result.push(format!("{k} = '{}'", v.escape_debug()));
             }
         }
         for (k, _) in self.secrets.iter() {
@@ -98,10 +98,10 @@ impl OptionMap {
     }
 }
 
-impl From<HashMap<String, String>> for OptionMap {
-    fn from(value: HashMap<String, String>) -> Self {
+impl<I: IntoIterator<Item = (String, String)>> From<I> for OptionMap {
+    fn from(value: I) -> Self {
         let mut result = OptionMap::default();
-        for (k, v) in value.into_iter() {
+        for (k, v) in value {
             result.insert(k, v);
         }
         result
@@ -152,5 +152,25 @@ impl VisitMut for OptionMap {
             v.expose_secret_mut().visit(visitor)?;
         }
         ControlFlow::Continue(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::statements::OptionMap;
+
+    #[test]
+    fn test_format() {
+        let mut map = OptionMap::default();
+        map.insert("comment".to_string(), "中文comment".to_string());
+        assert_eq!("comment = '中文comment'", map.kv_pairs()[0]);
+
+        let mut map = OptionMap::default();
+        map.insert("a.b".to_string(), "中文comment".to_string());
+        assert_eq!("'a.b' = '中文comment'", map.kv_pairs()[0]);
+
+        let mut map = OptionMap::default();
+        map.insert("a.b".to_string(), "中文comment\n".to_string());
+        assert_eq!("'a.b' = '中文comment\\n'", map.kv_pairs()[0]);
     }
 }

@@ -34,12 +34,14 @@ pub enum StatusCode {
     Internal = 1003,
     /// Invalid arguments.
     InvalidArguments = 1004,
-    /// The task is cancelled.
+    /// The task is cancelled (typically caller-side).
     Cancelled = 1005,
     /// Illegal state, can be exposed to users.
     IllegalState = 1006,
     /// Caused by some error originated from external system.
     External = 1007,
+    /// The request is deadline exceeded (typically server-side).
+    DeadlineExceeded = 1008,
     // ====== End of common status code ================
 
     // ====== Begin of SQL related status code =========
@@ -117,6 +119,11 @@ pub enum StatusCode {
     FlowAlreadyExists = 8000,
     FlowNotFound = 8001,
     // ====== End of flow related status code =====
+
+    // ====== Begin of trigger related status code =====
+    TriggerAlreadyExists = 9000,
+    TriggerNotFound = 9001,
+    // ====== End of trigger related status code =====
 }
 
 impl StatusCode {
@@ -142,6 +149,7 @@ impl StatusCode {
             | StatusCode::Unexpected
             | StatusCode::InvalidArguments
             | StatusCode::Cancelled
+            | StatusCode::DeadlineExceeded
             | StatusCode::InvalidSyntax
             | StatusCode::DatabaseAlreadyExists
             | StatusCode::PlanQuery
@@ -152,6 +160,8 @@ impl StatusCode {
             | StatusCode::RegionNotFound
             | StatusCode::FlowAlreadyExists
             | StatusCode::FlowNotFound
+            | StatusCode::TriggerAlreadyExists
+            | StatusCode::TriggerNotFound
             | StatusCode::RegionReadonly
             | StatusCode::TableColumnNotFound
             | StatusCode::TableColumnExists
@@ -177,6 +187,7 @@ impl StatusCode {
             | StatusCode::Unexpected
             | StatusCode::Internal
             | StatusCode::Cancelled
+            | StatusCode::DeadlineExceeded
             | StatusCode::IllegalState
             | StatusCode::EngineExecuteQuery
             | StatusCode::StorageUnavailable
@@ -194,6 +205,8 @@ impl StatusCode {
             | StatusCode::PlanQuery
             | StatusCode::FlowAlreadyExists
             | StatusCode::FlowNotFound
+            | StatusCode::TriggerAlreadyExists
+            | StatusCode::TriggerNotFound
             | StatusCode::RegionNotReady
             | StatusCode::RegionBusy
             | StatusCode::RegionReadonly
@@ -224,6 +237,48 @@ impl fmt::Display for StatusCode {
         // The current debug format is suitable to display.
         write!(f, "{self:?}")
     }
+}
+
+#[macro_export]
+macro_rules! define_from_tonic_status {
+    ($Error: ty, $Variant: ident) => {
+        impl From<tonic::Status> for $Error {
+            fn from(e: tonic::Status) -> Self {
+                use snafu::location;
+
+                fn metadata_value(e: &tonic::Status, key: &str) -> Option<String> {
+                    e.metadata()
+                        .get(key)
+                        .and_then(|v| String::from_utf8(v.as_bytes().to_vec()).ok())
+                }
+
+                let code = metadata_value(&e, $crate::GREPTIME_DB_HEADER_ERROR_CODE)
+                    .and_then(|s| {
+                        if let Ok(code) = s.parse::<u32>() {
+                            StatusCode::from_u32(code)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| match e.code() {
+                        tonic::Code::Cancelled => StatusCode::Cancelled,
+                        tonic::Code::DeadlineExceeded => StatusCode::DeadlineExceeded,
+                        _ => StatusCode::Internal,
+                    });
+
+                let msg = metadata_value(&e, $crate::GREPTIME_DB_HEADER_ERROR_MSG)
+                    .unwrap_or_else(|| e.message().to_string());
+
+                // TODO(LFC): Make the error variant defined automatically.
+                Self::$Variant {
+                    code,
+                    msg,
+                    tonic_code: e.code(),
+                    location: location!(),
+                }
+            }
+        }
+    };
 }
 
 #[macro_export]
@@ -272,16 +327,19 @@ pub fn status_to_tonic_code(status_code: StatusCode) -> Code {
             Code::InvalidArgument
         }
         StatusCode::Cancelled => Code::Cancelled,
+        StatusCode::DeadlineExceeded => Code::DeadlineExceeded,
         StatusCode::TableAlreadyExists
         | StatusCode::TableColumnExists
         | StatusCode::RegionAlreadyExists
         | StatusCode::DatabaseAlreadyExists
+        | StatusCode::TriggerAlreadyExists
         | StatusCode::FlowAlreadyExists => Code::AlreadyExists,
         StatusCode::TableNotFound
         | StatusCode::RegionNotFound
         | StatusCode::TableColumnNotFound
         | StatusCode::DatabaseNotFound
         | StatusCode::UserNotFound
+        | StatusCode::TriggerNotFound
         | StatusCode::FlowNotFound => Code::NotFound,
         StatusCode::TableUnavailable
         | StatusCode::StorageUnavailable

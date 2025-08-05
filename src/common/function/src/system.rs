@@ -22,7 +22,10 @@ mod version;
 use std::sync::Arc;
 
 use build::BuildFunction;
-use database::{CurrentSchemaFunction, DatabaseFunction, SessionUserFunction};
+use database::{
+    ConnectionIdFunction, CurrentSchemaFunction, DatabaseFunction, PgBackendPidFunction,
+    ReadPreferenceFunction, SessionUserFunction,
+};
 use pg_catalog::PGCatalogFunction;
 use procedure_state::ProcedureStateFunction;
 use timezone::TimezoneFunction;
@@ -34,12 +37,15 @@ pub(crate) struct SystemFunction;
 
 impl SystemFunction {
     pub fn register(registry: &FunctionRegistry) {
-        registry.register(Arc::new(BuildFunction));
-        registry.register(Arc::new(VersionFunction));
-        registry.register(Arc::new(CurrentSchemaFunction));
-        registry.register(Arc::new(DatabaseFunction));
-        registry.register(Arc::new(SessionUserFunction));
-        registry.register(Arc::new(TimezoneFunction));
+        registry.register_scalar(BuildFunction);
+        registry.register_scalar(VersionFunction);
+        registry.register_scalar(CurrentSchemaFunction);
+        registry.register_scalar(DatabaseFunction);
+        registry.register_scalar(SessionUserFunction);
+        registry.register_scalar(ReadPreferenceFunction);
+        registry.register_scalar(PgBackendPidFunction);
+        registry.register_scalar(ConnectionIdFunction);
+        registry.register_scalar(TimezoneFunction);
         registry.register_async(Arc::new(ProcedureStateFunction));
         PGCatalogFunction::register(registry);
     }

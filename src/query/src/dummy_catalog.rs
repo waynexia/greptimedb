@@ -28,10 +28,11 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion_common::DataFusionError;
 use datafusion_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datatypes::arrow::datatypes::SchemaRef;
+use session::context::QueryContextRef;
 use snafu::ResultExt;
 use store_api::metadata::RegionMetadataRef;
 use store_api::region_engine::RegionEngineRef;
-use store_api::storage::{RegionId, ScanRequest, TimeSeriesRowSelector};
+use store_api::storage::{RegionId, ScanRequest, TimeSeriesDistribution, TimeSeriesRowSelector};
 use table::table::scan::RegionScanExec;
 
 use crate::error::{GetRegionMetadataSnafu, Result};
@@ -135,6 +136,7 @@ pub struct DummyTableProvider {
     metadata: RegionMetadataRef,
     /// Keeping a mutable request makes it possible to change in the optimize phase.
     scan_request: Arc<Mutex<ScanRequest>>,
+    query_ctx: Option<QueryContextRef>,
 }
 
 impl fmt::Debug for DummyTableProvider {
@@ -175,10 +177,14 @@ impl TableProvider for DummyTableProvider {
 
         let scanner = self
             .engine
-            .handle_query(self.region_id, request)
+            .handle_query(self.region_id, request.clone())
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        Ok(Arc::new(RegionScanExec::new(scanner)))
+        let mut scan_exec = RegionScanExec::new(scanner, request)?;
+        if let Some(query_ctx) = &self.query_ctx {
+            scan_exec.set_explain_verbose(query_ctx.explain_verbose());
+        }
+        Ok(Arc::new(scan_exec))
     }
 
     fn supports_filters_pushdown(
@@ -193,7 +199,11 @@ impl TableProvider for DummyTableProvider {
                     if self
                         .metadata
                         .column_by_name(simple_filter.column_name())
-                        .and_then(|c| (c.semantic_type == SemanticType::Tag).then_some(()))
+                        .and_then(|c| {
+                            (c.semantic_type == SemanticType::Tag
+                                || c.semantic_type == SemanticType::Timestamp)
+                                .then_some(())
+                        })
                         .is_some()
                     {
                         TableProviderFilterPushDown::Exact
@@ -217,6 +227,7 @@ impl DummyTableProvider {
             engine,
             metadata,
             scan_request: Default::default(),
+            query_ctx: None,
         }
     }
 
@@ -227,6 +238,11 @@ impl DummyTableProvider {
     /// Sets the ordering hint of the query to the provider.
     pub fn with_ordering_hint(&self, order_opts: &[OrderOption]) {
         self.scan_request.lock().unwrap().output_ordering = Some(order_opts.to_vec());
+    }
+
+    /// Sets the distribution hint of the query to the provider.
+    pub fn with_distribution(&self, distribution: TimeSeriesDistribution) {
+        self.scan_request.lock().unwrap().distribution = Some(distribution);
     }
 
     /// Sets the time series selector hint of the query to the provider.
@@ -247,14 +263,13 @@ impl DummyTableProvider {
 
 pub struct DummyTableProviderFactory;
 
-#[async_trait]
-impl TableProviderFactory for DummyTableProviderFactory {
-    async fn create(
+impl DummyTableProviderFactory {
+    pub async fn create_table_provider(
         &self,
         region_id: RegionId,
         engine: RegionEngineRef,
-        ctx: Option<&session::context::QueryContext>,
-    ) -> Result<Arc<dyn TableProvider>> {
+        query_ctx: Option<QueryContextRef>,
+    ) -> Result<DummyTableProvider> {
         let metadata =
             engine
                 .get_metadata(region_id)
@@ -264,20 +279,35 @@ impl TableProviderFactory for DummyTableProviderFactory {
                     region_id,
                 })?;
 
-        let scan_request = ctx
-            .and_then(|c| c.get_snapshot(region_id.as_u64()))
-            .map(|seq| ScanRequest {
-                sequence: Some(seq),
+        let scan_request = query_ctx
+            .as_ref()
+            .map(|ctx| ScanRequest {
+                sequence: ctx.get_snapshot(region_id.as_u64()),
+                sst_min_sequence: ctx.sst_min_sequence(region_id.as_u64()),
                 ..Default::default()
             })
             .unwrap_or_default();
 
-        Ok(Arc::new(DummyTableProvider {
+        Ok(DummyTableProvider {
             region_id,
             engine,
             metadata,
             scan_request: Arc::new(Mutex::new(scan_request)),
-        }))
+            query_ctx,
+        })
+    }
+}
+
+#[async_trait]
+impl TableProviderFactory for DummyTableProviderFactory {
+    async fn create(
+        &self,
+        region_id: RegionId,
+        engine: RegionEngineRef,
+        ctx: Option<QueryContextRef>,
+    ) -> Result<Arc<dyn TableProvider>> {
+        let provider = self.create_table_provider(region_id, engine, ctx).await?;
+        Ok(Arc::new(provider))
     }
 }
 
@@ -287,7 +317,7 @@ pub trait TableProviderFactory: Send + Sync {
         &self,
         region_id: RegionId,
         engine: RegionEngineRef,
-        ctx: Option<&session::context::QueryContext>,
+        ctx: Option<QueryContextRef>,
     ) -> Result<Arc<dyn TableProvider>>;
 }
 

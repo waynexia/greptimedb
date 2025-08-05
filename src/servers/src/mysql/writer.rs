@@ -222,10 +222,7 @@ impl<'a, W: AsyncWrite + Unpin> MysqlResultWriter<'a, W> {
                         }
                     },
                     Value::Date(v) => row_writer.write_col(v.to_chrono_date())?,
-                    // convert datetime and timestamp to timezone of current connection
-                    Value::DateTime(v) => row_writer.write_col(
-                        v.to_chrono_datetime_with_timezone(Some(&query_context.timezone())),
-                    )?,
+                    // convert timestamp to timezone of current connection
                     Value::Timestamp(v) => row_writer.write_col(
                         v.to_chrono_datetime_with_timezone(Some(&query_context.timezone())),
                     )?,
@@ -293,7 +290,6 @@ pub(crate) fn create_mysql_column(
         ConcreteDataType::Timestamp(_) => Ok(ColumnType::MYSQL_TYPE_TIMESTAMP),
         ConcreteDataType::Time(_) => Ok(ColumnType::MYSQL_TYPE_TIME),
         ConcreteDataType::Date(_) => Ok(ColumnType::MYSQL_TYPE_DATE),
-        ConcreteDataType::DateTime(_) => Ok(ColumnType::MYSQL_TYPE_DATETIME),
         ConcreteDataType::Interval(_) => Ok(ColumnType::MYSQL_TYPE_VARCHAR),
         ConcreteDataType::Duration(_) => Ok(ColumnType::MYSQL_TYPE_TIME),
         ConcreteDataType::Decimal128(_) => Ok(ColumnType::MYSQL_TYPE_DECIMAL),
@@ -338,7 +334,7 @@ fn mysql_error_kind(status_code: &StatusCode) -> ErrorKind {
         StatusCode::Success => ErrorKind::ER_YES,
         StatusCode::Unknown | StatusCode::External => ErrorKind::ER_UNKNOWN_ERROR,
         StatusCode::Unsupported => ErrorKind::ER_NOT_SUPPORTED_YET,
-        StatusCode::Cancelled => ErrorKind::ER_QUERY_INTERRUPTED,
+        StatusCode::Cancelled | StatusCode::DeadlineExceeded => ErrorKind::ER_QUERY_INTERRUPTED,
         StatusCode::RuntimeResourcesExhausted => ErrorKind::ER_OUT_OF_RESOURCES,
         StatusCode::InvalidSyntax => ErrorKind::ER_SYNTAX_ERROR,
         StatusCode::RegionAlreadyExists | StatusCode::TableAlreadyExists => {
@@ -373,5 +369,7 @@ fn mysql_error_kind(status_code: &StatusCode) -> ErrorKind {
         StatusCode::RateLimited => ErrorKind::ER_TOO_MANY_CONCURRENT_TRXS,
         StatusCode::FlowAlreadyExists => ErrorKind::ER_TABLE_EXISTS_ERROR,
         StatusCode::FlowNotFound => ErrorKind::ER_NO_SUCH_TABLE,
+        StatusCode::TriggerAlreadyExists => ErrorKind::ER_TABLE_EXISTS_ERROR,
+        StatusCode::TriggerNotFound => ErrorKind::ER_NO_SUCH_TABLE,
     }
 }

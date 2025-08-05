@@ -35,7 +35,7 @@ use crate::worker::DROPPING_MARKER_FILE;
 async fn test_engine_drop_region() {
     common_telemetry::init_default_ut_logging();
 
-    let mut env = TestEnv::with_prefix("drop");
+    let mut env = TestEnv::with_prefix("drop").await;
     let listener = Arc::new(DropListener::new(Duration::from_millis(100)));
     let engine = env
         .create_engine_with(MitoConfig::default(), None, Some(listener.clone()))
@@ -71,7 +71,7 @@ async fn test_engine_drop_region() {
         .unwrap();
 
     let region = engine.get_region(region_id).unwrap();
-    let region_dir = region.access_layer.region_dir().to_string();
+    let region_dir = region.access_layer.build_region_dir(region_id);
     // no dropping marker file
     assert!(!env
         .get_object_store()
@@ -116,7 +116,7 @@ async fn test_engine_drop_region_for_custom_store() {
     ) {
         let request = CreateRequestBuilder::new()
             .insert_option("storage", storage_name)
-            .region_dir(storage_name)
+            .table_dir(storage_name)
             .build();
         let column_schema = rows_schema(&request);
         engine
@@ -143,7 +143,7 @@ async fn test_engine_drop_region_for_custom_store() {
         put_rows(engine, region_id, rows).await;
         flush_region(engine, region_id, None).await;
     }
-    let mut env = TestEnv::with_prefix("drop");
+    let mut env = TestEnv::with_prefix("drop").await;
     let listener = Arc::new(DropListener::new(Duration::from_millis(100)));
     let engine = env
         .create_engine_with_multiple_object_stores(
@@ -177,10 +177,33 @@ async fn test_engine_drop_region_for_custom_store() {
     .await;
 
     let global_region = engine.get_region(global_region_id).unwrap();
-    let global_region_dir = global_region.access_layer.region_dir().to_string();
+    let global_region_dir = global_region
+        .access_layer
+        .build_region_dir(global_region_id);
 
     let custom_region = engine.get_region(custom_region_id).unwrap();
-    let custom_region_dir = custom_region.access_layer.region_dir().to_string();
+    let custom_region_dir = custom_region
+        .access_layer
+        .build_region_dir(custom_region_id);
+
+    common_telemetry::info!(
+        "global_region_dir: {global_region_dir}, custom_region_dir: {custom_region_dir}"
+    );
+
+    let entries = object_store_manager
+        .find("Gcs")
+        .unwrap()
+        .list(&custom_region_dir)
+        .await
+        .unwrap();
+    common_telemetry::info!("Before drop, Gcs entries: {:?}", entries);
+    let entries = object_store_manager
+        .find("default")
+        .unwrap()
+        .list(&global_region_dir)
+        .await
+        .unwrap();
+    common_telemetry::info!("Before drop,default entries: {:?}", entries);
 
     // Both these regions should exist before dropping the custom region.
     assert!(object_store_manager
@@ -208,6 +231,21 @@ async fn test_engine_drop_region_for_custom_store() {
 
     // Wait for drop task.
     listener.wait().await;
+
+    let entries = object_store_manager
+        .find("Gcs")
+        .unwrap()
+        .list(&custom_region_dir)
+        .await
+        .unwrap();
+    common_telemetry::info!("After drop, Gcs entries: {:?}", entries);
+    let entries = object_store_manager
+        .find("default")
+        .unwrap()
+        .list(&global_region_dir)
+        .await
+        .unwrap();
+    common_telemetry::info!("After drop,default entries: {:?}", entries);
 
     assert!(!object_store_manager
         .find("Gcs")

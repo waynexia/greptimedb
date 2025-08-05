@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::fmt;
+use std::path::Path;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -19,8 +21,8 @@ use clap::Parser;
 use common_base::Plugins;
 use common_config::Configurable;
 use common_telemetry::info;
-use common_telemetry::logging::TracingOptions;
-use common_version::{short_version, version};
+use common_telemetry::logging::{TracingOptions, DEFAULT_LOGGING_DIR};
+use common_version::{short_version, verbose_version};
 use meta_srv::bootstrap::MetasrvInstance;
 use meta_srv::metasrv::BackendImpl;
 use snafu::ResultExt;
@@ -28,7 +30,7 @@ use tracing_appender::non_blocking::WorkerGuard;
 
 use crate::error::{self, LoadLayeredConfigSnafu, Result, StartMetaServerSnafu};
 use crate::options::{GlobalOptions, GreptimeOptions};
-use crate::{log_versions, App};
+use crate::{create_resource_limit_metrics, log_versions, maybe_activate_heap_profile, App};
 
 type MetasrvOptions = GreptimeOptions<meta_srv::metasrv::MetasrvOptions>;
 
@@ -52,6 +54,10 @@ impl Instance {
     pub fn get_inner(&self) -> &MetasrvInstance {
         &self.instance
     }
+
+    pub fn mut_inner(&mut self) -> &mut MetasrvInstance {
+        &mut self.instance
+    }
 }
 
 #[async_trait]
@@ -68,7 +74,7 @@ impl App for Instance {
         self.instance.start().await.context(StartMetaServerSnafu)
     }
 
-    async fn stop(&self) -> Result<()> {
+    async fn stop(&mut self) -> Result<()> {
         self.instance
             .shutdown()
             .await
@@ -131,8 +137,8 @@ impl SubCommand {
     }
 }
 
-#[derive(Debug, Default, Parser)]
-struct StartCommand {
+#[derive(Default, Parser)]
+pub struct StartCommand {
     /// The address to bind the gRPC server.
     #[clap(long, alias = "bind-addr")]
     rpc_bind_addr: Option<String>,
@@ -171,8 +177,29 @@ struct StartCommand {
     backend: Option<BackendImpl>,
 }
 
+impl fmt::Debug for StartCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StartCommand")
+            .field("rpc_bind_addr", &self.rpc_bind_addr)
+            .field("rpc_server_addr", &self.rpc_server_addr)
+            .field("store_addrs", &self.sanitize_store_addrs())
+            .field("config_file", &self.config_file)
+            .field("selector", &self.selector)
+            .field("use_memory_store", &self.use_memory_store)
+            .field("enable_region_failover", &self.enable_region_failover)
+            .field("http_addr", &self.http_addr)
+            .field("http_timeout", &self.http_timeout)
+            .field("env_prefix", &self.env_prefix)
+            .field("data_home", &self.data_home)
+            .field("store_key_prefix", &self.store_key_prefix)
+            .field("max_txn_ops", &self.max_txn_ops)
+            .field("backend", &self.backend)
+            .finish()
+    }
+}
+
 impl StartCommand {
-    fn load_options(&self, global_options: &GlobalOptions) -> Result<MetasrvOptions> {
+    pub fn load_options(&self, global_options: &GlobalOptions) -> Result<MetasrvOptions> {
         let mut opts = MetasrvOptions::load_layered_options(
             self.config_file.as_deref(),
             self.env_prefix.as_ref(),
@@ -182,6 +209,15 @@ impl StartCommand {
         self.merge_with_cli_options(global_options, &mut opts)?;
 
         Ok(opts)
+    }
+
+    fn sanitize_store_addrs(&self) -> Option<Vec<String>> {
+        self.store_addrs.as_ref().map(|addrs| {
+            addrs
+                .iter()
+                .map(|addr| common_meta::kv_backend::util::sanitize_connection_string(addr))
+                .collect()
+        })
     }
 
     // The precedence order is: cli > config file > environment variables > default values.
@@ -205,12 +241,20 @@ impl StartCommand {
             tokio_console_addr: global_options.tokio_console_addr.clone(),
         };
 
+        #[allow(deprecated)]
         if let Some(addr) = &self.rpc_bind_addr {
             opts.bind_addr.clone_from(addr);
+            opts.grpc.bind_addr.clone_from(addr);
+        } else if !opts.bind_addr.is_empty() {
+            opts.grpc.bind_addr.clone_from(&opts.bind_addr);
         }
 
+        #[allow(deprecated)]
         if let Some(addr) = &self.rpc_server_addr {
             opts.server_addr.clone_from(addr);
+            opts.grpc.server_addr.clone_from(addr);
+        } else if !opts.server_addr.is_empty() {
+            opts.grpc.server_addr.clone_from(&opts.server_addr);
         }
 
         if let Some(addrs) = &self.store_addrs {
@@ -243,6 +287,14 @@ impl StartCommand {
             opts.data_home.clone_from(data_home);
         }
 
+        // If the logging dir is not set, use the default logs dir in the data home.
+        if opts.logging.dir.is_empty() {
+            opts.logging.dir = Path::new(&opts.data_home)
+                .join(DEFAULT_LOGGING_DIR)
+                .to_string_lossy()
+                .to_string();
+        }
+
         if !self.store_key_prefix.is_empty() {
             opts.store_key_prefix.clone_from(&self.store_key_prefix)
         }
@@ -261,7 +313,7 @@ impl StartCommand {
         Ok(())
     }
 
-    async fn build(&self, opts: MetasrvOptions) -> Result<Instance> {
+    pub async fn build(&self, opts: MetasrvOptions) -> Result<Instance> {
         common_runtime::init_global_runtimes(&opts.runtime);
 
         let guard = common_telemetry::init_global_logging(
@@ -269,14 +321,18 @@ impl StartCommand {
             &opts.component.logging,
             &opts.component.tracing,
             None,
+            None,
         );
-        log_versions(version(), short_version(), APP_NAME);
+
+        log_versions(verbose_version(), short_version(), APP_NAME);
+        maybe_activate_heap_profile(&opts.component.memory);
+        create_resource_limit_metrics(APP_NAME);
 
         info!("Metasrv start command: {:#?}", self);
 
         let plugin_opts = opts.plugins;
         let mut opts = opts.component;
-        opts.detect_server_addr();
+        opts.grpc.detect_server_addr();
 
         info!("Metasrv options: {:#?}", opts);
 
@@ -285,12 +341,12 @@ impl StartCommand {
             .await
             .context(StartMetaServerSnafu)?;
 
-        let builder = meta_srv::bootstrap::metasrv_builder(&opts, plugins.clone(), None)
+        let builder = meta_srv::bootstrap::metasrv_builder(&opts, plugins, None)
             .await
             .context(error::BuildMetaServerSnafu)?;
         let metasrv = builder.build().await.context(error::BuildMetaServerSnafu)?;
 
-        let instance = MetasrvInstance::new(opts, plugins, metasrv)
+        let instance = MetasrvInstance::new(metasrv)
             .await
             .context(error::BuildMetaServerSnafu)?;
 
@@ -320,7 +376,7 @@ mod tests {
         };
 
         let options = cmd.load_options(&Default::default()).unwrap().component;
-        assert_eq!("127.0.0.1:3002".to_string(), options.bind_addr);
+        assert_eq!("127.0.0.1:3002".to_string(), options.grpc.bind_addr);
         assert_eq!(vec!["127.0.0.1:2380".to_string()], options.store_addrs);
         assert_eq!(SelectorType::LoadBased, options.selector);
     }
@@ -337,7 +393,7 @@ mod tests {
 
             [logging]
             level = "debug"
-            dir = "/tmp/greptimedb/test/logs"
+            dir = "./greptimedb_data/test/logs"
 
             [failure_detector]
             threshold = 8.0
@@ -353,12 +409,15 @@ mod tests {
         };
 
         let options = cmd.load_options(&Default::default()).unwrap().component;
-        assert_eq!("127.0.0.1:3002".to_string(), options.bind_addr);
-        assert_eq!("127.0.0.1:3002".to_string(), options.server_addr);
+        assert_eq!("127.0.0.1:3002".to_string(), options.grpc.bind_addr);
+        assert_eq!("127.0.0.1:3002".to_string(), options.grpc.server_addr);
         assert_eq!(vec!["127.0.0.1:2379".to_string()], options.store_addrs);
         assert_eq!(SelectorType::LeaseBased, options.selector);
         assert_eq!("debug", options.logging.level.as_ref().unwrap());
-        assert_eq!("/tmp/greptimedb/test/logs".to_string(), options.logging.dir);
+        assert_eq!(
+            "./greptimedb_data/test/logs".to_string(),
+            options.logging.dir
+        );
         assert_eq!(8.0, options.failure_detector.threshold);
         assert_eq!(
             100.0,
@@ -396,7 +455,7 @@ mod tests {
 
         let options = cmd
             .load_options(&GlobalOptions {
-                log_dir: Some("/tmp/greptimedb/test/logs".to_string()),
+                log_dir: Some("./greptimedb_data/test/logs".to_string()),
                 log_level: Some("debug".to_string()),
 
                 #[cfg(feature = "tokio-console")]
@@ -406,7 +465,7 @@ mod tests {
             .component;
 
         let logging_opt = options.logging;
-        assert_eq!("/tmp/greptimedb/test/logs", logging_opt.dir);
+        assert_eq!("./greptimedb_data/test/logs", logging_opt.dir);
         assert_eq!("debug", logging_opt.level.as_ref().unwrap());
     }
 
@@ -424,7 +483,7 @@ mod tests {
 
             [logging]
             level = "debug"
-            dir = "/tmp/greptimedb/test/logs"
+            dir = "./greptimedb_data/test/logs"
         "#;
         write!(file, "{}", toml_str).unwrap();
 
@@ -463,10 +522,10 @@ mod tests {
                 let opts = command.load_options(&Default::default()).unwrap().component;
 
                 // Should be read from env, env > default values.
-                assert_eq!(opts.bind_addr, "127.0.0.1:14002");
+                assert_eq!(opts.grpc.bind_addr, "127.0.0.1:14002");
 
                 // Should be read from config file, config file > env > default values.
-                assert_eq!(opts.server_addr, "127.0.0.1:3002");
+                assert_eq!(opts.grpc.server_addr, "127.0.0.1:3002");
 
                 // Should be read from cli, cli > config file > env > default values.
                 assert_eq!(opts.http.addr, "127.0.0.1:14000");

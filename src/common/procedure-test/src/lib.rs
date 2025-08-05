@@ -18,21 +18,37 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use common_procedure::local::{acquire_dynamic_key_lock, DynamicKeyLockGuard};
+use common_procedure::rwlock::KeyRwLock;
+use common_procedure::store::poison_store::PoisonStore;
+use common_procedure::test_util::InMemoryPoisonStore;
 use common_procedure::{
-    Context, ContextProvider, Output, Procedure, ProcedureId, ProcedureState, ProcedureWithId,
-    Result, Status,
+    Context, ContextProvider, Output, PoisonKey, Procedure, ProcedureId, ProcedureState,
+    ProcedureWithId, Result, Status, StringKey,
 };
+use tokio::sync::watch::Receiver;
 
 /// A Mock [ContextProvider].
 #[derive(Default)]
 pub struct MockContextProvider {
     states: HashMap<ProcedureId, ProcedureState>,
+    poison_manager: InMemoryPoisonStore,
+    dynamic_key_lock: Arc<KeyRwLock<String>>,
 }
 
 impl MockContextProvider {
     /// Returns a new provider.
     pub fn new(states: HashMap<ProcedureId, ProcedureState>) -> MockContextProvider {
-        MockContextProvider { states }
+        MockContextProvider {
+            states,
+            poison_manager: InMemoryPoisonStore::default(),
+            dynamic_key_lock: Arc::new(KeyRwLock::new()),
+        }
+    }
+
+    /// Returns a reference to the poison manager.
+    pub fn poison_manager(&self) -> &InMemoryPoisonStore {
+        &self.poison_manager
     }
 }
 
@@ -40,6 +56,23 @@ impl MockContextProvider {
 impl ContextProvider for MockContextProvider {
     async fn procedure_state(&self, procedure_id: ProcedureId) -> Result<Option<ProcedureState>> {
         Ok(self.states.get(&procedure_id).cloned())
+    }
+
+    async fn procedure_state_receiver(
+        &self,
+        _procedure_id: ProcedureId,
+    ) -> Result<Option<Receiver<ProcedureState>>> {
+        Ok(None)
+    }
+
+    async fn try_put_poison(&self, key: &PoisonKey, procedure_id: ProcedureId) -> Result<()> {
+        self.poison_manager
+            .try_put_poison(key.to_string(), procedure_id.to_string())
+            .await
+    }
+
+    async fn acquire_lock(&self, key: &StringKey) -> DynamicKeyLockGuard {
+        acquire_dynamic_key_lock(&self.dynamic_key_lock, key).await
     }
 }
 
@@ -61,6 +94,7 @@ pub async fn execute_procedure_until_done(procedure: &mut dyn Procedure) -> Opti
                 "Executing subprocedure is unsupported"
             ),
             Status::Done { output } => return output,
+            Status::Poisoned { .. } => return None,
         }
     }
 }
@@ -88,6 +122,7 @@ pub async fn execute_procedure_once(
             false
         }
         Status::Done { .. } => true,
+        Status::Poisoned { .. } => false,
     }
 }
 
@@ -109,6 +144,7 @@ pub async fn execute_until_suspended_or_done(
             Status::Executing { .. } => (),
             Status::Suspended { subprocedures, .. } => return Some(subprocedures),
             Status::Done { .. } => break,
+            Status::Poisoned { .. } => unreachable!(),
         }
     }
 

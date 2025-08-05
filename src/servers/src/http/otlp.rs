@@ -19,6 +19,7 @@ use axum::http::header;
 use axum::response::IntoResponse;
 use axum::Extension;
 use bytes::Bytes;
+use common_catalog::consts::{TRACE_TABLE_NAME, TRACE_TABLE_NAME_SESSION_KEY};
 use common_telemetry::tracing;
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsServiceRequest, ExportLogsServiceResponse,
@@ -29,35 +30,59 @@ use opentelemetry_proto::tonic::collector::metrics::v1::{
 use opentelemetry_proto::tonic::collector::trace::v1::{
     ExportTraceServiceRequest, ExportTraceServiceResponse,
 };
-use pipeline::util::to_pipeline_version;
-use pipeline::{PipelineDefinition, PipelineWay};
+use pipeline::PipelineWay;
 use prost::Message;
 use session::context::{Channel, QueryContext};
+use session::protocol_ctx::{MetricType, OtlpMetricCtx, ProtocolCtx};
 use snafu::prelude::*;
 
-use super::header::{write_cost_header_map, CONTENT_TYPE_PROTOBUF};
 use crate::error::{self, PipelineSnafu, Result};
-use crate::http::extractor::{LogTableName, PipelineInfo, SelectInfoWrapper, TraceTableName};
+use crate::http::extractor::{
+    LogTableName, OtlpMetricOptions, PipelineInfo, SelectInfoWrapper, TraceTableName,
+};
+// use crate::http::header::constants::GREPTIME_METRICS_LEGACY_MODE_HEADER_NAME;
+use crate::http::header::{write_cost_header_map, CONTENT_TYPE_PROTOBUF};
 use crate::metrics::METRIC_HTTP_OPENTELEMETRY_LOGS_ELAPSED;
-use crate::otlp::trace::TRACE_TABLE_NAME;
 use crate::query_handler::{OpenTelemetryProtocolHandlerRef, PipelineHandler};
+
+#[derive(Clone)]
+pub struct OtlpState {
+    pub with_metric_engine: bool,
+    pub handler: OpenTelemetryProtocolHandlerRef,
+}
 
 #[axum_macros::debug_handler]
 #[tracing::instrument(skip_all, fields(protocol = "otlp", request_type = "metrics"))]
 pub async fn metrics(
-    State(handler): State<OpenTelemetryProtocolHandlerRef>,
+    State(state): State<OtlpState>,
     Extension(mut query_ctx): Extension<QueryContext>,
-
+    http_opts: OtlpMetricOptions,
     bytes: Bytes,
 ) -> Result<OtlpResponse<ExportMetricsServiceResponse>> {
     let db = query_ctx.get_db_string();
     query_ctx.set_channel(Channel::Otlp);
-    let query_ctx = Arc::new(query_ctx);
+
     let _timer = crate::metrics::METRIC_HTTP_OPENTELEMETRY_METRICS_ELAPSED
         .with_label_values(&[db.as_str()])
         .start_timer();
     let request =
         ExportMetricsServiceRequest::decode(bytes).context(error::DecodeOtlpRequestSnafu)?;
+
+    let OtlpState {
+        with_metric_engine,
+        handler,
+    } = state;
+
+    query_ctx.set_protocol_ctx(ProtocolCtx::OtlpMetric(OtlpMetricCtx {
+        promote_all_resource_attrs: http_opts.promote_all_resource_attrs,
+        resource_attrs: http_opts.resource_attrs,
+        promote_scope_attrs: http_opts.promote_scope_attrs,
+        with_metric_engine,
+        // set is_legacy later
+        is_legacy: false,
+        metric_type: MetricType::Init,
+    }));
+    let query_ctx = Arc::new(query_ctx);
 
     handler
         .metrics(request, query_ctx)
@@ -73,8 +98,9 @@ pub async fn metrics(
 #[axum_macros::debug_handler]
 #[tracing::instrument(skip_all, fields(protocol = "otlp", request_type = "traces"))]
 pub async fn traces(
-    State(handler): State<OpenTelemetryProtocolHandlerRef>,
+    State(state): State<OtlpState>,
     TraceTableName(table_name): TraceTableName,
+    pipeline_info: PipelineInfo,
     Extension(mut query_ctx): Extension<QueryContext>,
     bytes: Bytes,
 ) -> Result<OtlpResponse<ExportTraceServiceResponse>> {
@@ -82,14 +108,39 @@ pub async fn traces(
     let table_name = table_name.unwrap_or_else(|| TRACE_TABLE_NAME.to_string());
 
     query_ctx.set_channel(Channel::Otlp);
+    query_ctx.set_extension(TRACE_TABLE_NAME_SESSION_KEY, &table_name);
+
     let query_ctx = Arc::new(query_ctx);
     let _timer = crate::metrics::METRIC_HTTP_OPENTELEMETRY_TRACES_ELAPSED
         .with_label_values(&[db.as_str()])
         .start_timer();
     let request =
         ExportTraceServiceRequest::decode(bytes).context(error::DecodeOtlpRequestSnafu)?;
+
+    let pipeline = PipelineWay::from_name_and_default(
+        pipeline_info.pipeline_name.as_deref(),
+        pipeline_info.pipeline_version.as_deref(),
+        None,
+    )
+    .context(PipelineSnafu)?;
+
+    let pipeline_params = pipeline_info.pipeline_params;
+
+    let OtlpState { handler, .. } = state;
+
+    // here we use nightly feature `trait_upcasting` to convert handler to
+    // pipeline_handler
+    let pipeline_handler: Arc<dyn PipelineHandler + Send + Sync> = handler.clone();
+
     handler
-        .traces(request, table_name, query_ctx)
+        .traces(
+            pipeline_handler,
+            request,
+            pipeline,
+            pipeline_params,
+            table_name,
+            query_ctx,
+        )
         .await
         .map(|o| OtlpResponse {
             resp_body: ExportTraceServiceResponse {
@@ -102,7 +153,7 @@ pub async fn traces(
 #[axum_macros::debug_handler]
 #[tracing::instrument(skip_all, fields(protocol = "otlp", request_type = "logs"))]
 pub async fn logs(
-    State(handler): State<OpenTelemetryProtocolHandlerRef>,
+    State(state): State<OtlpState>,
     Extension(mut query_ctx): Extension<QueryContext>,
     pipeline_info: PipelineInfo,
     LogTableName(tablename): LogTableName,
@@ -118,16 +169,15 @@ pub async fn logs(
         .start_timer();
     let request = ExportLogsServiceRequest::decode(bytes).context(error::DecodeOtlpRequestSnafu)?;
 
-    let pipeline = if let Some(pipeline_name) = pipeline_info.pipeline_name {
-        PipelineWay::Pipeline(PipelineDefinition::from_name(
-            &pipeline_name,
-            to_pipeline_version(pipeline_info.pipeline_version).context(PipelineSnafu)?,
-        ))
-    } else {
-        PipelineWay::OtlpLogDirect(Box::new(select_info))
-    };
-
+    let pipeline = PipelineWay::from_name_and_default(
+        pipeline_info.pipeline_name.as_deref(),
+        pipeline_info.pipeline_version.as_deref(),
+        Some(PipelineWay::OtlpLogDirect(Box::new(select_info))),
+    )
+    .context(PipelineSnafu)?;
     let pipeline_params = pipeline_info.pipeline_params;
+
+    let OtlpState { handler, .. } = state;
 
     // here we use nightly feature `trait_upcasting` to convert handler to
     // pipeline_handler
@@ -146,7 +196,7 @@ pub async fn logs(
             resp_body: ExportLogsServiceResponse {
                 partial_success: None,
             },
-            write_cost: o.meta.cost,
+            write_cost: o.iter().map(|o| o.meta.cost).sum(),
         })
 }
 

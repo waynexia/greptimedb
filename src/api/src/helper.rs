@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use common_base::BitVec;
@@ -19,9 +20,7 @@ use common_decimal::decimal128::{DECIMAL128_DEFAULT_SCALE, DECIMAL128_MAX_PRECIS
 use common_decimal::Decimal128;
 use common_time::time::Time;
 use common_time::timestamp::TimeUnit;
-use common_time::{
-    Date, DateTime, IntervalDayTime, IntervalMonthDayNano, IntervalYearMonth, Timestamp,
-};
+use common_time::{Date, IntervalDayTime, IntervalMonthDayNano, IntervalYearMonth, Timestamp};
 use datatypes::prelude::{ConcreteDataType, ValueRef};
 use datatypes::scalars::ScalarVector;
 use datatypes::types::{
@@ -29,8 +28,8 @@ use datatypes::types::{
 };
 use datatypes::value::{OrderedF32, OrderedF64, Value};
 use datatypes::vectors::{
-    BinaryVector, BooleanVector, DateTimeVector, DateVector, Decimal128Vector, Float32Vector,
-    Float64Vector, Int32Vector, Int64Vector, IntervalDayTimeVector, IntervalMonthDayNanoVector,
+    BinaryVector, BooleanVector, DateVector, Decimal128Vector, Float32Vector, Float64Vector,
+    Int32Vector, Int64Vector, IntervalDayTimeVector, IntervalMonthDayNanoVector,
     IntervalYearMonthVector, PrimitiveVector, StringVector, TimeMicrosecondVector,
     TimeMillisecondVector, TimeNanosecondVector, TimeSecondVector, TimestampMicrosecondVector,
     TimestampMillisecondVector, TimestampNanosecondVector, TimestampSecondVector, UInt32Vector,
@@ -48,7 +47,7 @@ use greptime_proto::v1::{
 use paste::paste;
 use snafu::prelude::*;
 
-use crate::error::{self, Result};
+use crate::error::{self, InconsistentTimeUnitSnafu, InvalidTimeUnitSnafu, Result};
 use crate::v1::column::Values;
 use crate::v1::{Column, ColumnDataType, Value as GrpcValue};
 
@@ -118,7 +117,7 @@ impl From<ColumnDataTypeWrapper> for ConcreteDataType {
             ColumnDataType::Json => ConcreteDataType::json_datatype(),
             ColumnDataType::String => ConcreteDataType::string_datatype(),
             ColumnDataType::Date => ConcreteDataType::date_datatype(),
-            ColumnDataType::Datetime => ConcreteDataType::datetime_datatype(),
+            ColumnDataType::Datetime => ConcreteDataType::timestamp_microsecond_datatype(),
             ColumnDataType::TimestampSecond => ConcreteDataType::timestamp_second_datatype(),
             ColumnDataType::TimestampMillisecond => {
                 ConcreteDataType::timestamp_millisecond_datatype()
@@ -271,7 +270,6 @@ impl TryFrom<ConcreteDataType> for ColumnDataTypeWrapper {
             ConcreteDataType::Binary(_) => ColumnDataType::Binary,
             ConcreteDataType::String(_) => ColumnDataType::String,
             ConcreteDataType::Date(_) => ColumnDataType::Date,
-            ConcreteDataType::DateTime(_) => ColumnDataType::Datetime,
             ConcreteDataType::Timestamp(t) => match t {
                 TimestampType::Second(_) => ColumnDataType::TimestampSecond,
                 TimestampType::Millisecond(_) => ColumnDataType::TimestampMillisecond,
@@ -294,6 +292,7 @@ impl TryFrom<ConcreteDataType> for ColumnDataTypeWrapper {
             ConcreteDataType::Vector(_) => ColumnDataType::Vector,
             ConcreteDataType::Null(_)
             | ConcreteDataType::List(_)
+            | ConcreteDataType::Struct(_)
             | ConcreteDataType::Dictionary(_)
             | ConcreteDataType::Duration(_) => {
                 return error::IntoColumnDataTypeSnafu { from: datatype }.fail()
@@ -476,7 +475,6 @@ pub fn push_vals(column: &mut Column, origin_count: usize, vector: VectorRef) {
         Value::String(val) => values.string_values.push(val.as_utf8().to_string()),
         Value::Binary(val) => values.binary_values.push(val.to_vec()),
         Value::Date(val) => values.date_values.push(val.val()),
-        Value::DateTime(val) => values.datetime_values.push(val.val()),
         Value::Timestamp(val) => match val.unit() {
             TimeUnit::Second => values.timestamp_second_values.push(val.value()),
             TimeUnit::Millisecond => values.timestamp_millisecond_values.push(val.value()),
@@ -518,6 +516,7 @@ fn query_request_type(request: &QueryRequest) -> &'static str {
         Some(Query::Sql(_)) => "query.sql",
         Some(Query::LogicalPlan(_)) => "query.logical_plan",
         Some(Query::PromRangeQuery(_)) => "query.prom_range",
+        Some(Query::InsertIntoPlan(_)) => "query.insert_into_plan",
         None => "query.empty",
     }
 }
@@ -577,12 +576,11 @@ pub fn pb_value_to_value_ref<'a>(
         ValueData::BinaryValue(bytes) => ValueRef::Binary(bytes.as_slice()),
         ValueData::StringValue(string) => ValueRef::String(string.as_str()),
         ValueData::DateValue(d) => ValueRef::Date(Date::from(*d)),
-        ValueData::DatetimeValue(d) => ValueRef::DateTime(DateTime::new(*d)),
         ValueData::TimestampSecondValue(t) => ValueRef::Timestamp(Timestamp::new_second(*t)),
         ValueData::TimestampMillisecondValue(t) => {
             ValueRef::Timestamp(Timestamp::new_millisecond(*t))
         }
-        ValueData::TimestampMicrosecondValue(t) => {
+        ValueData::DatetimeValue(t) | ValueData::TimestampMicrosecondValue(t) => {
             ValueRef::Timestamp(Timestamp::new_microsecond(*t))
         }
         ValueData::TimestampNanosecondValue(t) => {
@@ -651,7 +649,6 @@ pub fn pb_values_to_vector_ref(data_type: &ConcreteDataType, values: Values) -> 
         ConcreteDataType::Binary(_) => Arc::new(BinaryVector::from(values.binary_values)),
         ConcreteDataType::String(_) => Arc::new(StringVector::from_vec(values.string_values)),
         ConcreteDataType::Date(_) => Arc::new(DateVector::from_vec(values.date_values)),
-        ConcreteDataType::DateTime(_) => Arc::new(DateTimeVector::from_vec(values.datetime_values)),
         ConcreteDataType::Timestamp(unit) => match unit {
             TimestampType::Second(_) => Arc::new(TimestampSecondVector::from_vec(
                 values.timestamp_second_values,
@@ -708,6 +705,7 @@ pub fn pb_values_to_vector_ref(data_type: &ConcreteDataType, values: Values) -> 
         ConcreteDataType::Vector(_) => Arc::new(BinaryVector::from_vec(values.binary_values)),
         ConcreteDataType::Null(_)
         | ConcreteDataType::List(_)
+        | ConcreteDataType::Struct(_)
         | ConcreteDataType::Dictionary(_)
         | ConcreteDataType::Duration(_)
         | ConcreteDataType::Json(_) => {
@@ -786,11 +784,6 @@ pub fn pb_values_to_values(data_type: &ConcreteDataType, values: Values) -> Vec<
             .binary_values
             .into_iter()
             .map(|val| val.into())
-            .collect(),
-        ConcreteDataType::DateTime(_) => values
-            .datetime_values
-            .into_iter()
-            .map(|v| Value::DateTime(v.into()))
             .collect(),
         ConcreteDataType::Date(_) => values
             .date_values
@@ -874,6 +867,7 @@ pub fn pb_values_to_values(data_type: &ConcreteDataType, values: Values) -> Vec<
         ConcreteDataType::Vector(_) => values.binary_values.into_iter().map(|v| v.into()).collect(),
         ConcreteDataType::Null(_)
         | ConcreteDataType::List(_)
+        | ConcreteDataType::Struct(_)
         | ConcreteDataType::Dictionary(_)
         | ConcreteDataType::Duration(_)
         | ConcreteDataType::Json(_) => {
@@ -946,9 +940,6 @@ pub fn to_proto_value(value: Value) -> Option<v1::Value> {
         },
         Value::Date(v) => v1::Value {
             value_data: Some(ValueData::DateValue(v.val())),
-        },
-        Value::DateTime(v) => v1::Value {
-            value_data: Some(ValueData::DatetimeValue(v.val())),
         },
         Value::Timestamp(v) => match v.unit() {
             TimeUnit::Second => v1::Value {
@@ -1063,10 +1054,9 @@ pub fn value_to_grpc_value(value: Value) -> GrpcValue {
             Value::Int64(v) => Some(ValueData::I64Value(v)),
             Value::Float32(v) => Some(ValueData::F32Value(*v)),
             Value::Float64(v) => Some(ValueData::F64Value(*v)),
-            Value::String(v) => Some(ValueData::StringValue(v.as_utf8().to_string())),
+            Value::String(v) => Some(ValueData::StringValue(v.into_string())),
             Value::Binary(v) => Some(ValueData::BinaryValue(v.to_vec())),
             Value::Date(v) => Some(ValueData::DateValue(v.val())),
-            Value::DateTime(v) => Some(ValueData::DatetimeValue(v.val())),
             Value::Timestamp(v) => Some(match v.unit() {
                 TimeUnit::Second => ValueData::TimestampSecondValue(v.value()),
                 TimeUnit::Millisecond => ValueData::TimestampMillisecondValue(v.value()),
@@ -1088,6 +1078,89 @@ pub fn value_to_grpc_value(value: Value) -> GrpcValue {
             Value::List(_) | Value::Duration(_) => unreachable!(),
         },
     }
+}
+
+pub fn from_pb_time_unit(unit: v1::TimeUnit) -> TimeUnit {
+    match unit {
+        v1::TimeUnit::Second => TimeUnit::Second,
+        v1::TimeUnit::Millisecond => TimeUnit::Millisecond,
+        v1::TimeUnit::Microsecond => TimeUnit::Microsecond,
+        v1::TimeUnit::Nanosecond => TimeUnit::Nanosecond,
+    }
+}
+
+pub fn to_pb_time_unit(unit: TimeUnit) -> v1::TimeUnit {
+    match unit {
+        TimeUnit::Second => v1::TimeUnit::Second,
+        TimeUnit::Millisecond => v1::TimeUnit::Millisecond,
+        TimeUnit::Microsecond => v1::TimeUnit::Microsecond,
+        TimeUnit::Nanosecond => v1::TimeUnit::Nanosecond,
+    }
+}
+
+pub fn from_pb_time_ranges(time_ranges: v1::TimeRanges) -> Result<Vec<(Timestamp, Timestamp)>> {
+    if time_ranges.time_ranges.is_empty() {
+        return Ok(vec![]);
+    }
+    let proto_time_unit = v1::TimeUnit::try_from(time_ranges.time_unit).map_err(|_| {
+        InvalidTimeUnitSnafu {
+            time_unit: time_ranges.time_unit,
+        }
+        .build()
+    })?;
+    let time_unit = from_pb_time_unit(proto_time_unit);
+    Ok(time_ranges
+        .time_ranges
+        .into_iter()
+        .map(|r| {
+            (
+                Timestamp::new(r.start, time_unit),
+                Timestamp::new(r.end, time_unit),
+            )
+        })
+        .collect())
+}
+
+/// All time_ranges must be of the same time unit.
+///
+/// if input `time_ranges` is empty, it will return a default `TimeRanges` with `Millisecond` as the time unit.
+pub fn to_pb_time_ranges(time_ranges: &[(Timestamp, Timestamp)]) -> Result<v1::TimeRanges> {
+    let is_same_time_unit = time_ranges.windows(2).all(|x| {
+        x[0].0.unit() == x[1].0.unit()
+            && x[0].1.unit() == x[1].1.unit()
+            && x[0].0.unit() == x[0].1.unit()
+    });
+
+    if !is_same_time_unit {
+        let all_time_units: Vec<_> = time_ranges
+            .iter()
+            .map(|(s, e)| [s.unit(), e.unit()])
+            .clone()
+            .flatten()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        InconsistentTimeUnitSnafu {
+            units: all_time_units,
+        }
+        .fail()?
+    }
+
+    let mut pb_time_ranges = v1::TimeRanges {
+        // default time unit is Millisecond
+        time_unit: v1::TimeUnit::Millisecond as i32,
+        time_ranges: Vec::with_capacity(time_ranges.len()),
+    };
+    if let Some((start, _end)) = time_ranges.first() {
+        pb_time_ranges.time_unit = to_pb_time_unit(start.unit()) as i32;
+    }
+    for (start, end) in time_ranges {
+        pb_time_ranges.time_ranges.push(v1::TimeRange {
+            start: start.value(),
+            end: end.value(),
+        });
+    }
+    Ok(pb_time_ranges)
 }
 
 #[cfg(test)]
@@ -1248,7 +1321,7 @@ mod tests {
             ColumnDataTypeWrapper::date_datatype().into()
         );
         assert_eq!(
-            ConcreteDataType::datetime_datatype(),
+            ConcreteDataType::timestamp_microsecond_datatype(),
             ColumnDataTypeWrapper::datetime_datatype().into()
         );
         assert_eq!(
@@ -1338,10 +1411,6 @@ mod tests {
         assert_eq!(
             ColumnDataTypeWrapper::date_datatype(),
             ConcreteDataType::date_datatype().try_into().unwrap()
-        );
-        assert_eq!(
-            ColumnDataTypeWrapper::datetime_datatype(),
-            ConcreteDataType::datetime_datatype().try_into().unwrap()
         );
         assert_eq!(
             ColumnDataTypeWrapper::timestamp_millisecond_datatype(),
@@ -1827,17 +1896,6 @@ mod tests {
             Value::Date(1.into()),
             Value::Date(2.into()),
             Value::Date(3.into())
-        ]
-    );
-
-    test_convert_values!(
-        datetime,
-        vec![1.into(), 2.into(), 3.into()],
-        datetime,
-        vec![
-            Value::DateTime(1.into()),
-            Value::DateTime(2.into()),
-            Value::DateTime(3.into())
         ]
     );
 

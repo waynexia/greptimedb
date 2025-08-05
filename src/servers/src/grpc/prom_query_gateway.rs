@@ -27,13 +27,12 @@ use common_error::status_code::StatusCode;
 use common_time::util::current_time_rfc3339;
 use promql_parser::parser::value::ValueType;
 use query::parser::PromQuery;
-use session::context::QueryContext;
+use session::context::{Channel, QueryContext};
 use snafu::OptionExt;
 use tonic::{Request, Response};
 
-use super::greptime_handler::create_query_context;
 use crate::error::InvalidQuerySnafu;
-use crate::grpc::greptime_handler::auth;
+use crate::grpc::greptime_handler::{auth, create_query_context};
 use crate::grpc::TonicResult;
 use crate::http::prometheus::{retrieve_metric_name_and_result_type, PrometheusJsonResponse};
 use crate::prometheus_handler::PrometheusHandlerRef;
@@ -78,7 +77,8 @@ impl PrometheusGateway for PrometheusGatewayService {
         };
 
         let header = inner.header.as_ref();
-        let query_ctx = create_query_context(header, Default::default());
+        let query_ctx = create_query_context(Channel::Promql, header, Default::default())?;
+
         let user_info = auth(self.user_provider.clone(), header, &query_ctx).await?;
         query_ctx.set_current_user(user_info);
 
@@ -122,7 +122,7 @@ impl PrometheusGatewayService {
         let result = self.handler.do_query(&query, ctx).await;
         let (metric_name, mut result_type) =
             match retrieve_metric_name_and_result_type(&query.query) {
-                Ok((metric_name, result_type)) => (metric_name.unwrap_or_default(), result_type),
+                Ok((metric_name, result_type)) => (metric_name, result_type),
                 Err(err) => {
                     return PrometheusJsonResponse::error(err.status_code(), err.output_msg())
                 }

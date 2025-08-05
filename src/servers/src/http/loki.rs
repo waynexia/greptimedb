@@ -12,49 +12,59 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
 use api::v1::value::ValueData;
 use api::v1::{
     ColumnDataType, ColumnDataTypeExtension, ColumnSchema, JsonTypeExtension, Row,
-    RowInsertRequest, RowInsertRequests, Rows, SemanticType, Value as GreptimeValue,
+    RowInsertRequest, Rows, SemanticType, Value as GreptimeValue,
 };
 use axum::extract::State;
 use axum::Extension;
 use axum_extra::TypedHeader;
 use bytes::Bytes;
+use chrono::DateTime;
 use common_query::prelude::GREPTIME_TIMESTAMP;
 use common_query::{Output, OutputData};
 use common_telemetry::{error, warn};
-use hashbrown::HashMap;
 use headers::ContentType;
 use jsonb::Value;
 use lazy_static::lazy_static;
-use loki_proto::prost_types::Timestamp;
+use loki_proto::logproto::LabelPairAdapter;
+use loki_proto::prost_types::Timestamp as LokiTimestamp;
+use pipeline::util::to_pipeline_version;
+use pipeline::{ContextReq, PipelineContext, PipelineDefinition, SchemaInfo};
 use prost::Message;
 use quoted_string::test_utils::TestSpec;
 use session::context::{Channel, QueryContext};
 use snafu::{ensure, OptionExt, ResultExt};
+use vrl::value::{KeyString, Value as VrlValue};
 
 use crate::error::{
     DecodeOtlpRequestSnafu, InvalidLokiLabelsSnafu, InvalidLokiPayloadSnafu, ParseJsonSnafu,
-    Result, UnsupportedContentTypeSnafu,
+    PipelineSnafu, Result, UnsupportedContentTypeSnafu,
 };
-use crate::http::event::{LogState, JSON_CONTENT_TYPE, PB_CONTENT_TYPE};
-use crate::http::extractor::LogTableName;
+use crate::http::event::{LogState, PipelineIngestRequest, JSON_CONTENT_TYPE, PB_CONTENT_TYPE};
+use crate::http::extractor::{LogTableName, PipelineInfo};
 use crate::http::result::greptime_result_v1::GreptimedbV1Response;
 use crate::http::HttpResponse;
 use crate::metrics::{
     METRIC_FAILURE_VALUE, METRIC_LOKI_LOGS_INGESTION_COUNTER, METRIC_LOKI_LOGS_INGESTION_ELAPSED,
     METRIC_SUCCESS_VALUE,
 };
-use crate::{prom_store, unwrap_or_warn_continue};
+use crate::pipeline::run_pipeline;
+use crate::prom_store;
 
 const LOKI_TABLE_NAME: &str = "loki_logs";
 const LOKI_LINE_COLUMN: &str = "line";
 const LOKI_STRUCTURED_METADATA_COLUMN: &str = "structured_metadata";
+
+const LOKI_LINE_COLUMN_NAME: &str = "loki_line";
+
+const LOKI_PIPELINE_METADATA_PREFIX: &str = "loki_metadata_";
+const LOKI_PIPELINE_LABEL_PREFIX: &str = "loki_label_";
 
 const STREAMS_KEY: &str = "streams";
 const LABEL_KEY: &str = "stream";
@@ -96,6 +106,7 @@ pub async fn loki_ingest(
     Extension(mut ctx): Extension<QueryContext>,
     TypedHeader(content_type): TypedHeader<ContentType>,
     LogTableName(table_name): LogTableName,
+    pipeline_info: PipelineInfo,
     bytes: Bytes,
 ) -> Result<HttpResponse> {
     ctx.set_channel(Channel::Loki);
@@ -105,213 +116,507 @@ pub async fn loki_ingest(
     let db_str = db.as_str();
     let exec_timer = Instant::now();
 
-    // init schemas
-    let mut schemas = LOKI_INIT_SCHEMAS.clone();
-
-    let mut rows = match content_type {
-        x if x == *JSON_CONTENT_TYPE => handle_json_req(bytes, &mut schemas).await,
-        x if x == *PB_CONTENT_TYPE => handle_pb_req(bytes, &mut schemas).await,
-        _ => UnsupportedContentTypeSnafu { content_type }.fail(),
-    }?;
-
-    // fill Null for missing values
-    for row in rows.iter_mut() {
-        row.resize(schemas.len(), GreptimeValue::default());
-    }
-
-    let rows = Rows {
-        rows: rows.into_iter().map(|values| Row { values }).collect(),
-        schema: schemas,
-    };
-    let ins_req = RowInsertRequest {
-        table_name,
-        rows: Some(rows),
-    };
-    let ins_reqs = RowInsertRequests {
-        inserts: vec![ins_req],
-    };
-
     let handler = log_state.log_handler;
-    let output = handler.insert(ins_reqs, ctx).await;
 
-    if let Ok(Output {
-        data: OutputData::AffectedRows(rows),
-        meta: _,
-    }) = &output
-    {
-        METRIC_LOKI_LOGS_INGESTION_COUNTER
-            .with_label_values(&[db_str])
-            .inc_by(*rows as u64);
-        METRIC_LOKI_LOGS_INGESTION_ELAPSED
-            .with_label_values(&[db_str, METRIC_SUCCESS_VALUE])
-            .observe(exec_timer.elapsed().as_secs_f64());
+    let ctx_req = if let Some(pipeline_name) = pipeline_info.pipeline_name {
+        // go pipeline
+        let version = to_pipeline_version(pipeline_info.pipeline_version.as_deref())
+            .context(PipelineSnafu)?;
+        let def =
+            PipelineDefinition::from_name(&pipeline_name, version, None).context(PipelineSnafu)?;
+        let pipeline_ctx =
+            PipelineContext::new(&def, &pipeline_info.pipeline_params, Channel::Loki);
+
+        let v = extract_item::<LokiPipeline>(content_type, bytes)?
+            .map(|i| i.map)
+            .collect::<Vec<_>>();
+
+        let req = PipelineIngestRequest {
+            table: table_name,
+            values: v,
+        };
+
+        run_pipeline(&handler, &pipeline_ctx, req, &ctx, true).await?
     } else {
-        METRIC_LOKI_LOGS_INGESTION_ELAPSED
-            .with_label_values(&[db_str, METRIC_FAILURE_VALUE])
-            .observe(exec_timer.elapsed().as_secs_f64());
+        // init schemas
+        let mut schema_info = SchemaInfo::from_schema_list(LOKI_INIT_SCHEMAS.clone());
+        let mut rows = Vec::with_capacity(256);
+        for loki_row in extract_item::<LokiRawItem>(content_type, bytes)? {
+            let mut row = init_row(
+                schema_info.schema.len(),
+                loki_row.ts,
+                loki_row.line,
+                loki_row.structured_metadata,
+            );
+            process_labels(&mut schema_info, &mut row, loki_row.labels);
+            rows.push(row);
+        }
+
+        let schemas = schema_info.schema;
+        // fill Null for missing values
+        for row in rows.iter_mut() {
+            row.resize(schemas.len(), GreptimeValue::default());
+        }
+        let rows = Rows {
+            rows: rows.into_iter().map(|values| Row { values }).collect(),
+            schema: schemas,
+        };
+        let ins_req = RowInsertRequest {
+            table_name,
+            rows: Some(rows),
+        };
+
+        ContextReq::default_opt_with_reqs(vec![ins_req])
+    };
+
+    let mut outputs = Vec::with_capacity(ctx_req.map_len());
+    for (temp_ctx, req) in ctx_req.as_req_iter(ctx) {
+        let output = handler.insert(req, temp_ctx).await;
+
+        if let Ok(Output {
+            data: OutputData::AffectedRows(rows),
+            meta: _,
+        }) = &output
+        {
+            METRIC_LOKI_LOGS_INGESTION_COUNTER
+                .with_label_values(&[db_str])
+                .inc_by(*rows as u64);
+            METRIC_LOKI_LOGS_INGESTION_ELAPSED
+                .with_label_values(&[db_str, METRIC_SUCCESS_VALUE])
+                .observe(exec_timer.elapsed().as_secs_f64());
+        } else {
+            METRIC_LOKI_LOGS_INGESTION_ELAPSED
+                .with_label_values(&[db_str, METRIC_FAILURE_VALUE])
+                .observe(exec_timer.elapsed().as_secs_f64());
+        }
+        outputs.push(output);
     }
 
-    let response = GreptimedbV1Response::from_output(vec![output])
+    let response = GreptimedbV1Response::from_output(outputs)
         .await
         .with_execution_time(exec_timer.elapsed().as_millis() as u64);
     Ok(response)
 }
 
-async fn handle_json_req(
-    bytes: Bytes,
-    schemas: &mut Vec<ColumnSchema>,
-) -> Result<Vec<Vec<GreptimeValue>>> {
-    let mut column_indexer: HashMap<String, u16> = HashMap::new();
-    column_indexer.insert(GREPTIME_TIMESTAMP.to_string(), 0);
-    column_indexer.insert(LOKI_LINE_COLUMN.to_string(), 1);
-
-    let payload: serde_json::Value =
-        serde_json::from_slice(bytes.as_ref()).context(ParseJsonSnafu)?;
-
-    let streams = payload
-        .get(STREAMS_KEY)
-        .context(InvalidLokiPayloadSnafu {
-            msg: "missing streams",
-        })?
-        .as_array()
-        .context(InvalidLokiPayloadSnafu {
-            msg: "streams is not an array",
-        })?;
-
-    let mut rows = Vec::with_capacity(1000);
-
-    for (stream_index, stream) in streams.iter().enumerate() {
-        // parse lines first
-        // do not use `?` in case there are multiple streams
-        let lines = unwrap_or_warn_continue!(
-            stream.get(LINES_KEY),
-            "missing values on stream {}",
-            stream_index
-        );
-        let lines = unwrap_or_warn_continue!(
-            lines.as_array(),
-            "values is not an array on stream {}",
-            stream_index
-        );
-
-        // get labels
-        let labels = stream
-            .get(LABEL_KEY)
-            .and_then(|label| label.as_object())
-            .map(|l| {
-                l.iter()
-                    .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())))
-                    .collect::<BTreeMap<String, String>>()
-            });
-
-        // process each line
-        for (line_index, line) in lines.iter().enumerate() {
-            let line = unwrap_or_warn_continue!(
-                line.as_array(),
-                "missing line on stream {} index {}",
-                stream_index,
-                line_index
-            );
-            if line.len() < 2 {
-                warn!(
-                    "line on stream {} index {} is too short",
-                    stream_index, line_index
-                );
-                continue;
-            }
-            // get ts
-            let ts = unwrap_or_warn_continue!(
-                line.first()
-                    .and_then(|ts| ts.as_str())
-                    .and_then(|ts| ts.parse::<i64>().ok()),
-                "missing or invalid timestamp on stream {} index {}",
-                stream_index,
-                line_index
-            );
-            // get line
-            let line_text = unwrap_or_warn_continue!(
-                line.get(1)
-                    .and_then(|line| line.as_str())
-                    .map(|line| line.to_string()),
-                "missing or invalid line on stream {} index {}",
-                stream_index,
-                line_index
-            );
-
-            let structured_metadata = match line.get(2) {
-                Some(sdata) if sdata.is_object() => sdata
-                    .as_object()
-                    .unwrap()
-                    .iter()
-                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), Value::String(s.into()))))
-                    .collect(),
-                _ => BTreeMap::new(),
-            };
-            let structured_metadata = Value::Object(structured_metadata);
-
-            let mut row = init_row(schemas.len(), ts, line_text, structured_metadata);
-
-            process_labels(&mut column_indexer, schemas, &mut row, labels.as_ref());
-
-            rows.push(row);
-        }
-    }
-
-    Ok(rows)
+/// This is the holder of the loki lines parsed from json or protobuf.
+/// The generic here is either [VrlValue] or [Vec<LabelPairAdapter>].
+/// Depending on the target destination, this can be converted to [LokiRawItem] or [LokiPipeline].
+pub struct LokiMiddleItem<T> {
+    pub ts: i64,
+    pub line: String,
+    pub structured_metadata: Option<T>,
+    pub labels: Option<BTreeMap<String, String>>,
 }
 
-async fn handle_pb_req(
-    bytes: Bytes,
-    schemas: &mut Vec<ColumnSchema>,
-) -> Result<Vec<Vec<GreptimeValue>>> {
-    let decompressed = prom_store::snappy_decompress(&bytes).unwrap();
-    let req = loki_proto::logproto::PushRequest::decode(&decompressed[..])
-        .context(DecodeOtlpRequestSnafu)?;
+/// This is the line item for the Loki raw ingestion.
+/// We'll persist the line in its whole, set labels into tags,
+/// and structured metadata into a big JSON.
+pub struct LokiRawItem {
+    pub ts: i64,
+    pub line: String,
+    pub structured_metadata: Vec<u8>,
+    pub labels: Option<BTreeMap<String, String>>,
+}
 
-    let mut column_indexer: HashMap<String, u16> = HashMap::new();
-    column_indexer.insert(GREPTIME_TIMESTAMP.to_string(), 0);
-    column_indexer.insert(LOKI_LINE_COLUMN.to_string(), 1);
+/// This is the line item prepared for the pipeline engine.
+pub struct LokiPipeline {
+    pub map: VrlValue,
+}
 
-    let cnt = req.streams.iter().map(|s| s.entries.len()).sum::<usize>();
-    let mut rows = Vec::with_capacity(cnt);
+/// This is the flow of the Loki ingestion.
+/// +--------+
+/// | bytes  |
+/// +--------+
+///     |
+/// +----------------------+----------------------+
+/// |                      |                      |
+/// |   JSON content type  |   PB content type    |
+/// +----------------------+----------------------+
+/// |                      |                      |
+/// | JsonStreamItem       | PbStreamItem         |
+/// | stream: serde_json   | stream: adapter      |
+/// +----------------------+----------------------+
+/// |                      |                      |
+/// | MiddleItem<serde_json> | MiddleItem<entry>  |
+/// +----------------------+----------------------+
+///           \                  /
+///            \                /
+///             \              /
+///         +----------------------+
+///         |   MiddleItem<T>      |
+///         +----------------------+
+///                 |
+///     +----------------+----------------+
+///     |                                 |
+/// +------------------+         +---------------------+
+/// |   LokiRawItem    |         |  LokiPipelineItem   |
+/// +------------------+         +---------------------+
+///           |                             |
+/// +------------------+         +---------------------+
+/// |   Loki ingest    |         |   run_pipeline      |
+/// +------------------+         +---------------------+
+fn extract_item<T>(content_type: ContentType, bytes: Bytes) -> Result<Box<dyn Iterator<Item = T>>>
+where
+    LokiMiddleItem<VrlValue>: Into<T>,
+    LokiMiddleItem<Vec<LabelPairAdapter>>: Into<T>,
+{
+    match content_type {
+        x if x == *JSON_CONTENT_TYPE => Ok(Box::new(
+            LokiJsonParser::from_bytes(bytes)?.flat_map(|item| item.into_iter().map(|i| i.into())),
+        )),
+        x if x == *PB_CONTENT_TYPE => Ok(Box::new(
+            LokiPbParser::from_bytes(bytes)?.flat_map(|item| item.into_iter().map(|i| i.into())),
+        )),
+        _ => UnsupportedContentTypeSnafu { content_type }.fail(),
+    }
+}
 
-    for stream in req.streams {
+struct LokiJsonParser {
+    pub streams: VecDeque<VrlValue>,
+}
+
+impl LokiJsonParser {
+    pub fn from_bytes(bytes: Bytes) -> Result<Self> {
+        let payload: VrlValue = serde_json::from_slice(bytes.as_ref()).context(ParseJsonSnafu)?;
+
+        let VrlValue::Object(mut map) = payload else {
+            return InvalidLokiPayloadSnafu {
+                msg: "payload is not an object",
+            }
+            .fail();
+        };
+
+        let streams = map.remove(STREAMS_KEY).context(InvalidLokiPayloadSnafu {
+            msg: "missing streams",
+        })?;
+
+        let VrlValue::Array(streams) = streams else {
+            return InvalidLokiPayloadSnafu {
+                msg: "streams is not an array",
+            }
+            .fail();
+        };
+
+        Ok(Self {
+            streams: streams.into(),
+        })
+    }
+}
+
+impl Iterator for LokiJsonParser {
+    type Item = JsonStreamItem;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(stream) = self.streams.pop_front() {
+            // get lines from the map
+            let VrlValue::Object(mut map) = stream else {
+                warn!("stream is not an object, {:?}", stream);
+                continue;
+            };
+            let Some(lines) = map.remove(LINES_KEY) else {
+                warn!("missing lines on stream, {:?}", map);
+                continue;
+            };
+            let VrlValue::Array(lines) = lines else {
+                warn!("lines is not an array, {:?}", lines);
+                continue;
+            };
+
+            // get labels
+            let labels = map
+                .remove(LABEL_KEY)
+                .and_then(|m| match m {
+                    VrlValue::Object(labels) => Some(labels),
+                    _ => None,
+                })
+                .map(|m| {
+                    m.into_iter()
+                        .filter_map(|(k, v)| match v {
+                            VrlValue::Bytes(v) => {
+                                Some((k.into(), String::from_utf8_lossy(&v).to_string()))
+                            }
+                            _ => None,
+                        })
+                        .collect::<BTreeMap<String, String>>()
+                });
+
+            return Some(JsonStreamItem {
+                lines: lines.into(),
+                labels,
+            });
+        }
+        None
+    }
+}
+
+struct JsonStreamItem {
+    pub lines: VecDeque<VrlValue>,
+    pub labels: Option<BTreeMap<String, String>>,
+}
+
+impl Iterator for JsonStreamItem {
+    type Item = LokiMiddleItem<VrlValue>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(line) = self.lines.pop_front() {
+            let VrlValue::Array(line) = line else {
+                warn!("line is not an array, {:?}", line);
+                continue;
+            };
+            if line.len() < 2 {
+                warn!("line is too short, {:?}", line);
+                continue;
+            }
+            let mut line: VecDeque<VrlValue> = line.into();
+
+            // get ts
+            let ts = line.pop_front().and_then(|ts| match ts {
+                VrlValue::Bytes(ts) => String::from_utf8_lossy(&ts).parse::<i64>().ok(),
+                _ => {
+                    warn!("missing or invalid timestamp, {:?}", ts);
+                    None
+                }
+            });
+            let Some(ts) = ts else {
+                continue;
+            };
+
+            let line_text = line.pop_front().and_then(|l| match l {
+                VrlValue::Bytes(l) => Some(String::from_utf8_lossy(&l).to_string()),
+                _ => {
+                    warn!("missing or invalid line, {:?}", l);
+                    None
+                }
+            });
+            let Some(line_text) = line_text else {
+                continue;
+            };
+
+            let structured_metadata = line.pop_front();
+
+            return Some(LokiMiddleItem {
+                ts,
+                line: line_text,
+                structured_metadata,
+                labels: self.labels.clone(),
+            });
+        }
+        None
+    }
+}
+
+impl From<LokiMiddleItem<VrlValue>> for LokiRawItem {
+    fn from(val: LokiMiddleItem<VrlValue>) -> Self {
+        let LokiMiddleItem {
+            ts,
+            line,
+            structured_metadata,
+            labels,
+        } = val;
+
+        let structured_metadata = structured_metadata
+            .and_then(|m| match m {
+                VrlValue::Object(m) => Some(m),
+                _ => None,
+            })
+            .map(|m| {
+                m.into_iter()
+                    .filter_map(|(k, v)| match v {
+                        VrlValue::Bytes(bytes) => Some((
+                            k.into(),
+                            Value::String(String::from_utf8_lossy(&bytes).to_string().into()),
+                        )),
+                        _ => None,
+                    })
+                    .collect::<BTreeMap<String, Value>>()
+            })
+            .unwrap_or_default();
+        let structured_metadata = Value::Object(structured_metadata).to_vec();
+
+        LokiRawItem {
+            ts,
+            line,
+            structured_metadata,
+            labels,
+        }
+    }
+}
+
+impl From<LokiMiddleItem<VrlValue>> for LokiPipeline {
+    fn from(value: LokiMiddleItem<VrlValue>) -> Self {
+        let LokiMiddleItem {
+            ts,
+            line,
+            structured_metadata,
+            labels,
+        } = value;
+
+        let mut map = BTreeMap::new();
+        map.insert(
+            KeyString::from(GREPTIME_TIMESTAMP),
+            VrlValue::Timestamp(DateTime::from_timestamp_nanos(ts)),
+        );
+        map.insert(
+            KeyString::from(LOKI_LINE_COLUMN_NAME),
+            VrlValue::Bytes(line.into()),
+        );
+
+        if let Some(VrlValue::Object(m)) = structured_metadata {
+            for (k, v) in m {
+                map.insert(
+                    KeyString::from(format!("{}{}", LOKI_PIPELINE_METADATA_PREFIX, k)),
+                    v,
+                );
+            }
+        }
+        if let Some(v) = labels {
+            v.into_iter().for_each(|(k, v)| {
+                map.insert(
+                    KeyString::from(format!("{}{}", LOKI_PIPELINE_LABEL_PREFIX, k)),
+                    VrlValue::Bytes(v.into()),
+                );
+            });
+        }
+
+        LokiPipeline {
+            map: VrlValue::Object(map),
+        }
+    }
+}
+
+pub struct LokiPbParser {
+    pub streams: VecDeque<loki_proto::logproto::StreamAdapter>,
+}
+
+impl LokiPbParser {
+    pub fn from_bytes(bytes: Bytes) -> Result<Self> {
+        let decompressed = prom_store::snappy_decompress(&bytes).unwrap();
+        let req = loki_proto::logproto::PushRequest::decode(&decompressed[..])
+            .context(DecodeOtlpRequestSnafu)?;
+
+        Ok(Self {
+            streams: req.streams.into(),
+        })
+    }
+}
+
+impl Iterator for LokiPbParser {
+    type Item = PbStreamItem;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let stream = self.streams.pop_front()?;
+
         let labels = parse_loki_labels(&stream.labels)
             .inspect_err(|e| {
-                error!(e; "failed to parse loki labels");
+                error!(e; "failed to parse loki labels, {:?}", stream.labels);
             })
             .ok();
 
-        // process entries
-        for entry in stream.entries {
+        Some(PbStreamItem {
+            entries: stream.entries.into(),
+            labels,
+        })
+    }
+}
+
+pub struct PbStreamItem {
+    pub entries: VecDeque<loki_proto::logproto::EntryAdapter>,
+    pub labels: Option<BTreeMap<String, String>>,
+}
+
+impl Iterator for PbStreamItem {
+    type Item = LokiMiddleItem<Vec<LabelPairAdapter>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(entry) = self.entries.pop_front() {
             let ts = if let Some(ts) = entry.timestamp {
                 ts
             } else {
+                warn!("missing timestamp, {:?}", entry);
                 continue;
             };
             let line = entry.line;
 
-            let structured_metadata = entry
-                .structured_metadata
-                .into_iter()
-                .map(|d| (d.name, Value::String(d.value.into())))
-                .collect::<BTreeMap<String, Value>>();
-            let structured_metadata = Value::Object(structured_metadata);
+            let structured_metadata = entry.structured_metadata;
 
-            let mut row = init_row(
-                schemas.len(),
-                prost_ts_to_nano(&ts),
+            return Some(LokiMiddleItem {
+                ts: prost_ts_to_nano(&ts),
                 line,
-                structured_metadata,
-            );
+                structured_metadata: Some(structured_metadata),
+                labels: self.labels.clone(),
+            });
+        }
+        None
+    }
+}
 
-            process_labels(&mut column_indexer, schemas, &mut row, labels.as_ref());
+impl From<LokiMiddleItem<Vec<LabelPairAdapter>>> for LokiRawItem {
+    fn from(val: LokiMiddleItem<Vec<LabelPairAdapter>>) -> Self {
+        let LokiMiddleItem {
+            ts,
+            line,
+            structured_metadata,
+            labels,
+        } = val;
 
-            rows.push(row);
+        let structured_metadata = structured_metadata
+            .unwrap_or_default()
+            .into_iter()
+            .map(|d| (d.name, Value::String(d.value.into())))
+            .collect::<BTreeMap<String, Value>>();
+        let structured_metadata = Value::Object(structured_metadata).to_vec();
+
+        LokiRawItem {
+            ts,
+            line,
+            structured_metadata,
+            labels,
         }
     }
+}
 
-    Ok(rows)
+impl From<LokiMiddleItem<Vec<LabelPairAdapter>>> for LokiPipeline {
+    fn from(value: LokiMiddleItem<Vec<LabelPairAdapter>>) -> Self {
+        let LokiMiddleItem {
+            ts,
+            line,
+            structured_metadata,
+            labels,
+        } = value;
+
+        let mut map = BTreeMap::new();
+        map.insert(
+            KeyString::from(GREPTIME_TIMESTAMP),
+            VrlValue::Timestamp(DateTime::from_timestamp_nanos(ts)),
+        );
+        map.insert(
+            KeyString::from(LOKI_LINE_COLUMN_NAME),
+            VrlValue::Bytes(line.into()),
+        );
+
+        structured_metadata
+            .unwrap_or_default()
+            .into_iter()
+            .for_each(|d| {
+                map.insert(
+                    KeyString::from(format!("{}{}", LOKI_PIPELINE_METADATA_PREFIX, d.name)),
+                    VrlValue::Bytes(d.value.into()),
+                );
+            });
+
+        if let Some(v) = labels {
+            v.into_iter().for_each(|(k, v)| {
+                map.insert(
+                    KeyString::from(format!("{}{}", LOKI_PIPELINE_LABEL_PREFIX, k)),
+                    VrlValue::Bytes(v.into()),
+                );
+            });
+        }
+
+        LokiPipeline {
+            map: VrlValue::Object(map),
+        }
+    }
 }
 
 /// since we're hand-parsing the labels, if any error is encountered, we'll just skip the label
@@ -345,7 +650,7 @@ pub fn parse_loki_labels(labels: &str) -> Result<BTreeMap<String, String>> {
 
     while !labels.is_empty() {
         // parse key
-        let first_index = labels.find("=").context(InvalidLokiLabelsSnafu {
+        let first_index = labels.find("=").with_context(|| InvalidLokiLabelsSnafu {
             msg: format!("missing `=` near: {}", labels),
         })?;
         let key = &labels[..first_index];
@@ -390,7 +695,7 @@ pub fn parse_loki_labels(labels: &str) -> Result<BTreeMap<String, String>> {
 }
 
 #[inline]
-fn prost_ts_to_nano(ts: &Timestamp) -> i64 {
+fn prost_ts_to_nano(ts: &LokiTimestamp) -> i64 {
     ts.seconds * 1_000_000_000 + ts.nanos as i64
 }
 
@@ -398,7 +703,7 @@ fn init_row(
     schema_len: usize,
     ts: i64,
     line: String,
-    structured_metadata: Value,
+    structured_metadata: Vec<u8>,
 ) -> Vec<GreptimeValue> {
     // create and init row
     let mut row = Vec::with_capacity(schema_len);
@@ -410,7 +715,7 @@ fn init_row(
         value_data: Some(ValueData::StringValue(line)),
     });
     row.push(GreptimeValue {
-        value_data: Some(ValueData::BinaryValue(structured_metadata.to_vec())),
+        value_data: Some(ValueData::BinaryValue(structured_metadata)),
     });
     for _ in 0..(schema_len - 3) {
         row.push(GreptimeValue { value_data: None });
@@ -419,22 +724,24 @@ fn init_row(
 }
 
 fn process_labels(
-    column_indexer: &mut HashMap<String, u16>,
-    schemas: &mut Vec<ColumnSchema>,
+    schema_info: &mut SchemaInfo,
     row: &mut Vec<GreptimeValue>,
-    labels: Option<&BTreeMap<String, String>>,
+    labels: Option<BTreeMap<String, String>>,
 ) {
     let Some(labels) = labels else {
         return;
     };
 
+    let column_indexer = &mut schema_info.index;
+    let schemas = &mut schema_info.schema;
+
     // insert labels
     for (k, v) in labels {
-        if let Some(index) = column_indexer.get(k) {
+        if let Some(index) = column_indexer.get(&k) {
             // exist in schema
             // insert value using index
-            row[*index as usize] = GreptimeValue {
-                value_data: Some(ValueData::StringValue(v.clone())),
+            row[*index] = GreptimeValue {
+                value_data: Some(ValueData::StringValue(v)),
             };
         } else {
             // not exist
@@ -446,34 +753,13 @@ fn process_labels(
                 datatype_extension: None,
                 options: None,
             });
-            column_indexer.insert(k.clone(), (schemas.len() - 1) as u16);
+            column_indexer.insert(k, schemas.len() - 1);
 
             row.push(GreptimeValue {
-                value_data: Some(ValueData::StringValue(v.clone())),
+                value_data: Some(ValueData::StringValue(v)),
             });
         }
     }
-}
-
-#[macro_export]
-macro_rules! unwrap_or_warn_continue {
-    ($expr:expr, $msg:expr) => {
-        if let Some(value) = $expr {
-            value
-        } else {
-            warn!($msg);
-            continue;
-        }
-    };
-
-    ($expr:expr, $fmt:expr, $($arg:tt)*) => {
-        if let Some(value) = $expr {
-            value
-        } else {
-            warn!($fmt, $($arg)*);
-            continue;
-        }
-    };
 }
 
 #[cfg(test)]

@@ -17,8 +17,10 @@ use std::time::Duration;
 use common_base::readable_size::ReadableSize;
 use serde::{Deserialize, Serialize};
 
-use super::common::KafkaConnectionConfig;
-use crate::config::kafka::common::{backoff_prefix, BackoffConfig, KafkaTopicConfig};
+use crate::config::kafka::common::{
+    KafkaConnectionConfig, KafkaTopicConfig, DEFAULT_AUTO_PRUNE_INTERVAL,
+    DEFAULT_AUTO_PRUNE_PARALLELISM, DEFAULT_TRIGGER_FLUSH_THRESHOLD,
+};
 
 /// Kafka wal configurations for datanode.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -34,9 +36,6 @@ pub struct DatanodeKafkaConfig {
     /// The consumer wait timeout.
     #[serde(with = "humantime_serde")]
     pub consumer_wait_timeout: Duration,
-    /// The backoff config.
-    #[serde(flatten, with = "backoff_prefix")]
-    pub backoff: BackoffConfig,
     /// The kafka topic config.
     #[serde(flatten)]
     pub kafka_topic: KafkaTopicConfig,
@@ -48,6 +47,14 @@ pub struct DatanodeKafkaConfig {
     pub dump_index_interval: Duration,
     /// Ignore missing entries during read WAL.
     pub overwrite_entry_start_id: bool,
+    // Interval of WAL pruning.
+    #[serde(with = "humantime_serde")]
+    pub auto_prune_interval: Duration,
+    // Threshold for sending flush request when pruning remote WAL.
+    // `None` stands for never sending flush request.
+    pub trigger_flush_threshold: u64,
+    // Limit of concurrent active pruning procedures.
+    pub auto_prune_parallelism: usize,
 }
 
 impl Default for DatanodeKafkaConfig {
@@ -57,12 +64,14 @@ impl Default for DatanodeKafkaConfig {
             // Warning: Kafka has a default limit of 1MB per message in a topic.
             max_batch_bytes: ReadableSize::mb(1),
             consumer_wait_timeout: Duration::from_millis(100),
-            backoff: BackoffConfig::default(),
             kafka_topic: KafkaTopicConfig::default(),
             auto_create_topics: true,
             create_index: true,
             dump_index_interval: Duration::from_secs(60),
             overwrite_entry_start_id: false,
+            auto_prune_interval: DEFAULT_AUTO_PRUNE_INTERVAL,
+            trigger_flush_threshold: DEFAULT_TRIGGER_FLUSH_THRESHOLD,
+            auto_prune_parallelism: DEFAULT_AUTO_PRUNE_PARALLELISM,
         }
     }
 }

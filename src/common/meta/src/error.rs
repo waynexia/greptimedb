@@ -18,6 +18,7 @@ use std::sync::Arc;
 use common_error::ext::{BoxedError, ErrorExt};
 use common_error::status_code::StatusCode;
 use common_macro::stack_trace_debug;
+use common_procedure::ProcedureId;
 use common_wal::options::WalOptions;
 use serde_json::error::Error as JsonError;
 use snafu::{Location, Snafu};
@@ -136,6 +137,21 @@ pub enum Error {
     #[snafu(display("Unsupported operation {}", operation))]
     Unsupported {
         operation: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Failed to get procedure state receiver, procedure id: {procedure_id}"))]
+    ProcedureStateReceiver {
+        procedure_id: ProcedureId,
+        #[snafu(implicit)]
+        location: Location,
+        source: common_procedure::Error,
+    },
+
+    #[snafu(display("Procedure state receiver not found: {procedure_id}"))]
+    ProcedureStateReceiverNotFound {
+        procedure_id: ProcedureId,
         #[snafu(implicit)]
         location: Location,
     },
@@ -387,6 +403,13 @@ pub enum Error {
         location: Location,
     },
 
+    #[snafu(display("Catalog not found, catalog: {}", catalog))]
+    CatalogNotFound {
+        catalog: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("Invalid metadata, err: {}", err_msg))]
     InvalidMetadata {
         err_msg: String,
@@ -397,6 +420,13 @@ pub enum Error {
     #[snafu(display("Invalid view info, err: {}", err_msg))]
     InvalidViewInfo {
         err_msg: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Invalid flow request body: {:?}", body))]
+    InvalidFlowRequestBody {
+        body: Box<Option<api::v1::flow::flow_request::Body>>,
         #[snafu(implicit)]
         location: Location,
     },
@@ -447,7 +477,18 @@ pub enum Error {
     },
 
     #[snafu(display("Retry later"))]
-    RetryLater { source: BoxedError },
+    RetryLater {
+        source: BoxedError,
+        clean_poisons: bool,
+    },
+
+    #[snafu(display("Abort procedure"))]
+    AbortProcedure {
+        #[snafu(implicit)]
+        location: Location,
+        source: BoxedError,
+        clean_poisons: bool,
+    },
 
     #[snafu(display(
         "Failed to encode a wal options to json string, wal_options: {:?}",
@@ -499,11 +540,25 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to build a Kafka partition client, topic: {}, partition: {}",
+        "Failed to get a Kafka partition client, topic: {}, partition: {}",
         topic,
         partition
     ))]
-    BuildKafkaPartitionClient {
+    KafkaPartitionClient {
+        topic: String,
+        partition: i32,
+        #[snafu(implicit)]
+        location: Location,
+        #[snafu(source)]
+        error: rskafka::client::error::Error,
+    },
+
+    #[snafu(display(
+        "Failed to get offset from Kafka, topic: {}, partition: {}",
+        topic,
+        partition
+    ))]
+    KafkaGetOffset {
         topic: String,
         partition: i32,
         #[snafu(implicit)]
@@ -686,6 +741,61 @@ pub enum Error {
     },
 
     #[cfg(feature = "pg_kvbackend")]
+    #[snafu(display("Failed to setup PostgreSQL TLS configuration: {}", reason))]
+    PostgresTlsConfig {
+        reason: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[cfg(feature = "pg_kvbackend")]
+    #[snafu(display("Failed to load TLS certificate from path: {}", path))]
+    LoadTlsCertificate {
+        path: String,
+        #[snafu(source)]
+        error: std::io::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[cfg(feature = "pg_kvbackend")]
+    #[snafu(display("Invalid TLS configuration: {}", reason))]
+    InvalidTlsConfig {
+        reason: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[cfg(feature = "mysql_kvbackend")]
+    #[snafu(display("Failed to execute via MySql, sql: {}", sql))]
+    MySqlExecution {
+        sql: String,
+        #[snafu(source)]
+        error: sqlx::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[cfg(feature = "mysql_kvbackend")]
+    #[snafu(display("Failed to create connection pool for MySql"))]
+    CreateMySqlPool {
+        #[snafu(source)]
+        error: sqlx::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[cfg(feature = "mysql_kvbackend")]
+    #[snafu(display("Failed to {} MySql transaction", operation))]
+    MySqlTransaction {
+        #[snafu(source)]
+        error: sqlx::Error,
+        #[snafu(implicit)]
+        location: Location,
+        operation: String,
+    },
+
+    #[cfg(any(feature = "pg_kvbackend", feature = "mysql_kvbackend"))]
     #[snafu(display("Rds transaction retry failed"))]
     RdsTransactionRetryFailed {
         #[snafu(implicit)]
@@ -719,6 +829,164 @@ pub enum Error {
         #[snafu(source)]
         error: serde_json::Error,
     },
+
+    #[snafu(display("No leader found for table_id: {}", table_id))]
+    NoLeader {
+        table_id: TableId,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display(
+        "Procedure poison key already exists with a different value, key: {}, value: {}",
+        key,
+        value
+    ))]
+    ProcedurePoisonConflict {
+        key: String,
+        value: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Failed to put poison, table metadata may be corrupted"))]
+    PutPoison {
+        #[snafu(implicit)]
+        location: Location,
+        #[snafu(source)]
+        source: common_procedure::error::Error,
+    },
+
+    #[snafu(display("Failed to parse timezone"))]
+    InvalidTimeZone {
+        #[snafu(implicit)]
+        location: Location,
+        #[snafu(source)]
+        error: common_time::error::Error,
+    },
+    #[snafu(display("Invalid file path: {}", file_path))]
+    InvalidFilePath {
+        #[snafu(implicit)]
+        location: Location,
+        file_path: String,
+    },
+
+    #[snafu(display("Failed to serialize flexbuffers"))]
+    SerializeFlexbuffers {
+        #[snafu(implicit)]
+        location: Location,
+        #[snafu(source)]
+        error: flexbuffers::SerializationError,
+    },
+
+    #[snafu(display("Failed to deserialize flexbuffers"))]
+    DeserializeFlexbuffers {
+        #[snafu(implicit)]
+        location: Location,
+        #[snafu(source)]
+        error: flexbuffers::DeserializationError,
+    },
+
+    #[snafu(display("Failed to read flexbuffers"))]
+    ReadFlexbuffers {
+        #[snafu(implicit)]
+        location: Location,
+        #[snafu(source)]
+        error: flexbuffers::ReaderError,
+    },
+
+    #[snafu(display("Invalid file name: {}", reason))]
+    InvalidFileName {
+        #[snafu(implicit)]
+        location: Location,
+        reason: String,
+    },
+
+    #[snafu(display("Invalid file extension: {}", reason))]
+    InvalidFileExtension {
+        #[snafu(implicit)]
+        location: Location,
+        reason: String,
+    },
+
+    #[snafu(display("Failed to write object, file path: {}", file_path))]
+    WriteObject {
+        #[snafu(implicit)]
+        location: Location,
+        file_path: String,
+        #[snafu(source)]
+        error: object_store::Error,
+    },
+
+    #[snafu(display("Failed to read object, file path: {}", file_path))]
+    ReadObject {
+        #[snafu(implicit)]
+        location: Location,
+        file_path: String,
+        #[snafu(source)]
+        error: object_store::Error,
+    },
+
+    #[snafu(display("Missing column ids"))]
+    MissingColumnIds {
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display(
+        "Missing column in column metadata: {}, table: {}, table_id: {}",
+        column_name,
+        table_name,
+        table_id,
+    ))]
+    MissingColumnInColumnMetadata {
+        column_name: String,
+        #[snafu(implicit)]
+        location: Location,
+        table_name: String,
+        table_id: TableId,
+    },
+
+    #[snafu(display(
+        "Mismatch column id: column_name: {}, column_id: {}, table: {}, table_id: {}",
+        column_name,
+        column_id,
+        table_name,
+        table_id,
+    ))]
+    MismatchColumnId {
+        column_name: String,
+        column_id: u32,
+        #[snafu(implicit)]
+        location: Location,
+        table_name: String,
+        table_id: TableId,
+    },
+
+    #[snafu(display("Failed to convert column def, column: {}", column))]
+    ConvertColumnDef {
+        column: String,
+        #[snafu(implicit)]
+        location: Location,
+        source: api::error::Error,
+    },
+
+    #[snafu(display("Failed to convert time ranges"))]
+    ConvertTimeRanges {
+        #[snafu(implicit)]
+        location: Location,
+        source: api::error::Error,
+    },
+
+    #[snafu(display(
+        "Column metadata inconsistencies found in table: {}, table_id: {}",
+        table_name,
+        table_id
+    ))]
+    ColumnMetadataConflicts {
+        table_name: String,
+        table_id: TableId,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -737,9 +1005,17 @@ impl ErrorExt for Error {
             | SerializeToJson { .. }
             | DeserializeFromJson { .. } => StatusCode::Internal,
 
-            ValueNotExist { .. } => StatusCode::Unexpected,
+            NoLeader { .. } => StatusCode::TableUnavailable,
+            ValueNotExist { .. }
+            | ProcedurePoisonConflict { .. }
+            | ProcedureStateReceiverNotFound { .. }
+            | MissingColumnIds { .. }
+            | MissingColumnInColumnMetadata { .. }
+            | MismatchColumnId { .. }
+            | ColumnMetadataConflicts { .. } => StatusCode::Unexpected,
 
             Unsupported { .. } => StatusCode::Unsupported,
+            WriteObject { .. } | ReadObject { .. } => StatusCode::StorageUnavailable,
 
             SerdeJson { .. }
             | ParseOption { .. }
@@ -763,7 +1039,7 @@ impl ErrorExt for Error {
             | EncodeWalOptions { .. }
             | BuildKafkaClient { .. }
             | BuildKafkaCtrlClient { .. }
-            | BuildKafkaPartitionClient { .. }
+            | KafkaPartitionClient { .. }
             | ResolveKafkaEndpoint { .. }
             | ProduceRecord { .. }
             | CreateKafkaWalTopic { .. }
@@ -772,7 +1048,12 @@ impl ErrorExt for Error {
             | ProcedureOutput { .. }
             | FromUtf8 { .. }
             | MetadataCorruption { .. }
-            | ParseWalOptions { .. } => StatusCode::Unexpected,
+            | ParseWalOptions { .. }
+            | KafkaGetOffset { .. }
+            | ReadFlexbuffers { .. }
+            | SerializeFlexbuffers { .. }
+            | DeserializeFlexbuffers { .. }
+            | ConvertTimeRanges { .. } => StatusCode::Unexpected,
 
             SendMessage { .. } | GetKvCache { .. } | CacheNotGet { .. } => StatusCode::Internal,
 
@@ -788,7 +1069,12 @@ impl ErrorExt for Error {
             | TlsConfig { .. }
             | InvalidSetDatabaseOption { .. }
             | InvalidUnsetDatabaseOption { .. }
-            | InvalidTopicNamePrefix { .. } => StatusCode::InvalidArguments,
+            | InvalidTopicNamePrefix { .. }
+            | InvalidTimeZone { .. }
+            | InvalidFileExtension { .. }
+            | InvalidFileName { .. }
+            | InvalidFilePath { .. } => StatusCode::InvalidArguments,
+            InvalidFlowRequestBody { .. } => StatusCode::InvalidArguments,
 
             FlowNotFound { .. } => StatusCode::FlowNotFound,
             FlowRouteNotFound { .. } => StatusCode::Unexpected,
@@ -808,11 +1094,16 @@ impl ErrorExt for Error {
             OperateDatanode { source, .. } => source.status_code(),
             Table { source, .. } => source.status_code(),
             RetryLater { source, .. } => source.status_code(),
+            AbortProcedure { source, .. } => source.status_code(),
             ConvertAlterTableRequest { source, .. } => source.status_code(),
+            PutPoison { source, .. } => source.status_code(),
+            ConvertColumnDef { source, .. } => source.status_code(),
+            ProcedureStateReceiver { source, .. } => source.status_code(),
 
             ParseProcedureId { .. }
             | InvalidNumTopics { .. }
             | SchemaNotFound { .. }
+            | CatalogNotFound { .. }
             | InvalidNodeInfoKey { .. }
             | InvalidStatKey { .. }
             | ParseNum { .. }
@@ -824,8 +1115,16 @@ impl ErrorExt for Error {
             | CreatePostgresPool { .. }
             | GetPostgresConnection { .. }
             | PostgresTransaction { .. }
-            | RdsTransactionRetryFailed { .. } => StatusCode::Internal,
-            Error::DatanodeTableInfoNotFound { .. } => StatusCode::Internal,
+            | PostgresTlsConfig { .. }
+            | LoadTlsCertificate { .. }
+            | InvalidTlsConfig { .. } => StatusCode::Internal,
+            #[cfg(feature = "mysql_kvbackend")]
+            MySqlExecution { .. } | CreateMySqlPool { .. } | MySqlTransaction { .. } => {
+                StatusCode::Internal
+            }
+            #[cfg(any(feature = "pg_kvbackend", feature = "mysql_kvbackend"))]
+            RdsTransactionRetryFailed { .. } => StatusCode::Internal,
+            DatanodeTableInfoNotFound { .. } => StatusCode::Internal,
         }
     }
 
@@ -835,15 +1134,28 @@ impl ErrorExt for Error {
 }
 
 impl Error {
-    #[cfg(feature = "pg_kvbackend")]
+    #[cfg(any(feature = "pg_kvbackend", feature = "mysql_kvbackend"))]
     /// Check if the error is a serialization error.
     pub fn is_serialization_error(&self) -> bool {
         match self {
+            #[cfg(feature = "pg_kvbackend")]
             Error::PostgresTransaction { error, .. } => {
                 error.code() == Some(&tokio_postgres::error::SqlState::T_R_SERIALIZATION_FAILURE)
             }
+            #[cfg(feature = "pg_kvbackend")]
             Error::PostgresExecution { error, .. } => {
                 error.code() == Some(&tokio_postgres::error::SqlState::T_R_SERIALIZATION_FAILURE)
+            }
+            #[cfg(feature = "mysql_kvbackend")]
+            Error::MySqlExecution {
+                error: sqlx::Error::Database(database_error),
+                ..
+            } => {
+                matches!(
+                    database_error.message(),
+                    "Deadlock found when trying to get lock; try restarting transaction"
+                        | "can't serialize access for this transaction"
+                )
             }
             _ => false,
         }
@@ -853,12 +1165,24 @@ impl Error {
     pub fn retry_later<E: ErrorExt + Send + Sync + 'static>(err: E) -> Error {
         Error::RetryLater {
             source: BoxedError::new(err),
+            clean_poisons: false,
         }
     }
 
     /// Determine whether it is a retry later type through [StatusCode]
     pub fn is_retry_later(&self) -> bool {
         matches!(self, Error::RetryLater { .. })
+    }
+
+    /// Determine whether it needs to clean poisons.
+    pub fn need_clean_poisons(&self) -> bool {
+        matches!(
+            self,
+            Error::AbortProcedure { clean_poisons, .. } if *clean_poisons
+        ) || matches!(
+            self,
+            Error::RetryLater { clean_poisons, .. } if *clean_poisons
+        )
     }
 
     /// Returns true if the response exceeds the size limit.

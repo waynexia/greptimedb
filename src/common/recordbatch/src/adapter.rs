@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::fmt::Display;
+use std::fmt::{self, Display};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -28,14 +29,16 @@ use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::create_physical_expr;
 use datafusion::physical_plan::metrics::{BaselineMetrics, MetricValue};
 use datafusion::physical_plan::{
-    accept, displayable, ExecutionPlan, ExecutionPlanVisitor, PhysicalExpr,
+    accept, DisplayFormatType, ExecutionPlan, ExecutionPlanVisitor, PhysicalExpr,
     RecordBatchStream as DfRecordBatchStream,
 };
 use datafusion_common::arrow::error::ArrowError;
 use datafusion_common::{DataFusionError, ToDFSchema};
 use datatypes::arrow::array::Array;
-use datatypes::schema::{Schema, SchemaRef};
+use datatypes::arrow::datatypes::DataType as ArrowDataType;
+use datatypes::schema::{ColumnExtType, Schema, SchemaRef};
 use futures::ready;
+use jsonb;
 use pin_project::pin_project;
 use snafu::ResultExt;
 
@@ -141,12 +144,9 @@ where
                 let mut columns = Vec::with_capacity(projected_schema.fields.len());
                 for (idx,field) in projected_schema.fields.iter().enumerate() {
                     let column = projected_column.column(idx);
-                    if column.data_type() != field.data_type() {
-                        let output = cast(&column, field.data_type())?;
-                        columns.push(output)
-                    } else {
-                        columns.push(column.clone())
-                    }
+                    let extype = field.metadata().get("greptime:type").and_then(|s| ColumnExtType::from_str(s).ok());
+                    let output = custom_cast(&column, field.data_type(), extype)?;
+                    columns.push(output)
                 }
                 let record_batch = DfRecordBatch::try_new(projected_schema, columns)?;
                 let record_batch = if let Some(predicate) = predicate {
@@ -206,19 +206,23 @@ impl Stream for DfRecordBatchStreamAdapter {
 }
 
 /// DataFusion [SendableRecordBatchStream](DfSendableRecordBatchStream) -> Greptime [RecordBatchStream].
-/// The reverse one is [DfRecordBatchStreamAdapter]
+/// The reverse one is [DfRecordBatchStreamAdapter].
+/// It can collect metrics from DataFusion execution plan.
 pub struct RecordBatchStreamAdapter {
     schema: SchemaRef,
     stream: DfSendableRecordBatchStream,
     metrics: Option<BaselineMetrics>,
     /// Aggregated plan-level metrics. Resolved after an [ExecutionPlan] is finished.
     metrics_2: Metrics,
+    /// Display plan and metrics in verbose mode.
+    explain_verbose: bool,
 }
 
 /// Json encoded metrics. Contains metric from a whole plan tree.
 enum Metrics {
     Unavailable,
     Unresolved(Arc<dyn ExecutionPlan>),
+    PartialResolved(Arc<dyn ExecutionPlan>, RecordBatchMetrics),
     Resolved(RecordBatchMetrics),
 }
 
@@ -231,6 +235,7 @@ impl RecordBatchStreamAdapter {
             stream,
             metrics: None,
             metrics_2: Metrics::Unavailable,
+            explain_verbose: false,
         })
     }
 
@@ -246,11 +251,17 @@ impl RecordBatchStreamAdapter {
             stream,
             metrics: Some(metrics),
             metrics_2: Metrics::Unresolved(df_plan),
+            explain_verbose: false,
         })
     }
 
     pub fn set_metrics2(&mut self, plan: Arc<dyn ExecutionPlan>) {
         self.metrics_2 = Metrics::Unresolved(plan)
+    }
+
+    /// Set the verbose mode for displaying plan and metrics.
+    pub fn set_explain_verbose(&mut self, verbose: bool) {
+        self.explain_verbose = verbose;
     }
 }
 
@@ -265,7 +276,9 @@ impl RecordBatchStream for RecordBatchStreamAdapter {
 
     fn metrics(&self) -> Option<RecordBatchMetrics> {
         match &self.metrics_2 {
-            Metrics::Resolved(metrics) => Some(metrics.clone()),
+            Metrics::Resolved(metrics) | Metrics::PartialResolved(_, metrics) => {
+                Some(metrics.clone())
+            }
             Metrics::Unavailable | Metrics::Unresolved(_) => None,
         }
     }
@@ -288,15 +301,27 @@ impl Stream for RecordBatchStreamAdapter {
         match Pin::new(&mut self.stream).poll_next(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Some(df_record_batch)) => {
-                let df_record_batch = df_record_batch.context(error::PollStreamSnafu)?;
+                let df_record_batch = df_record_batch?;
+                if let Metrics::Unresolved(df_plan) | Metrics::PartialResolved(df_plan, _) =
+                    &self.metrics_2
+                {
+                    let mut metric_collector = MetricCollector::new(self.explain_verbose);
+                    accept(df_plan.as_ref(), &mut metric_collector).unwrap();
+                    self.metrics_2 = Metrics::PartialResolved(
+                        df_plan.clone(),
+                        metric_collector.record_batch_metrics,
+                    );
+                }
                 Poll::Ready(Some(RecordBatch::try_from_df_record_batch(
                     self.schema(),
                     df_record_batch,
                 )))
             }
             Poll::Ready(None) => {
-                if let Metrics::Unresolved(df_plan) = &self.metrics_2 {
-                    let mut metric_collector = MetricCollector::default();
+                if let Metrics::Unresolved(df_plan) | Metrics::PartialResolved(df_plan, _) =
+                    &self.metrics_2
+                {
+                    let mut metric_collector = MetricCollector::new(self.explain_verbose);
                     accept(df_plan.as_ref(), &mut metric_collector).unwrap();
                     self.metrics_2 = Metrics::Resolved(metric_collector.record_batch_metrics);
                 }
@@ -312,10 +337,20 @@ impl Stream for RecordBatchStreamAdapter {
 }
 
 /// An [ExecutionPlanVisitor] to collect metrics from a [ExecutionPlan].
-#[derive(Default)]
 pub struct MetricCollector {
     current_level: usize,
     pub record_batch_metrics: RecordBatchMetrics,
+    verbose: bool,
+}
+
+impl MetricCollector {
+    pub fn new(verbose: bool) -> Self {
+        Self {
+            current_level: 0,
+            record_batch_metrics: RecordBatchMetrics::default(),
+            verbose,
+        }
+    }
 }
 
 impl ExecutionPlanVisitor for MetricCollector {
@@ -339,7 +374,7 @@ impl ExecutionPlanVisitor for MetricCollector {
             .sorted_for_display()
             .timestamps_removed();
         let mut plan_metric = PlanMetrics {
-            plan: displayable(plan).one_line().to_string(),
+            plan: one_line(plan, self.verbose).to_string(),
             level: self.current_level,
             metrics: Vec::with_capacity(metric.iter().size_hint().0),
         };
@@ -369,6 +404,29 @@ impl ExecutionPlanVisitor for MetricCollector {
         self.current_level -= 1;
         Ok(true)
     }
+}
+
+/// Returns a single-line summary of the root of the plan.
+/// If the `verbose` flag is set, it will display detailed information about the plan.
+fn one_line(plan: &dyn ExecutionPlan, verbose: bool) -> impl fmt::Display + '_ {
+    struct Wrapper<'a> {
+        plan: &'a dyn ExecutionPlan,
+        format_type: DisplayFormatType,
+    }
+
+    impl fmt::Display for Wrapper<'_> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.plan.fmt_as(self.format_type, f)?;
+            writeln!(f)
+        }
+    }
+
+    let format_type = if verbose {
+        DisplayFormatType::Verbose
+    } else {
+        DisplayFormatType::Default
+    };
+    Wrapper { plan, format_type }
 }
 
 /// [`RecordBatchMetrics`] carrys metrics value
@@ -484,11 +542,137 @@ impl Stream for AsyncRecordBatchStreamAdapter {
     }
 }
 
+/// Custom cast function that handles Map -> Binary (JSON) conversion
+fn custom_cast(
+    array: &dyn Array,
+    target_type: &ArrowDataType,
+    extype: Option<ColumnExtType>,
+) -> std::result::Result<Arc<dyn Array>, ArrowError> {
+    if let ArrowDataType::Map(_, _) = array.data_type() {
+        if let ArrowDataType::Binary = target_type {
+            return convert_map_to_json_binary(array, extype);
+        }
+    }
+
+    cast(array, target_type)
+}
+
+/// Convert a Map array to a Binary array containing JSON data
+fn convert_map_to_json_binary(
+    array: &dyn Array,
+    extype: Option<ColumnExtType>,
+) -> std::result::Result<Arc<dyn Array>, ArrowError> {
+    use datatypes::arrow::array::{BinaryArray, MapArray};
+    use serde_json::Value;
+
+    let map_array = array
+        .as_any()
+        .downcast_ref::<MapArray>()
+        .ok_or_else(|| ArrowError::CastError("Failed to downcast to MapArray".to_string()))?;
+
+    let mut json_values = Vec::with_capacity(map_array.len());
+
+    for i in 0..map_array.len() {
+        if map_array.is_null(i) {
+            json_values.push(None);
+        } else {
+            // Extract the map entry at index i
+            let map_entry = map_array.value(i);
+            let key_value_array = map_entry
+                .as_any()
+                .downcast_ref::<datatypes::arrow::array::StructArray>()
+                .ok_or_else(|| {
+                    ArrowError::CastError("Failed to downcast to StructArray".to_string())
+                })?;
+
+            // Convert to JSON object
+            let mut json_obj = serde_json::Map::with_capacity(key_value_array.len());
+
+            for j in 0..key_value_array.len() {
+                if key_value_array.is_null(j) {
+                    continue;
+                }
+                let key_field = key_value_array.column(0);
+                let value_field = key_value_array.column(1);
+
+                if key_field.is_null(j) {
+                    continue;
+                }
+
+                let key = key_field
+                    .as_any()
+                    .downcast_ref::<datatypes::arrow::array::StringArray>()
+                    .ok_or_else(|| {
+                        ArrowError::CastError("Failed to downcast key to StringArray".to_string())
+                    })?
+                    .value(j);
+
+                let value = if value_field.is_null(j) {
+                    Value::Null
+                } else {
+                    let value_str = value_field
+                        .as_any()
+                        .downcast_ref::<datatypes::arrow::array::StringArray>()
+                        .ok_or_else(|| {
+                            ArrowError::CastError(
+                                "Failed to downcast value to StringArray".to_string(),
+                            )
+                        })?
+                        .value(j);
+                    Value::String(value_str.to_string())
+                };
+
+                json_obj.insert(key.to_string(), value);
+            }
+
+            let json_value = Value::Object(json_obj);
+            let json_bytes = match extype {
+                Some(ColumnExtType::Json) => {
+                    let json_string = match serde_json::to_string(&json_value) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return Err(ArrowError::CastError(format!(
+                                "Failed to serialize JSON: {}",
+                                e
+                            )))
+                        }
+                    };
+                    match jsonb::parse_value(json_string.as_bytes()) {
+                        Ok(jsonb_value) => jsonb_value.to_vec(),
+                        Err(e) => {
+                            return Err(ArrowError::CastError(format!(
+                                "Failed to serialize JSONB: {}",
+                                e
+                            )))
+                        }
+                    }
+                }
+                _ => match serde_json::to_vec(&json_value) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return Err(ArrowError::CastError(format!(
+                            "Failed to serialize JSON: {}",
+                            e
+                        )))
+                    }
+                },
+            };
+            json_values.push(Some(json_bytes));
+        }
+    }
+
+    let binary_array = BinaryArray::from_iter(json_values);
+    Ok(Arc::new(binary_array))
+}
+
 #[cfg(test)]
 mod test {
     use common_error::ext::BoxedError;
     use common_error::mock::MockError;
     use common_error::status_code::StatusCode;
+    use datatypes::arrow::array::{ArrayRef, MapArray, StringArray, StructArray};
+    use datatypes::arrow::buffer::OffsetBuffer;
+    use datatypes::arrow::datatypes::Field;
     use datatypes::prelude::ConcreteDataType;
     use datatypes::schema::ColumnSchema;
     use datatypes::vectors::Int32Vector;
@@ -591,5 +775,78 @@ mod test {
             matches!(err, Error::External { .. }),
             "unexpected err {err}"
         );
+    }
+
+    #[test]
+    fn test_convert_map_to_json_binary() {
+        let keys = StringArray::from(vec![Some("a"), Some("b"), Some("c"), Some("x")]);
+        let values = StringArray::from(vec![Some("1"), None, Some("3"), Some("42")]);
+        let key_field = Arc::new(Field::new("key", ArrowDataType::Utf8, false));
+        let value_field = Arc::new(Field::new("value", ArrowDataType::Utf8, true));
+        let struct_type = ArrowDataType::Struct(vec![key_field, value_field].into());
+
+        let entries_field = Arc::new(Field::new("entries", struct_type, false));
+
+        let struct_array = StructArray::from(vec![
+            (
+                Arc::new(Field::new("key", ArrowDataType::Utf8, false)),
+                Arc::new(keys) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("value", ArrowDataType::Utf8, true)),
+                Arc::new(values) as ArrayRef,
+            ),
+        ]);
+
+        let offsets = OffsetBuffer::from_lengths([3, 0, 1]);
+        let nulls = datatypes::arrow::buffer::NullBuffer::from(vec![true, false, true]);
+
+        let map_array = MapArray::new(
+            entries_field,
+            offsets,
+            struct_array,
+            Some(nulls), // nulls
+            false,
+        );
+
+        let result = convert_map_to_json_binary(&map_array, None).unwrap();
+        let binary_array = result
+            .as_any()
+            .downcast_ref::<datatypes::arrow::array::BinaryArray>()
+            .unwrap();
+
+        let expected_jsons = [
+            Some(r#"{"a":"1","b":null,"c":"3"}"#),
+            None,
+            Some(r#"{"x":"42"}"#),
+        ];
+
+        for (i, _) in expected_jsons.iter().enumerate() {
+            if let Some(expected) = &expected_jsons[i] {
+                assert!(!binary_array.is_null(i));
+                let actual_bytes = binary_array.value(i);
+                let actual_str = std::str::from_utf8(actual_bytes).unwrap();
+                assert_eq!(actual_str, *expected);
+            } else {
+                assert!(binary_array.is_null(i));
+            }
+        }
+
+        let result_json =
+            convert_map_to_json_binary(&map_array, Some(ColumnExtType::Json)).unwrap();
+        let binary_array_json = result_json
+            .as_any()
+            .downcast_ref::<datatypes::arrow::array::BinaryArray>()
+            .unwrap();
+
+        for (i, _) in expected_jsons.iter().enumerate() {
+            if expected_jsons[i].is_some() {
+                assert!(!binary_array_json.is_null(i));
+                let actual_bytes = binary_array_json.value(i);
+                assert_ne!(actual_bytes, expected_jsons[i].unwrap().as_bytes());
+            } else {
+                assert!(binary_array_json.is_null(i));
+            }
+        }
     }
 }

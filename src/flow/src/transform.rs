@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use common_error::ext::BoxedError;
+use common_function::function::{FunctionContext, FunctionRef};
 use datafusion_substrait::extensions::Extensions;
 use datatypes::data_type::ConcreteDataType as CDT;
 use query::QueryEngine;
@@ -107,9 +108,13 @@ impl FunctionExtensions {
 
 /// register flow-specific functions to the query engine
 pub fn register_function_to_query_engine(engine: &Arc<dyn QueryEngine>) {
-    engine.register_function(Arc::new(TumbleFunction::new("tumble")));
-    engine.register_function(Arc::new(TumbleFunction::new(TUMBLE_START)));
-    engine.register_function(Arc::new(TumbleFunction::new(TUMBLE_END)));
+    let tumble_fn = Arc::new(TumbleFunction::new("tumble")) as FunctionRef;
+    let tumble_start_fn = Arc::new(TumbleFunction::new(TUMBLE_START)) as FunctionRef;
+    let tumble_end_fn = Arc::new(TumbleFunction::new(TUMBLE_END)) as FunctionRef;
+
+    engine.register_scalar_function(tumble_fn.into());
+    engine.register_scalar_function(tumble_start_fn.into());
+    engine.register_scalar_function(tumble_end_fn.into());
 }
 
 #[derive(Debug)]
@@ -146,7 +151,7 @@ impl common_function::function::Function for TumbleFunction {
 
     fn eval(
         &self,
-        _func_ctx: common_function::function::FunctionContext,
+        _func_ctx: &FunctionContext,
         _columns: &[datatypes::prelude::VectorRef],
     ) -> common_query::error::Result<datatypes::prelude::VectorRef> {
         UnexpectedSnafu {
@@ -170,6 +175,7 @@ mod test {
     use datatypes::vectors::{TimestampMillisecondVectorBuilder, VectorRef};
     use itertools::Itertools;
     use prost::Message;
+    use query::options::QueryOptions;
     use query::parser::QueryLanguageParser;
     use query::query_engine::DefaultSerializer;
     use query::QueryEngine;
@@ -262,7 +268,15 @@ mod test {
         };
         catalog_list.register_table_sync(req_with_ts).unwrap();
 
-        let factory = query::QueryEngineFactory::new(catalog_list, None, None, None, None, false);
+        let factory = query::QueryEngineFactory::new(
+            catalog_list,
+            None,
+            None,
+            None,
+            None,
+            false,
+            QueryOptions::default(),
+        );
 
         let engine = factory.query_engine();
         register_function_to_query_engine(&engine);

@@ -12,9 +12,9 @@ deadlock_detection = ["parking_lot/deadlock_detection"]
 workspace = true
 
 [dependencies]
-atty = "0.2"
 backtrace = "0.3"
 common-error.workspace = true
+common-version.workspace = true
 console-subscriber = { version = "0.1", optional = true }
 greptime-proto.workspace = true
 humantime-serde.workspace = true
@@ -23,7 +23,7 @@ once_cell.workspace = true
 opentelemetry = { version = "0.21.0", default-features = false, features = [
     "trace",
 ] }
-opentelemetry-otlp = { version = "0.14.0", features = ["tokio"] }
+opentelemetry-otlp = { version = "0.14.0", features = ["tokio", "http-proto", "reqwest-client"] }
 opentelemetry-semantic-conventions = "0.13.0"
 opentelemetry_sdk = { version = "0.21.0", features = ["rt-tokio"] }
 parking_lot.workspace = true

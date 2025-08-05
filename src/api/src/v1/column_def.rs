@@ -15,13 +15,16 @@
 use std::collections::HashMap;
 
 use datatypes::schema::{
-    ColumnDefaultConstraint, ColumnSchema, FulltextAnalyzer, FulltextOptions, SkippingIndexType,
-    COMMENT_KEY, FULLTEXT_KEY, INVERTED_INDEX_KEY, SKIPPING_INDEX_KEY,
+    ColumnDefaultConstraint, ColumnSchema, FulltextAnalyzer, FulltextBackend, FulltextOptions,
+    SkippingIndexOptions, SkippingIndexType, COMMENT_KEY, FULLTEXT_KEY, INVERTED_INDEX_KEY,
+    SKIPPING_INDEX_KEY,
 };
-use greptime_proto::v1::{Analyzer, SkippingIndexType as PbSkippingIndexType};
+use greptime_proto::v1::{
+    Analyzer, FulltextBackend as PbFulltextBackend, SkippingIndexType as PbSkippingIndexType,
+};
 use snafu::ResultExt;
 
-use crate::error::{self, Result};
+use crate::error::{self, ConvertColumnDefaultConstraintSnafu, Result};
 use crate::helper::ColumnDataTypeWrapper;
 use crate::v1::{ColumnDef, ColumnOptions, SemanticType};
 
@@ -74,6 +77,48 @@ pub fn try_as_column_schema(column_def: &ColumnDef) -> Result<ColumnSchema> {
         })
 }
 
+/// Tries to construct a `ColumnDef` from the given `ColumnSchema`.
+///
+/// TODO(weny): Add tests for this function.
+pub fn try_as_column_def(column_schema: &ColumnSchema, is_primary_key: bool) -> Result<ColumnDef> {
+    let column_datatype =
+        ColumnDataTypeWrapper::try_from(column_schema.data_type.clone()).map(|w| w.to_parts())?;
+
+    let semantic_type = if column_schema.is_time_index() {
+        SemanticType::Timestamp
+    } else if is_primary_key {
+        SemanticType::Tag
+    } else {
+        SemanticType::Field
+    } as i32;
+    let comment = column_schema
+        .metadata()
+        .get(COMMENT_KEY)
+        .cloned()
+        .unwrap_or_default();
+
+    let default_constraint = match column_schema.default_constraint() {
+        None => vec![],
+        Some(v) => v
+            .clone()
+            .try_into()
+            .context(ConvertColumnDefaultConstraintSnafu {
+                column: &column_schema.name,
+            })?,
+    };
+    let options = options_from_column_schema(column_schema);
+    Ok(ColumnDef {
+        name: column_schema.name.clone(),
+        data_type: column_datatype.0 as i32,
+        is_nullable: column_schema.is_nullable(),
+        default_constraint,
+        semantic_type,
+        comment,
+        datatype_extension: column_datatype.1,
+        options,
+    })
+}
+
 /// Constructs a `ColumnOptions` from the given `ColumnSchema`.
 pub fn options_from_column_schema(column_schema: &ColumnSchema) -> Option<ColumnOptions> {
     let mut options = ColumnOptions::default();
@@ -103,6 +148,13 @@ pub fn contains_fulltext(options: &Option<ColumnOptions>) -> bool {
         .is_some_and(|o| o.options.contains_key(FULLTEXT_GRPC_KEY))
 }
 
+/// Checks if the `ColumnOptions` contains skipping index options.
+pub fn contains_skipping(options: &Option<ColumnOptions>) -> bool {
+    options
+        .as_ref()
+        .is_some_and(|o| o.options.contains_key(SKIPPING_INDEX_GRPC_KEY))
+}
+
 /// Tries to construct a `ColumnOptions` from the given `FulltextOptions`.
 pub fn options_from_fulltext(fulltext: &FulltextOptions) -> Result<Option<ColumnOptions>> {
     let mut options = ColumnOptions::default();
@@ -113,11 +165,40 @@ pub fn options_from_fulltext(fulltext: &FulltextOptions) -> Result<Option<Column
     Ok((!options.options.is_empty()).then_some(options))
 }
 
+/// Tries to construct a `ColumnOptions` from the given `SkippingIndexOptions`.
+pub fn options_from_skipping(skipping: &SkippingIndexOptions) -> Result<Option<ColumnOptions>> {
+    let mut options = ColumnOptions::default();
+
+    let v = serde_json::to_string(skipping).context(error::SerializeJsonSnafu)?;
+    options
+        .options
+        .insert(SKIPPING_INDEX_GRPC_KEY.to_string(), v);
+
+    Ok((!options.options.is_empty()).then_some(options))
+}
+
+/// Tries to construct a `ColumnOptions` for inverted index.
+pub fn options_from_inverted() -> ColumnOptions {
+    let mut options = ColumnOptions::default();
+    options
+        .options
+        .insert(INVERTED_INDEX_GRPC_KEY.to_string(), "true".to_string());
+    options
+}
+
 /// Tries to construct a `FulltextAnalyzer` from the given analyzer.
-pub fn as_fulltext_option(analyzer: Analyzer) -> FulltextAnalyzer {
+pub fn as_fulltext_option_analyzer(analyzer: Analyzer) -> FulltextAnalyzer {
     match analyzer {
         Analyzer::English => FulltextAnalyzer::English,
         Analyzer::Chinese => FulltextAnalyzer::Chinese,
+    }
+}
+
+/// Tries to construct a `FulltextBackend` from the given backend.
+pub fn as_fulltext_option_backend(backend: PbFulltextBackend) -> FulltextBackend {
+    match backend {
+        PbFulltextBackend::Bloom => FulltextBackend::Bloom,
+        PbFulltextBackend::Tantivy => FulltextBackend::Tantivy,
     }
 }
 
@@ -132,7 +213,7 @@ pub fn as_skipping_index_type(skipping_index_type: PbSkippingIndexType) -> Skipp
 mod tests {
 
     use datatypes::data_type::ConcreteDataType;
-    use datatypes::schema::FulltextAnalyzer;
+    use datatypes::schema::{FulltextAnalyzer, FulltextBackend};
 
     use super::*;
     use crate::v1::ColumnDataType;
@@ -187,17 +268,20 @@ mod tests {
         assert!(options.is_none());
 
         let mut schema = ColumnSchema::new("test", ConcreteDataType::string_datatype(), true)
-            .with_fulltext_options(FulltextOptions {
-                enable: true,
-                analyzer: FulltextAnalyzer::English,
-                case_sensitive: false,
-            })
+            .with_fulltext_options(FulltextOptions::new_unchecked(
+                true,
+                FulltextAnalyzer::English,
+                false,
+                FulltextBackend::Bloom,
+                10240,
+                0.01,
+            ))
             .unwrap();
         schema.set_inverted_index(true);
         let options = options_from_column_schema(&schema).unwrap();
         assert_eq!(
             options.options.get(FULLTEXT_GRPC_KEY).unwrap(),
-            "{\"enable\":true,\"analyzer\":\"English\",\"case-sensitive\":false}"
+            "{\"enable\":true,\"analyzer\":\"English\",\"case-sensitive\":false,\"backend\":\"bloom\",\"granularity\":10240,\"false-positive-rate-in-10000\":100}"
         );
         assert_eq!(
             options.options.get(INVERTED_INDEX_GRPC_KEY).unwrap(),
@@ -207,15 +291,18 @@ mod tests {
 
     #[test]
     fn test_options_with_fulltext() {
-        let fulltext = FulltextOptions {
-            enable: true,
-            analyzer: FulltextAnalyzer::English,
-            case_sensitive: false,
-        };
+        let fulltext = FulltextOptions::new_unchecked(
+            true,
+            FulltextAnalyzer::English,
+            false,
+            FulltextBackend::Bloom,
+            10240,
+            0.01,
+        );
         let options = options_from_fulltext(&fulltext).unwrap().unwrap();
         assert_eq!(
             options.options.get(FULLTEXT_GRPC_KEY).unwrap(),
-            "{\"enable\":true,\"analyzer\":\"English\",\"case-sensitive\":false}"
+            "{\"enable\":true,\"analyzer\":\"English\",\"case-sensitive\":false,\"backend\":\"bloom\",\"granularity\":10240,\"false-positive-rate-in-10000\":100}"
         );
     }
 

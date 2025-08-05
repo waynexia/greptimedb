@@ -16,7 +16,8 @@ use api::v1::Rows;
 use common_error::ext::ErrorExt;
 use common_error::status_code::StatusCode;
 use store_api::region_engine::{
-    RegionEngine, RegionRole, SetRegionRoleStateResponse, SettableRegionRoleState,
+    RegionEngine, RegionRole, SetRegionRoleStateResponse, SetRegionRoleStateSuccess,
+    SettableRegionRoleState,
 };
 use store_api::region_request::{RegionPutRequest, RegionRequest};
 use store_api::storage::RegionId;
@@ -31,7 +32,7 @@ async fn test_set_role_state_gracefully() {
         SettableRegionRoleState::DowngradingLeader,
     ];
     for settable_role_state in settable_role_states {
-        let mut env = TestEnv::new();
+        let mut env = TestEnv::new().await;
         let engine = env.create_engine(MitoConfig::default()).await;
 
         let region_id = RegionId::new(1, 1);
@@ -48,9 +49,7 @@ async fn test_set_role_state_gracefully() {
             .await
             .unwrap();
         assert_eq!(
-            SetRegionRoleStateResponse::Success {
-                last_entry_id: Some(0)
-            },
+            SetRegionRoleStateResponse::success(SetRegionRoleStateSuccess::mito(0)),
             result
         );
 
@@ -60,9 +59,7 @@ async fn test_set_role_state_gracefully() {
             .await
             .unwrap();
         assert_eq!(
-            SetRegionRoleStateResponse::Success {
-                last_entry_id: Some(0)
-            },
+            SetRegionRoleStateResponse::success(SetRegionRoleStateSuccess::mito(0)),
             result
         );
 
@@ -96,9 +93,7 @@ async fn test_set_role_state_gracefully() {
             .unwrap();
 
         assert_eq!(
-            SetRegionRoleStateResponse::Success {
-                last_entry_id: Some(1)
-            },
+            SetRegionRoleStateResponse::success(SetRegionRoleStateSuccess::mito(1)),
             result
         );
     }
@@ -106,7 +101,7 @@ async fn test_set_role_state_gracefully() {
 
 #[tokio::test]
 async fn test_set_role_state_gracefully_not_exist() {
-    let mut env = TestEnv::new();
+    let mut env = TestEnv::new().await;
     let engine = env.create_engine(MitoConfig::default()).await;
 
     let non_exist_region_id = RegionId::new(1, 1);
@@ -121,7 +116,7 @@ async fn test_set_role_state_gracefully_not_exist() {
 
 #[tokio::test]
 async fn test_write_downgrading_region() {
-    let mut env = TestEnv::with_prefix("write-to-downgrading-region");
+    let mut env = TestEnv::with_prefix("write-to-downgrading-region").await;
     let engine = env.create_engine(MitoConfig::default()).await;
 
     let region_id = RegionId::new(1, 1);
@@ -144,9 +139,7 @@ async fn test_write_downgrading_region() {
         .await
         .unwrap();
     assert_eq!(
-        SetRegionRoleStateResponse::Success {
-            last_entry_id: Some(1)
-        },
+        SetRegionRoleStateResponse::success(SetRegionRoleStateSuccess::mito(1)),
         result
     );
 

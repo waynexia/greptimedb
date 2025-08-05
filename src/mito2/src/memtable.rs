@@ -17,35 +17,42 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-pub use bulk::part::BulkPart;
+pub use bulk::part::EncodedBulkPart;
 use common_time::Timestamp;
+use mito_codec::key_values::KeyValue;
+pub use mito_codec::key_values::KeyValues;
 use serde::{Deserialize, Serialize};
 use store_api::metadata::RegionMetadataRef;
 use store_api::storage::{ColumnId, SequenceNumber};
-use table::predicate::Predicate;
 
 use crate::config::MitoConfig;
 use crate::error::Result;
 use crate::flush::WriteBufferManagerRef;
-use crate::memtable::key_values::KeyValue;
-pub use crate::memtable::key_values::KeyValues;
 use crate::memtable::partition_tree::{PartitionTreeConfig, PartitionTreeMemtableBuilder};
 use crate::memtable::time_series::TimeSeriesMemtableBuilder;
 use crate::metrics::WRITE_BUFFER_BYTES;
 use crate::read::prune::PruneTimeIterator;
+use crate::read::scan_region::PredicateGroup;
 use crate::read::Batch;
 use crate::region::options::{MemtableOptions, MergeMode};
 use crate::sst::file::FileTimeRange;
 
+mod builder;
 pub mod bulk;
-pub mod key_values;
 pub mod partition_tree;
+pub mod simple_bulk_memtable;
 mod stats;
 pub mod time_partition;
 pub mod time_series;
 pub(crate) mod version;
+
+#[cfg(any(test, feature = "test"))]
+pub use bulk::part::BulkPart;
+#[cfg(any(test, feature = "test"))]
+pub use time_partition::filter_record_batch;
 
 /// Id for memtables.
 ///
@@ -66,7 +73,7 @@ impl Default for MemtableConfig {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct MemtableStats {
     /// The estimated bytes allocated by this memtable from heap.
     estimated_bytes: usize,
@@ -74,18 +81,26 @@ pub struct MemtableStats {
     /// and only if the memtable is empty.
     time_range: Option<(Timestamp, Timestamp)>,
     /// Total rows in memtable
-    num_rows: usize,
+    pub num_rows: usize,
     /// Total number of ranges in the memtable.
-    num_ranges: usize,
+    pub num_ranges: usize,
     /// The maximum sequence number in the memtable.
     max_sequence: SequenceNumber,
+    /// Number of estimated timeseries in memtable.
+    series_count: usize,
 }
 
 impl MemtableStats {
     /// Attaches the time range to the stats.
     #[cfg(any(test, feature = "test"))]
-    pub(crate) fn with_time_range(mut self, time_range: Option<(Timestamp, Timestamp)>) -> Self {
+    pub fn with_time_range(mut self, time_range: Option<(Timestamp, Timestamp)>) -> Self {
         self.time_range = time_range;
+        self
+    }
+
+    #[cfg(feature = "test")]
+    pub fn with_max_sequence(mut self, max_sequence: SequenceNumber) -> Self {
+        self.max_sequence = max_sequence;
         self
     }
 
@@ -113,6 +128,11 @@ impl MemtableStats {
     pub fn max_sequence(&self) -> SequenceNumber {
         self.max_sequence
     }
+
+    /// Series count in memtable.
+    pub fn series_count(&self) -> usize {
+        self.series_count
+    }
 }
 
 pub type BoxedBatchIterator = Box<dyn Iterator<Item = Result<Batch>> + Send>;
@@ -138,15 +158,19 @@ pub trait Memtable: Send + Sync + fmt::Debug {
     fn write_one(&self, key_value: KeyValue) -> Result<()>;
 
     /// Writes an encoded batch of into memtable.
-    fn write_bulk(&self, part: BulkPart) -> Result<()>;
+    fn write_bulk(&self, part: crate::memtable::bulk::part::BulkPart) -> Result<()>;
 
     /// Scans the memtable.
     /// `projection` selects columns to read, `None` means reading all columns.
     /// `filters` are the predicates to be pushed down to memtable.
+    ///
+    /// # Note
+    /// This method should only be used for tests.
+    #[cfg(any(test, feature = "test"))]
     fn iter(
         &self,
         projection: Option<&[ColumnId]>,
-        predicate: Option<Predicate>,
+        predicate: Option<table::predicate::Predicate>,
         sequence: Option<SequenceNumber>,
     ) -> Result<BoxedBatchIterator>;
 
@@ -155,9 +179,9 @@ pub trait Memtable: Send + Sync + fmt::Debug {
     fn ranges(
         &self,
         projection: Option<&[ColumnId]>,
-        predicate: Option<Predicate>,
+        predicate: PredicateGroup,
         sequence: Option<SequenceNumber>,
-    ) -> MemtableRanges;
+    ) -> Result<MemtableRanges>;
 
     /// Returns true if the memtable is empty.
     fn is_empty(&self) -> bool;
@@ -180,6 +204,12 @@ pub type MemtableRef = Arc<dyn Memtable>;
 pub trait MemtableBuilder: Send + Sync + fmt::Debug {
     /// Builds a new memtable instance.
     fn build(&self, id: MemtableId, metadata: &RegionMetadataRef) -> MemtableRef;
+
+    /// Returns true if the memtable supports bulk insert and benefits from it.
+    fn use_bulk_insert(&self, metadata: &RegionMetadataRef) -> bool {
+        let _metadata = metadata;
+        false
+    }
 }
 
 pub type MemtableBuilderRef = Arc<dyn MemtableBuilder>;
@@ -331,11 +361,43 @@ impl MemtableBuilderProvider {
     }
 }
 
+/// Metrics for scanning a memtable.
+#[derive(Clone, Default)]
+pub struct MemScanMetrics(Arc<Mutex<MemScanMetricsData>>);
+
+impl MemScanMetrics {
+    /// Merges the metrics.
+    pub(crate) fn merge_inner(&self, inner: &MemScanMetricsData) {
+        let mut metrics = self.0.lock().unwrap();
+        metrics.total_series += inner.total_series;
+        metrics.num_rows += inner.num_rows;
+        metrics.num_batches += inner.num_batches;
+        metrics.scan_cost += inner.scan_cost;
+    }
+
+    /// Gets the metrics data.
+    pub(crate) fn data(&self) -> MemScanMetricsData {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct MemScanMetricsData {
+    /// Total series in the memtable.
+    pub(crate) total_series: usize,
+    /// Number of rows read.
+    pub(crate) num_rows: usize,
+    /// Number of batch read.
+    pub(crate) num_batches: usize,
+    /// Duration to scan the memtable.
+    pub(crate) scan_cost: Duration,
+}
+
 /// Builder to build an iterator to read the range.
 /// The builder should know the projection and the predicate to build the iterator.
 pub trait IterBuilder: Send + Sync {
     /// Returns the iterator to read the range.
-    fn build(&self) -> Result<BoxedBatchIterator>;
+    fn build(&self, metrics: Option<MemScanMetrics>) -> Result<BoxedBatchIterator>;
 }
 
 pub type BoxedIterBuilder = Box<dyn IterBuilder>;
@@ -346,14 +408,20 @@ pub struct MemtableRangeContext {
     id: MemtableId,
     /// Iterator builder.
     builder: BoxedIterBuilder,
+    /// All filters.
+    predicate: PredicateGroup,
 }
 
 pub type MemtableRangeContextRef = Arc<MemtableRangeContext>;
 
 impl MemtableRangeContext {
     /// Creates a new [MemtableRangeContext].
-    pub fn new(id: MemtableId, builder: BoxedIterBuilder) -> Self {
-        Self { id, builder }
+    pub fn new(id: MemtableId, builder: BoxedIterBuilder, predicate: PredicateGroup) -> Self {
+        Self {
+            id,
+            builder,
+            predicate,
+        }
     }
 }
 
@@ -362,12 +430,15 @@ impl MemtableRangeContext {
 pub struct MemtableRange {
     /// Shared context.
     context: MemtableRangeContextRef,
+    /// Number of rows in current memtable range.
+    // todo(hl): use [MemtableRangeStats] instead.
+    num_rows: usize,
 }
 
 impl MemtableRange {
     /// Creates a new range from context.
-    pub fn new(context: MemtableRangeContextRef) -> Self {
-        Self { context }
+    pub fn new(context: MemtableRangeContextRef, num_rows: usize) -> Self {
+        Self { context, num_rows }
     }
 
     /// Returns the id of the memtable to read.
@@ -376,10 +447,29 @@ impl MemtableRange {
     }
 
     /// Builds an iterator to read the range.
-    /// Filters the result by the specific time range.
-    pub fn build_iter(&self, time_range: FileTimeRange) -> Result<BoxedBatchIterator> {
-        let iter = self.context.builder.build()?;
-        Ok(Box::new(PruneTimeIterator::new(iter, time_range)))
+    /// Filters the result by the specific time range, this ensures memtable won't return
+    /// rows out of the time range when new rows are inserted.
+    pub fn build_prune_iter(
+        &self,
+        time_range: FileTimeRange,
+        metrics: Option<MemScanMetrics>,
+    ) -> Result<BoxedBatchIterator> {
+        let iter = self.context.builder.build(metrics)?;
+        let time_filters = self.context.predicate.time_filters();
+        Ok(Box::new(PruneTimeIterator::new(
+            iter,
+            time_range,
+            time_filters,
+        )))
+    }
+
+    /// Builds an iterator to read all rows in range.
+    pub fn build_iter(&self) -> Result<BoxedBatchIterator> {
+        self.context.builder.build(None)
+    }
+
+    pub fn num_rows(&self) -> usize {
+        self.num_rows
     }
 }
 

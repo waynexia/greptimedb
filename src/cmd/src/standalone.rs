@@ -13,13 +13,15 @@
 // limitations under the License.
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::{fs, path};
 
 use async_trait::async_trait;
 use cache::{build_fundamental_cache_registry, with_default_composite_cache_registry};
 use catalog::information_schema::InformationExtension;
-use catalog::kvbackend::KvBackendCatalogManager;
+use catalog::kvbackend::KvBackendCatalogManagerBuilder;
+use catalog::process_manager::ProcessManager;
 use clap::Parser;
 use client::api::v1::meta::RegionRole;
 use common_base::readable_size::ReadableSize;
@@ -28,36 +30,42 @@ use common_catalog::consts::{MIN_USER_FLOW_ID, MIN_USER_TABLE_ID};
 use common_config::{metadata_store_dir, Configurable, KvBackendConfig};
 use common_error::ext::BoxedError;
 use common_meta::cache::LayeredCacheRegistryBuilder;
-use common_meta::cache_invalidator::CacheInvalidatorRef;
 use common_meta::cluster::{NodeInfo, NodeStatus};
 use common_meta::datanode::RegionStat;
-use common_meta::ddl::flow_meta::{FlowMetadataAllocator, FlowMetadataAllocatorRef};
-use common_meta::ddl::table_meta::{TableMetadataAllocator, TableMetadataAllocatorRef};
-use common_meta::ddl::{DdlContext, NoopRegionFailureDetectorControl, ProcedureExecutorRef};
+use common_meta::ddl::flow_meta::FlowMetadataAllocator;
+use common_meta::ddl::table_meta::TableMetadataAllocator;
+use common_meta::ddl::{DdlContext, NoopRegionFailureDetectorControl};
 use common_meta::ddl_manager::DdlManager;
 use common_meta::key::flow::flow_state::FlowStat;
-use common_meta::key::flow::{FlowMetadataManager, FlowMetadataManagerRef};
+use common_meta::key::flow::FlowMetadataManager;
 use common_meta::key::{TableMetadataManager, TableMetadataManagerRef};
 use common_meta::kv_backend::KvBackendRef;
-use common_meta::node_manager::NodeManagerRef;
 use common_meta::peer::Peer;
+use common_meta::procedure_executor::LocalProcedureExecutor;
 use common_meta::region_keeper::MemoryRegionKeeper;
+use common_meta::region_registry::LeaderRegionRegistry;
 use common_meta::sequence::SequenceBuilder;
 use common_meta::wal_options_allocator::{build_wal_options_allocator, WalOptionsAllocatorRef};
+use common_options::memory::MemoryOptions;
 use common_procedure::{ProcedureInfo, ProcedureManagerRef};
 use common_telemetry::info;
-use common_telemetry::logging::{LoggingOptions, TracingOptions};
+use common_telemetry::logging::{
+    LoggingOptions, SlowQueryOptions, TracingOptions, DEFAULT_LOGGING_DIR,
+};
 use common_time::timezone::set_default_timezone;
-use common_version::{short_version, version};
+use common_version::{short_version, verbose_version};
 use common_wal::config::DatanodeWalConfig;
 use datanode::config::{DatanodeOptions, ProcedureConfig, RegionEngineConfig, StorageConfig};
 use datanode::datanode::{Datanode, DatanodeBuilder};
 use datanode::region_server::RegionServer;
 use file_engine::config::EngineConfig as FileEngineConfig;
-use flow::{FlowConfig, FlowWorkerManager, FlownodeBuilder, FlownodeOptions, FrontendInvoker};
-use frontend::frontend::FrontendOptions;
+use flow::{
+    FlowConfig, FlownodeBuilder, FlownodeInstance, FlownodeOptions, FrontendClient,
+    FrontendInvoker, GrpcQueryHandlerWithBoxedError, StreamingEngine,
+};
+use frontend::frontend::{Frontend, FrontendOptions};
 use frontend::instance::builder::FrontendBuilder;
-use frontend::instance::{FrontendInstance, Instance as FeInstance, StandaloneDatanodeManager};
+use frontend::instance::{Instance as FeInstance, StandaloneDatanodeManager};
 use frontend::server::Services;
 use frontend::service_config::{
     InfluxdbOptions, JaegerOptions, MysqlOptions, OpentsdbOptions, PostgresOptions,
@@ -65,26 +73,19 @@ use frontend::service_config::{
 };
 use meta_srv::metasrv::{FLOW_ID_SEQ, TABLE_ID_SEQ};
 use mito2::config::MitoConfig;
-use query::stats::StatementStatistics;
+use query::options::QueryOptions;
 use serde::{Deserialize, Serialize};
-use servers::export_metrics::ExportMetricsOption;
+use servers::export_metrics::{ExportMetricsOption, ExportMetricsTask};
 use servers::grpc::GrpcOptions;
 use servers::http::HttpOptions;
 use servers::tls::{TlsMode, TlsOption};
-use servers::Mode;
 use snafu::ResultExt;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::RwLock;
 use tracing_appender::non_blocking::WorkerGuard;
 
-use crate::error::{
-    BuildCacheRegistrySnafu, BuildWalOptionsAllocatorSnafu, CreateDirSnafu, IllegalConfigSnafu,
-    InitDdlManagerSnafu, InitMetadataSnafu, InitTimezoneSnafu, LoadLayeredConfigSnafu, OtherSnafu,
-    Result, ShutdownDatanodeSnafu, ShutdownFlownodeSnafu, ShutdownFrontendSnafu,
-    StartDatanodeSnafu, StartFlownodeSnafu, StartFrontendSnafu, StartProcedureManagerSnafu,
-    StartWalOptionsAllocatorSnafu, StopProcedureManagerSnafu,
-};
+use crate::error::{Result, StartFlownodeSnafu};
 use crate::options::{GlobalOptions, GreptimeOptions};
-use crate::{log_versions, App};
+use crate::{create_resource_limit_metrics, error, log_versions, maybe_activate_heap_profile, App};
 
 pub const APP_NAME: &str = "greptime-standalone";
 
@@ -132,7 +133,6 @@ impl SubCommand {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct StandaloneOptions {
-    pub mode: Mode,
     pub enable_telemetry: bool,
     pub default_timezone: Option<String>,
     pub http: HttpOptions,
@@ -157,12 +157,14 @@ pub struct StandaloneOptions {
     pub init_regions_in_background: bool,
     pub init_regions_parallelism: usize,
     pub max_in_flight_write_bytes: Option<ReadableSize>,
+    pub slow_query: Option<SlowQueryOptions>,
+    pub query: QueryOptions,
+    pub memory: MemoryOptions,
 }
 
 impl Default for StandaloneOptions {
     fn default() -> Self {
         Self {
-            mode: Mode::Standalone,
             enable_telemetry: true,
             default_timezone: None,
             http: HttpOptions::default(),
@@ -189,6 +191,9 @@ impl Default for StandaloneOptions {
             init_regions_in_background: false,
             init_regions_parallelism: 16,
             max_in_flight_write_bytes: None,
+            slow_query: Some(SlowQueryOptions::default()),
+            query: QueryOptions::default(),
+            memory: MemoryOptions::default(),
         }
     }
 }
@@ -228,6 +233,7 @@ impl StandaloneOptions {
             // Handle the export metrics task run by standalone to frontend for execution
             export_metrics: cloned_opts.export_metrics,
             max_in_flight_write_bytes: cloned_opts.max_in_flight_write_bytes,
+            slow_query: cloned_opts.slow_query,
             ..Default::default()
         }
     }
@@ -243,7 +249,7 @@ impl StandaloneOptions {
             grpc: cloned_opts.grpc,
             init_regions_in_background: cloned_opts.init_regions_in_background,
             init_regions_parallelism: cloned_opts.init_regions_parallelism,
-            mode: Mode::Standalone,
+            query: cloned_opts.query,
             ..Default::default()
         }
     }
@@ -251,21 +257,37 @@ impl StandaloneOptions {
 
 pub struct Instance {
     datanode: Datanode,
-    frontend: FeInstance,
-    // TODO(discord9): wrapped it in flownode instance instead
-    flow_worker_manager: Arc<FlowWorkerManager>,
-    flow_shutdown: broadcast::Sender<()>,
+    frontend: Frontend,
+    flownode: FlownodeInstance,
     procedure_manager: ProcedureManagerRef,
     wal_options_allocator: WalOptionsAllocatorRef,
+
+    // The components of standalone, which make it easier to expand based
+    // on the components.
+    #[cfg(feature = "enterprise")]
+    components: Components,
 
     // Keep the logging guard to prevent the worker from being dropped.
     _guard: Vec<WorkerGuard>,
 }
 
+#[cfg(feature = "enterprise")]
+pub struct Components {
+    pub plugins: Plugins,
+    pub kv_backend: KvBackendRef,
+    pub frontend_client: Arc<FrontendClient>,
+    pub catalog_manager: catalog::CatalogManagerRef,
+}
+
 impl Instance {
     /// Find the socket addr of a server by its `name`.
-    pub async fn server_addr(&self, name: &str) -> Option<SocketAddr> {
-        self.frontend.server_handlers().addr(name).await
+    pub fn server_addr(&self, name: &str) -> Option<SocketAddr> {
+        self.frontend.server_handlers().addr(name)
+    }
+
+    #[cfg(feature = "enterprise")]
+    pub fn components(&self) -> &Components {
+        &self.components
     }
 }
 
@@ -281,48 +303,48 @@ impl App for Instance {
         self.procedure_manager
             .start()
             .await
-            .context(StartProcedureManagerSnafu)?;
+            .context(error::StartProcedureManagerSnafu)?;
 
         self.wal_options_allocator
             .start()
             .await
-            .context(StartWalOptionsAllocatorSnafu)?;
+            .context(error::StartWalOptionsAllocatorSnafu)?;
 
-        plugins::start_frontend_plugins(self.frontend.plugins().clone())
+        plugins::start_frontend_plugins(self.frontend.instance.plugins().clone())
             .await
-            .context(StartFrontendSnafu)?;
+            .context(error::StartFrontendSnafu)?;
 
-        self.frontend.start().await.context(StartFrontendSnafu)?;
-        self.flow_worker_manager
-            .clone()
-            .run_background(Some(self.flow_shutdown.subscribe()));
+        self.frontend
+            .start()
+            .await
+            .context(error::StartFrontendSnafu)?;
+
+        self.flownode.start().await.context(StartFlownodeSnafu)?;
+
         Ok(())
     }
 
-    async fn stop(&self) -> Result<()> {
+    async fn stop(&mut self) -> Result<()> {
         self.frontend
             .shutdown()
             .await
-            .context(ShutdownFrontendSnafu)?;
+            .context(error::ShutdownFrontendSnafu)?;
 
         self.procedure_manager
             .stop()
             .await
-            .context(StopProcedureManagerSnafu)?;
+            .context(error::StopProcedureManagerSnafu)?;
 
         self.datanode
             .shutdown()
             .await
-            .context(ShutdownDatanodeSnafu)?;
-        self.flow_shutdown
-            .send(())
-            .map_err(|_e| {
-                flow::error::InternalSnafu {
-                    reason: "Failed to send shutdown signal to flow worker manager, all receiver end already closed".to_string(),
-                }
-                .build()
-            })
-            .context(ShutdownFlownodeSnafu)?;
+            .context(error::ShutdownDatanodeSnafu)?;
+
+        self.flownode
+            .shutdown()
+            .await
+            .context(error::ShutdownFlownodeSnafu)?;
+
         info!("Datanode instance stopped.");
 
         Ok(())
@@ -368,7 +390,7 @@ impl StartCommand {
             self.config_file.as_deref(),
             self.env_prefix.as_ref(),
         )
-        .context(LoadLayeredConfigSnafu)?;
+        .context(error::LoadLayeredConfigSnafu)?;
 
         self.merge_with_cli_options(global_options, &mut opts.component)?;
 
@@ -381,9 +403,6 @@ impl StartCommand {
         global_options: &GlobalOptions,
         opts: &mut StandaloneOptions,
     ) -> Result<()> {
-        // Should always be standalone mode.
-        opts.mode = Mode::Standalone;
-
         if let Some(dir) = &global_options.log_dir {
             opts.logging.dir.clone_from(dir);
         }
@@ -411,11 +430,19 @@ impl StartCommand {
             opts.storage.data_home.clone_from(data_home);
         }
 
+        // If the logging dir is not set, use the default logs dir in the data home.
+        if opts.logging.dir.is_empty() {
+            opts.logging.dir = Path::new(&opts.storage.data_home)
+                .join(DEFAULT_LOGGING_DIR)
+                .to_string_lossy()
+                .to_string();
+        }
+
         if let Some(addr) = &self.rpc_bind_addr {
             // frontend grpc addr conflict with datanode default grpc addr
             let datanode_grpc_addr = DatanodeOptions::default().grpc.bind_addr;
             if addr.eq(&datanode_grpc_addr) {
-                return IllegalConfigSnafu {
+                return error::IllegalConfigSnafu {
                     msg: format!(
                         "gRPC listen address conflicts with datanode reserved gRPC addr: {datanode_grpc_addr}",
                     ),
@@ -459,8 +486,12 @@ impl StartCommand {
             &opts.component.logging,
             &opts.component.tracing,
             None,
+            opts.component.slow_query.as_ref(),
         );
-        log_versions(version(), short_version(), APP_NAME);
+
+        log_versions(verbose_version(), short_version(), APP_NAME);
+        maybe_activate_heap_profile(&opts.component.memory);
+        create_resource_limit_metrics(APP_NAME);
 
         info!("Standalone start command: {:#?}", self);
         info!("Standalone options: {opts:#?}");
@@ -474,18 +505,19 @@ impl StartCommand {
 
         plugins::setup_frontend_plugins(&mut plugins, &plugin_opts, &fe_opts)
             .await
-            .context(StartFrontendSnafu)?;
+            .context(error::StartFrontendSnafu)?;
 
         plugins::setup_datanode_plugins(&mut plugins, &plugin_opts, &dn_opts)
             .await
-            .context(StartDatanodeSnafu)?;
+            .context(error::StartDatanodeSnafu)?;
 
-        set_default_timezone(fe_opts.default_timezone.as_deref()).context(InitTimezoneSnafu)?;
+        set_default_timezone(fe_opts.default_timezone.as_deref())
+            .context(error::InitTimezoneSnafu)?;
 
         let data_home = &dn_opts.storage.data_home;
         // Ensure the data_home directory exists.
         fs::create_dir_all(path::Path::new(data_home))
-            .context(CreateDirSnafu { dir: data_home })?;
+            .context(error::CreateDirSnafu { dir: data_home })?;
 
         let metadata_dir = metadata_store_dir(data_home);
         let (kv_backend, procedure_manager) = FeInstance::try_build_standalone_components(
@@ -494,7 +526,7 @@ impl StartCommand {
             opts.procedure,
         )
         .await
-        .context(StartFrontendSnafu)?;
+        .context(error::StartFrontendSnafu)?;
 
         // Builds cache registry
         let layered_cache_builder = LayeredCacheRegistryBuilder::default();
@@ -503,27 +535,34 @@ impl StartCommand {
             with_default_composite_cache_registry(
                 layered_cache_builder.add_cache_registry(fundamental_cache_registry),
             )
-            .context(BuildCacheRegistrySnafu)?
+            .context(error::BuildCacheRegistrySnafu)?
             .build(),
         );
 
-        let datanode = DatanodeBuilder::new(dn_opts, plugins.clone())
-            .with_kv_backend(kv_backend.clone())
-            .with_cache_registry(layered_cache_registry.clone())
-            .build()
-            .await
-            .context(StartDatanodeSnafu)?;
+        let mut builder = DatanodeBuilder::new(dn_opts, plugins.clone(), kv_backend.clone());
+        builder.with_cache_registry(layered_cache_registry.clone());
+        let datanode = builder.build().await.context(error::StartDatanodeSnafu)?;
 
         let information_extension = Arc::new(StandaloneInformationExtension::new(
             datanode.region_server(),
             procedure_manager.clone(),
         ));
-        let catalog_manager = KvBackendCatalogManager::new(
+
+        let process_manager = Arc::new(ProcessManager::new(opts.grpc.server_addr.clone(), None));
+        let builder = KvBackendCatalogManagerBuilder::new(
             information_extension.clone(),
             kv_backend.clone(),
             layered_cache_registry.clone(),
-            Some(procedure_manager.clone()),
-        );
+        )
+        .with_procedure_manager(procedure_manager.clone())
+        .with_process_manager(process_manager.clone());
+        #[cfg(feature = "enterprise")]
+        let builder = if let Some(factories) = plugins.get() {
+            builder.with_extra_information_table_factories(factories)
+        } else {
+            builder
+        };
+        let catalog_manager = builder.build();
 
         let table_metadata_manager =
             Self::create_table_metadata_manager(kv_backend.clone()).await?;
@@ -533,32 +572,37 @@ impl StartCommand {
             flow: opts.flow.clone(),
             ..Default::default()
         };
+
+        // for standalone not use grpc, but get a handler to frontend grpc client without
+        // actually make a connection
+        let (frontend_client, frontend_instance_handler) =
+            FrontendClient::from_empty_grpc_handler(opts.query.clone());
+        let frontend_client = Arc::new(frontend_client);
         let flow_builder = FlownodeBuilder::new(
             flownode_options,
             plugins.clone(),
             table_metadata_manager.clone(),
             catalog_manager.clone(),
             flow_metadata_manager.clone(),
+            frontend_client.clone(),
         );
-        let flownode = Arc::new(
-            flow_builder
-                .build()
-                .await
-                .map_err(BoxedError::new)
-                .context(OtherSnafu)?,
-        );
+        let flownode = flow_builder
+            .build()
+            .await
+            .map_err(BoxedError::new)
+            .context(error::OtherSnafu)?;
 
         // set the ref to query for the local flow state
         {
-            let flow_worker_manager = flownode.flow_worker_manager();
+            let flow_streaming_engine = flownode.flow_engine().streaming_engine();
             information_extension
-                .set_flow_worker_manager(flow_worker_manager.clone())
+                .set_flow_streaming_engine(flow_streaming_engine)
                 .await;
         }
 
         let node_manager = Arc::new(StandaloneDatanodeManager {
             region_server: datanode.region_server(),
-            flow_server: flownode.flow_worker_manager(),
+            flow_server: flownode.flow_engine(),
         });
 
         let table_id_sequence = Arc::new(
@@ -576,104 +620,112 @@ impl StartCommand {
         let kafka_options = opts.wal.clone().into();
         let wal_options_allocator = build_wal_options_allocator(&kafka_options, kv_backend.clone())
             .await
-            .context(BuildWalOptionsAllocatorSnafu)?;
+            .context(error::BuildWalOptionsAllocatorSnafu)?;
         let wal_options_allocator = Arc::new(wal_options_allocator);
-        let table_meta_allocator = Arc::new(TableMetadataAllocator::new(
+        let table_metadata_allocator = Arc::new(TableMetadataAllocator::new(
             table_id_sequence,
             wal_options_allocator.clone(),
         ));
-        let flow_meta_allocator = Arc::new(FlowMetadataAllocator::with_noop_peer_allocator(
+        let flow_metadata_allocator = Arc::new(FlowMetadataAllocator::with_noop_peer_allocator(
             flow_id_sequence,
         ));
 
-        let ddl_task_executor = Self::create_ddl_task_executor(
-            procedure_manager.clone(),
-            node_manager.clone(),
-            layered_cache_registry.clone(),
-            table_metadata_manager,
-            table_meta_allocator,
-            flow_metadata_manager,
-            flow_meta_allocator,
-        )
-        .await?;
+        let ddl_context = DdlContext {
+            node_manager: node_manager.clone(),
+            cache_invalidator: layered_cache_registry.clone(),
+            memory_region_keeper: Arc::new(MemoryRegionKeeper::default()),
+            leader_region_registry: Arc::new(LeaderRegionRegistry::default()),
+            table_metadata_manager: table_metadata_manager.clone(),
+            table_metadata_allocator: table_metadata_allocator.clone(),
+            flow_metadata_manager: flow_metadata_manager.clone(),
+            flow_metadata_allocator: flow_metadata_allocator.clone(),
+            region_failure_detector_controller: Arc::new(NoopRegionFailureDetectorControl),
+        };
 
-        let mut frontend = FrontendBuilder::new(
-            fe_opts,
+        let ddl_manager = DdlManager::try_new(ddl_context, procedure_manager.clone(), true)
+            .context(error::InitDdlManagerSnafu)?;
+        #[cfg(feature = "enterprise")]
+        let ddl_manager = {
+            let trigger_ddl_manager: Option<common_meta::ddl_manager::TriggerDdlManagerRef> =
+                plugins.get();
+            ddl_manager.with_trigger_ddl_manager(trigger_ddl_manager)
+        };
+
+        let procedure_executor = Arc::new(LocalProcedureExecutor::new(
+            Arc::new(ddl_manager),
+            procedure_manager.clone(),
+        ));
+
+        let fe_instance = FrontendBuilder::new(
+            fe_opts.clone(),
             kv_backend.clone(),
             layered_cache_registry.clone(),
             catalog_manager.clone(),
             node_manager.clone(),
-            ddl_task_executor.clone(),
-            StatementStatistics::new(opts.logging.slow_query.clone()),
+            procedure_executor.clone(),
+            process_manager,
         )
         .with_plugin(plugins.clone())
         .try_build()
         .await
-        .context(StartFrontendSnafu)?;
+        .context(error::StartFrontendSnafu)?;
+        let fe_instance = Arc::new(fe_instance);
 
-        let flow_worker_manager = flownode.flow_worker_manager();
+        // set the frontend client for flownode
+        let grpc_handler = fe_instance.clone() as Arc<dyn GrpcQueryHandlerWithBoxedError>;
+        let weak_grpc_handler = Arc::downgrade(&grpc_handler);
+        frontend_instance_handler
+            .lock()
+            .unwrap()
+            .replace(weak_grpc_handler);
+
+        // set the frontend invoker for flownode
+        let flow_streaming_engine = flownode.flow_engine().streaming_engine();
         // flow server need to be able to use frontend to write insert requests back
         let invoker = FrontendInvoker::build_from(
-            flow_worker_manager.clone(),
+            flow_streaming_engine.clone(),
             catalog_manager.clone(),
             kv_backend.clone(),
             layered_cache_registry.clone(),
-            ddl_task_executor.clone(),
+            procedure_executor,
             node_manager,
         )
         .await
         .context(StartFlownodeSnafu)?;
-        flow_worker_manager.set_frontend_invoker(invoker).await;
+        flow_streaming_engine.set_frontend_invoker(invoker).await;
 
-        let (tx, _rx) = broadcast::channel(1);
+        let export_metrics_task = ExportMetricsTask::try_new(&opts.export_metrics, Some(&plugins))
+            .context(error::ServersSnafu)?;
 
-        let servers = Services::new(opts, Arc::new(frontend.clone()), plugins)
+        let servers = Services::new(opts, fe_instance.clone(), plugins.clone())
             .build()
-            .await
-            .context(StartFrontendSnafu)?;
-        frontend
-            .build_servers(servers)
-            .context(StartFrontendSnafu)?;
+            .context(error::StartFrontendSnafu)?;
+
+        let frontend = Frontend {
+            instance: fe_instance,
+            servers,
+            heartbeat_task: None,
+            export_metrics_task,
+        };
+
+        #[cfg(feature = "enterprise")]
+        let components = Components {
+            plugins,
+            kv_backend,
+            frontend_client,
+            catalog_manager,
+        };
 
         Ok(Instance {
             datanode,
             frontend,
-            flow_worker_manager,
-            flow_shutdown: tx,
+            flownode,
             procedure_manager,
             wal_options_allocator,
+            #[cfg(feature = "enterprise")]
+            components,
             _guard: guard,
         })
-    }
-
-    pub async fn create_ddl_task_executor(
-        procedure_manager: ProcedureManagerRef,
-        node_manager: NodeManagerRef,
-        cache_invalidator: CacheInvalidatorRef,
-        table_metadata_manager: TableMetadataManagerRef,
-        table_metadata_allocator: TableMetadataAllocatorRef,
-        flow_metadata_manager: FlowMetadataManagerRef,
-        flow_metadata_allocator: FlowMetadataAllocatorRef,
-    ) -> Result<ProcedureExecutorRef> {
-        let procedure_executor: ProcedureExecutorRef = Arc::new(
-            DdlManager::try_new(
-                DdlContext {
-                    node_manager,
-                    cache_invalidator,
-                    memory_region_keeper: Arc::new(MemoryRegionKeeper::default()),
-                    table_metadata_manager,
-                    table_metadata_allocator,
-                    flow_metadata_manager,
-                    flow_metadata_allocator,
-                    region_failure_detector_controller: Arc::new(NoopRegionFailureDetectorControl),
-                },
-                procedure_manager,
-                true,
-            )
-            .context(InitDdlManagerSnafu)?,
-        );
-
-        Ok(procedure_executor)
     }
 
     pub async fn create_table_metadata_manager(
@@ -684,7 +736,7 @@ impl StartCommand {
         table_metadata_manager
             .init()
             .await
-            .context(InitMetadataSnafu)?;
+            .context(error::InitMetadataSnafu)?;
 
         Ok(table_metadata_manager)
     }
@@ -694,7 +746,7 @@ pub struct StandaloneInformationExtension {
     region_server: RegionServer,
     procedure_manager: ProcedureManagerRef,
     start_time_ms: u64,
-    flow_worker_manager: RwLock<Option<Arc<FlowWorkerManager>>>,
+    flow_streaming_engine: RwLock<Option<Arc<StreamingEngine>>>,
 }
 
 impl StandaloneInformationExtension {
@@ -703,14 +755,14 @@ impl StandaloneInformationExtension {
             region_server,
             procedure_manager,
             start_time_ms: common_time::util::current_time_millis() as u64,
-            flow_worker_manager: RwLock::new(None),
+            flow_streaming_engine: RwLock::new(None),
         }
     }
 
-    /// Set the flow worker manager for the standalone instance.
-    pub async fn set_flow_worker_manager(&self, flow_worker_manager: Arc<FlowWorkerManager>) {
-        let mut guard = self.flow_worker_manager.write().await;
-        *guard = Some(flow_worker_manager);
+    /// Set the flow streaming engine for the standalone instance.
+    pub async fn set_flow_streaming_engine(&self, flow_streaming_engine: Arc<StreamingEngine>) {
+        let mut guard = self.flow_streaming_engine.write().await;
+        *guard = Some(flow_streaming_engine);
     }
 }
 
@@ -777,7 +829,11 @@ impl InformationExtension for StandaloneInformationExtension {
                     memtable_size: region_stat.memtable_size,
                     manifest_size: region_stat.manifest_size,
                     sst_size: region_stat.sst_size,
+                    sst_num: region_stat.sst_num,
                     index_size: region_stat.index_size,
+                    region_manifest: region_stat.manifest.into(),
+                    data_topic_latest_entry_id: region_stat.data_topic_latest_entry_id,
+                    metadata_topic_latest_entry_id: region_stat.metadata_topic_latest_entry_id,
                 }
             })
             .collect::<Vec<_>>();
@@ -786,7 +842,7 @@ impl InformationExtension for StandaloneInformationExtension {
 
     async fn flow_stats(&self) -> std::result::Result<Option<FlowStat>, Self::Error> {
         Ok(Some(
-            self.flow_worker_manager
+            self.flow_streaming_engine
                 .read()
                 .await
                 .as_ref()
@@ -808,7 +864,7 @@ mod tests {
     use common_config::ENV_VAR_SEP;
     use common_test_util::temp_dir::create_named_temp_file;
     use common_wal::config::DatanodeWalConfig;
-    use datanode::config::{FileConfig, GcsConfig};
+    use object_store::config::{FileConfig, GcsConfig};
 
     use super::*;
     use crate::options::GlobalOptions;
@@ -846,13 +902,11 @@ mod tests {
     fn test_read_from_config_file() {
         let mut file = create_named_temp_file();
         let toml_str = r#"
-            mode = "distributed"
-
             enable_memory_catalog = true
 
             [wal]
             provider = "raft_engine"
-            dir = "/tmp/greptimedb/test/wal"
+            dir = "./greptimedb_data/test/wal"
             file_size = "1GB"
             purge_threshold = "50GB"
             purge_interval = "10m"
@@ -860,7 +914,7 @@ mod tests {
             sync_write = false
 
             [storage]
-            data_home = "/tmp/greptimedb/"
+            data_home = "./greptimedb_data/"
             type = "File"
 
             [[storage.providers]]
@@ -892,7 +946,7 @@ mod tests {
 
             [logging]
             level = "debug"
-            dir = "/tmp/greptimedb/test/logs"
+            dir = "./greptimedb_data/test/logs"
         "#;
         write!(file, "{}", toml_str).unwrap();
         let cmd = StartCommand {
@@ -922,19 +976,22 @@ mod tests {
         let DatanodeWalConfig::RaftEngine(raft_engine_config) = dn_opts.wal else {
             unreachable!()
         };
-        assert_eq!("/tmp/greptimedb/test/wal", raft_engine_config.dir.unwrap());
+        assert_eq!(
+            "./greptimedb_data/test/wal",
+            raft_engine_config.dir.unwrap()
+        );
 
         assert!(matches!(
             &dn_opts.storage.store,
-            datanode::config::ObjectStoreConfig::File(FileConfig { .. })
+            object_store::config::ObjectStoreConfig::File(FileConfig { .. })
         ));
         assert_eq!(dn_opts.storage.providers.len(), 2);
         assert!(matches!(
             dn_opts.storage.providers[0],
-            datanode::config::ObjectStoreConfig::Gcs(GcsConfig { .. })
+            object_store::config::ObjectStoreConfig::Gcs(GcsConfig { .. })
         ));
         match &dn_opts.storage.providers[1] {
-            datanode::config::ObjectStoreConfig::S3(s3_config) => {
+            object_store::config::ObjectStoreConfig::S3(s3_config) => {
                 assert_eq!(
                     "SecretBox<alloc::string::String>([REDACTED])".to_string(),
                     format!("{:?}", s3_config.access_key_id)
@@ -946,7 +1003,7 @@ mod tests {
         }
 
         assert_eq!("debug", logging_opts.level.as_ref().unwrap());
-        assert_eq!("/tmp/greptimedb/test/logs".to_string(), logging_opts.dir);
+        assert_eq!("./greptimedb_data/test/logs".to_string(), logging_opts.dir);
     }
 
     #[test]
@@ -958,7 +1015,7 @@ mod tests {
 
         let opts = cmd
             .load_options(&GlobalOptions {
-                log_dir: Some("/tmp/greptimedb/test/logs".to_string()),
+                log_dir: Some("./greptimedb_data/test/logs".to_string()),
                 log_level: Some("debug".to_string()),
 
                 #[cfg(feature = "tokio-console")]
@@ -967,7 +1024,7 @@ mod tests {
             .unwrap()
             .component;
 
-        assert_eq!("/tmp/greptimedb/test/logs", opts.logging.dir);
+        assert_eq!("./greptimedb_data/test/logs", opts.logging.dir);
         assert_eq!("debug", opts.logging.level.unwrap());
     }
 
@@ -975,8 +1032,6 @@ mod tests {
     fn test_config_precedence_order() {
         let mut file = create_named_temp_file();
         let toml_str = r#"
-            mode = "standalone"
-
             [http]
             addr = "127.0.0.1:4000"
 
@@ -1051,7 +1106,6 @@ mod tests {
         let options =
             StandaloneOptions::load_layered_options(None, "GREPTIMEDB_STANDALONE").unwrap();
         let default_options = StandaloneOptions::default();
-        assert_eq!(options.mode, default_options.mode);
         assert_eq!(options.enable_telemetry, default_options.enable_telemetry);
         assert_eq!(options.http, default_options.http);
         assert_eq!(options.grpc, default_options.grpc);

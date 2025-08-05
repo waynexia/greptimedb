@@ -17,6 +17,7 @@
 //! It updates the manifest and applies the changes to the region in background.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 use common_telemetry::{info, warn};
 use store_api::logstore::LogStore;
@@ -28,10 +29,12 @@ use crate::error::{RegionBusySnafu, RegionNotFoundSnafu, Result};
 use crate::manifest::action::{
     RegionChange, RegionEdit, RegionMetaAction, RegionMetaActionList, RegionTruncate,
 };
+use crate::metrics::WRITE_CACHE_INFLIGHT_DOWNLOAD;
+use crate::region::version::VersionBuilder;
 use crate::region::{MitoRegionRef, RegionLeaderState, RegionRoleState};
 use crate::request::{
     BackgroundNotify, OptionOutputTx, RegionChangeResult, RegionEditRequest, RegionEditResult,
-    TruncateResult, WorkerRequest,
+    RegionSyncRequest, TruncateResult, WorkerRequest, WorkerRequestWithTime,
 };
 use crate::sst::location;
 use crate::worker::{RegionWorkerLoop, WorkerListener};
@@ -117,6 +120,64 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         self.handle_region_stalled_requests(&change_result.region_id)
             .await;
     }
+
+    /// Handles region sync request.
+    ///
+    /// Updates the manifest to at least the given version.
+    /// **Note**: The installed version may be greater than the given version.
+    pub(crate) async fn handle_region_sync(&mut self, request: RegionSyncRequest) {
+        let region_id = request.region_id;
+        let sender = request.sender;
+        let region = match self.regions.follower_region(region_id) {
+            Ok(region) => region,
+            Err(e) => {
+                let _ = sender.send(Err(e));
+                return;
+            }
+        };
+
+        let original_manifest_version = region.manifest_ctx.manifest_version().await;
+        let manifest = match region
+            .manifest_ctx
+            .install_manifest_to(request.manifest_version)
+            .await
+        {
+            Ok(manifest) => manifest,
+            Err(e) => {
+                let _ = sender.send(Err(e));
+                return;
+            }
+        };
+        let version = region.version();
+        if !version.memtables.is_empty() {
+            let current = region.version_control.current();
+            warn!(
+                "Region {} memtables is not empty, which should not happen, manifest version: {}, last entry id: {}",
+                region.region_id, manifest.manifest_version, current.last_entry_id
+            );
+        }
+        let region_options = version.options.clone();
+        let new_mutable = Arc::new(
+            region
+                .version()
+                .memtables
+                .mutable
+                .new_with_part_duration(version.compaction_time_window),
+        );
+        let metadata = manifest.metadata.clone();
+        let version = VersionBuilder::new(metadata, new_mutable)
+            .add_files(region.file_purger.clone(), manifest.files.values().cloned())
+            .flushed_entry_id(manifest.flushed_entry_id)
+            .flushed_sequence(manifest.flushed_sequence)
+            .truncated_entry_id(manifest.truncated_entry_id)
+            .compaction_time_window(manifest.compaction_time_window)
+            .options(region_options)
+            .build();
+        region.version_control.overwrite_current(Arc::new(version));
+
+        let updated = manifest.manifest_version > original_manifest_version;
+        let _ = sender.send(Ok((manifest.manifest_version, updated)));
+    }
 }
 
 impl<S> RegionWorkerLoop<S> {
@@ -169,7 +230,10 @@ impl<S> RegionWorkerLoop<S> {
                 }),
             };
             // We don't set state back as the worker loop is already exited.
-            if let Err(res) = request_sender.send(notify).await {
+            if let Err(res) = request_sender
+                .send(WorkerRequestWithTime::new(notify))
+                .await
+            {
                 warn!(
                     "Failed to send region edit result back to the worker, region_id: {}, res: {:?}",
                     region_id, res
@@ -253,14 +317,13 @@ impl<S> RegionWorkerLoop<S> {
                 region_id: truncate.region_id,
                 sender,
                 result,
-                truncated_entry_id: truncate.truncated_entry_id,
-                truncated_sequence: truncate.truncated_sequence,
+                kind: truncate.kind,
             };
             let _ = request_sender
-                .send(WorkerRequest::Background {
+                .send(WorkerRequestWithTime::new(WorkerRequest::Background {
                     region_id: truncate.region_id,
                     notify: BackgroundNotify::Truncate(truncate_result),
-                })
+                }))
                 .await
                 .inspect_err(|_| warn!("failed to send truncate result"));
         });
@@ -303,7 +366,10 @@ impl<S> RegionWorkerLoop<S> {
                 .on_notify_region_change_result_begin(region.region_id)
                 .await;
 
-            if let Err(res) = request_sender.send(notify).await {
+            if let Err(res) = request_sender
+                .send(WorkerRequestWithTime::new(notify))
+                .await
+            {
                 warn!(
                     "Failed to send region change result back to the worker, region_id: {}, res: {:?}",
                     region.region_id, res
@@ -328,9 +394,24 @@ async fn edit_region(
             let listener = listener.clone();
 
             let index_key = IndexKey::new(region_id, file_meta.file_id, FileType::Parquet);
-            let remote_path = location::sst_file_path(layer.region_dir(), file_meta.file_id);
+            let remote_path =
+                location::sst_file_path(layer.table_dir(), file_meta.file_id(), layer.path_type());
+
+            let is_index_exist = file_meta.exists_index();
+            let index_file_size = file_meta.index_file_size();
+
+            let index_file_index_key =
+                IndexKey::new(region_id, file_meta.file_id, FileType::Puffin);
+            let index_remote_path = location::index_file_path(
+                layer.table_dir(),
+                file_meta.file_id(),
+                layer.path_type(),
+            );
+
             let file_size = file_meta.file_size;
             common_runtime::spawn_global(async move {
+                WRITE_CACHE_INFLIGHT_DOWNLOAD.add(1);
+
                 if write_cache
                     .download(index_key, &remote_path, layer.object_store(), file_size)
                     .await
@@ -345,6 +426,24 @@ async fn edit_region(
 
                     listener.on_file_cache_filled(index_key.file_id);
                 }
+                if is_index_exist {
+                    // also download puffin file
+                    if let Err(err) = write_cache
+                        .download(
+                            index_file_index_key,
+                            &index_remote_path,
+                            layer.object_store(),
+                            index_file_size,
+                        )
+                        .await
+                    {
+                        common_telemetry::error!(
+                            err; "Failed to download puffin file, region_id: {}, index_file_index_key: {:?}, index_remote_path: {}", region_id, index_file_index_key, index_remote_path
+                        );
+                    }
+                }
+
+                WRITE_CACHE_INFLIGHT_DOWNLOAD.sub(1);
             });
         }
     }

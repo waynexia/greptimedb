@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use common_telemetry::warn;
+use dashmap::DashMap;
 use rskafka::client::partition::{Compression, OffsetAt, PartitionClient};
 use rskafka::record::Record;
 use store_api::logstore::provider::KafkaProvider;
@@ -24,6 +25,10 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 use crate::error::{self, Result};
 use crate::kafka::index::IndexCollector;
 use crate::kafka::worker::{BackgroundProducerWorker, ProduceResultHandle, WorkerRequest};
+use crate::metrics::{
+    METRIC_KAFKA_CLIENT_BYTES_TOTAL, METRIC_KAFKA_CLIENT_PRODUCE_ELAPSED,
+    METRIC_KAFKA_CLIENT_TRAFFIC_TOTAL,
+};
 
 pub type OrderedBatchProducerRef = Arc<OrderedBatchProducer>;
 
@@ -52,6 +57,7 @@ impl OrderedBatchProducer {
         compression: Compression,
         max_batch_bytes: usize,
         index_collector: Box<dyn IndexCollector>,
+        high_watermark: Arc<DashMap<Arc<KafkaProvider>, u64>>,
     ) -> Self {
         let mut worker = BackgroundProducerWorker {
             provider,
@@ -61,6 +67,7 @@ impl OrderedBatchProducer {
             request_batch_size: REQUEST_BATCH_SIZE,
             max_batch_bytes,
             index_collector,
+            high_watermark,
         };
         tokio::spawn(async move { worker.run().await });
         Self { sender: tx }
@@ -86,6 +93,21 @@ impl OrderedBatchProducer {
 
         Ok(handle)
     }
+
+    /// Sends an [WorkerRequest::UpdateHighWatermark] request to the producer.
+    /// This is used to update the high watermark for the topic.
+    pub(crate) async fn update_high_watermark(&self) -> Result<()> {
+        if self
+            .sender
+            .send(WorkerRequest::UpdateHighWatermark)
+            .await
+            .is_err()
+        {
+            warn!("OrderedBatchProducer is already exited");
+            return error::OrderedBatchProducerStoppedSnafu {}.fail();
+        }
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -106,6 +128,18 @@ impl ProducerClient for PartitionClient {
         records: Vec<Record>,
         compression: Compression,
     ) -> rskafka::client::error::Result<Vec<i64>> {
+        let total_size = records.iter().map(|r| r.approximate_size()).sum::<usize>();
+        let partition = self.partition().to_string();
+        METRIC_KAFKA_CLIENT_BYTES_TOTAL
+            .with_label_values(&[self.topic(), &partition])
+            .inc_by(total_size as u64);
+        METRIC_KAFKA_CLIENT_TRAFFIC_TOTAL
+            .with_label_values(&[self.topic(), &partition])
+            .inc();
+        let _timer = METRIC_KAFKA_CLIENT_PRODUCE_ELAPSED
+            .with_label_values(&[self.topic(), &partition])
+            .start_timer();
+
         self.produce(records, compression).await
     }
 
@@ -119,7 +153,6 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use chrono::{TimeZone, Utc};
     use common_base::readable_size::ReadableSize;
     use common_telemetry::debug;
     use futures::stream::FuturesUnordered;
@@ -133,6 +166,7 @@ mod tests {
     use super::*;
     use crate::kafka::index::NoopCollector;
     use crate::kafka::producer::OrderedBatchProducer;
+    use crate::kafka::test_util::record;
 
     #[derive(Debug)]
     struct MockClient {
@@ -180,15 +214,6 @@ mod tests {
         }
     }
 
-    fn record() -> Record {
-        Record {
-            key: Some(vec![0; 4]),
-            value: Some(vec![0; 6]),
-            headers: Default::default(),
-            timestamp: Utc.timestamp_millis_opt(320).unwrap(),
-        }
-    }
-
     #[tokio::test]
     async fn test_producer() {
         common_telemetry::init_default_ut_logging();
@@ -208,6 +233,7 @@ mod tests {
             Compression::NoCompression,
             ReadableSize((record.approximate_size() * 2) as u64).as_bytes() as usize,
             Box::new(NoopCollector),
+            Arc::new(DashMap::new()),
         );
 
         let region_id = RegionId::new(1, 1);
@@ -256,6 +282,7 @@ mod tests {
             Compression::NoCompression,
             ReadableSize((record.approximate_size() * 2) as u64).as_bytes() as usize,
             Box::new(NoopCollector),
+            Arc::new(DashMap::new()),
         );
 
         let region_id = RegionId::new(1, 1);
@@ -308,6 +335,7 @@ mod tests {
             Compression::NoCompression,
             ReadableSize((record.approximate_size() * 2) as u64).as_bytes() as usize,
             Box::new(NoopCollector),
+            Arc::new(DashMap::new()),
         );
 
         let region_id = RegionId::new(1, 1);

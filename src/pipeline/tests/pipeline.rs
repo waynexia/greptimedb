@@ -13,14 +13,14 @@
 // limitations under the License.
 
 use api::v1::value::ValueData;
-use api::v1::Rows;
+use api::v1::{Rows, Value};
 use common_telemetry::tracing::info;
 use greptime_proto::v1::value::ValueData::{
     BinaryValue, BoolValue, F64Value, StringValue, TimestampNanosecondValue, TimestampSecondValue,
     U32Value, U64Value, U8Value,
 };
 use greptime_proto::v1::Value as GreptimeValue;
-use pipeline::{json_to_intermediate_state, parse, Content, GreptimeTransformer, Pipeline};
+use pipeline::{parse, setup_pipeline, Content, Pipeline, PipelineContext};
 
 #[test]
 fn test_complex_data() {
@@ -418,19 +418,24 @@ transform:
     .collect::<Vec<GreptimeValue>>();
 
     let yaml_content = Content::Yaml(pipeline_yaml);
-    let pipeline: Pipeline<GreptimeTransformer> =
-        parse(&yaml_content).expect("failed to parse pipeline");
-    let mut stats = json_to_intermediate_state(input_value).unwrap();
+    let pipeline: Pipeline = parse(&yaml_content).expect("failed to parse pipeline");
+    let (pipeline, mut schema_info, pipeline_def, pipeline_param) = setup_pipeline!(pipeline);
+    let pipeline_ctx = PipelineContext::new(
+        &pipeline_def,
+        &pipeline_param,
+        session::context::Channel::Unknown,
+    );
+    let stats = input_value.into();
 
     let row = pipeline
-        .exec_mut(&mut stats)
+        .exec_mut(stats, &pipeline_ctx, &mut schema_info)
         .expect("failed to exec pipeline")
         .into_transformed()
         .expect("expect transformed result ");
 
     let output = Rows {
-        schema: pipeline.schemas().clone(),
-        rows: vec![row],
+        schema: pipeline.schemas().unwrap().clone(),
+        rows: vec![row.0],
     };
 
     assert_eq!(output.rows.len(), 1);
@@ -487,15 +492,22 @@ transform:
 "#;
 
     let yaml_content = Content::Yaml(pipeline_yaml);
-    let pipeline: Pipeline<GreptimeTransformer> = parse(&yaml_content).unwrap();
+    let pipeline: Pipeline = parse(&yaml_content).unwrap();
+    let (pipeline, mut schema_info, pipeline_def, pipeline_param) = setup_pipeline!(pipeline);
+    let pipeline_ctx = PipelineContext::new(
+        &pipeline_def,
+        &pipeline_param,
+        session::context::Channel::Unknown,
+    );
 
-    let mut status = json_to_intermediate_state(input_value).unwrap();
+    let status = input_value.into();
     let row = pipeline
-        .exec_mut(&mut status)
+        .exec_mut(status, &pipeline_ctx, &mut schema_info)
         .unwrap()
         .into_transformed()
         .expect("expect transformed result ");
     let r = row
+        .0
         .values
         .into_iter()
         .map(|v| v.value_data.unwrap())
@@ -595,16 +607,23 @@ transform:
 "#;
 
     let yaml_content = Content::Yaml(pipeline_yaml);
-    let pipeline: Pipeline<GreptimeTransformer> = parse(&yaml_content).unwrap();
+    let pipeline: Pipeline = parse(&yaml_content).unwrap();
+    let (pipeline, mut schema_info, pipeline_def, pipeline_param) = setup_pipeline!(pipeline);
+    let pipeline_ctx = PipelineContext::new(
+        &pipeline_def,
+        &pipeline_param,
+        session::context::Channel::Unknown,
+    );
 
-    let mut status = json_to_intermediate_state(input_value).unwrap();
+    let status = input_value.into();
     let row = pipeline
-        .exec_mut(&mut status)
+        .exec_mut(status, &pipeline_ctx, &mut schema_info)
         .unwrap()
         .into_transformed()
         .expect("expect transformed result ");
 
     let r = row
+        .0
         .values
         .into_iter()
         .map(|v| v.value_data.unwrap())
@@ -660,15 +679,22 @@ transform:
 "#;
 
     let yaml_content = Content::Yaml(pipeline_yaml);
-    let pipeline: Pipeline<GreptimeTransformer> = parse(&yaml_content).unwrap();
+    let pipeline: Pipeline = parse(&yaml_content).unwrap();
+    let (pipeline, mut schema_info, pipeline_def, pipeline_param) = setup_pipeline!(pipeline);
+    let pipeline_ctx = PipelineContext::new(
+        &pipeline_def,
+        &pipeline_param,
+        session::context::Channel::Unknown,
+    );
 
-    let mut status = json_to_intermediate_state(input_value).unwrap();
+    let status = input_value.into();
     let row = pipeline
-        .exec_mut(&mut status)
+        .exec_mut(status, &pipeline_ctx, &mut schema_info)
         .unwrap()
         .into_transformed()
         .expect("expect transformed result ");
     let r = row
+        .0
         .values
         .into_iter()
         .map(|v| v.value_data.unwrap())
@@ -699,17 +725,23 @@ transform:
     type: string
 "#;
     let yaml_content = Content::Yaml(pipeline_yaml);
-    let pipeline: Pipeline<GreptimeTransformer> = parse(&yaml_content).unwrap();
+    let pipeline: Pipeline = parse(&yaml_content).unwrap();
+    let (pipeline, mut schema_info, pipeline_def, pipeline_param) = setup_pipeline!(pipeline);
+    let pipeline_ctx = PipelineContext::new(
+        &pipeline_def,
+        &pipeline_param,
+        session::context::Channel::Unknown,
+    );
 
-    let mut status = json_to_intermediate_state(input_value).unwrap();
-
+    let status = input_value.into();
     let row = pipeline
-        .exec_mut(&mut status)
+        .exec_mut(status, &pipeline_ctx, &mut schema_info)
         .unwrap()
         .into_transformed()
         .expect("expect transformed result ");
 
     let r = row
+        .0
         .values
         .into_iter()
         .map(|v| v.value_data.unwrap())
@@ -758,16 +790,23 @@ transform:
 "#;
 
     let yaml_content = Content::Yaml(pipeline_yaml);
-    let pipeline: Pipeline<GreptimeTransformer> = parse(&yaml_content).unwrap();
+    let pipeline: Pipeline = parse(&yaml_content).unwrap();
+    let (pipeline, mut schema_info, pipeline_def, pipeline_param) = setup_pipeline!(pipeline);
+    let pipeline_ctx = PipelineContext::new(
+        &pipeline_def,
+        &pipeline_param,
+        session::context::Channel::Unknown,
+    );
 
-    let mut status = json_to_intermediate_state(input_value).unwrap();
+    let status = input_value.into();
     let row = pipeline
-        .exec_mut(&mut status)
+        .exec_mut(status, &pipeline_ctx, &mut schema_info)
         .unwrap()
         .into_transformed()
         .expect("expect transformed result ");
 
     let mut r = row
+        .0
         .values
         .into_iter()
         .map(|v| v.value_data.unwrap())
@@ -798,16 +837,22 @@ transform:
 "#;
 
     let yaml_content = Content::Yaml(pipeline_yaml);
-    let pipeline: Pipeline<GreptimeTransformer> = parse(&yaml_content).unwrap();
+    let pipeline: Pipeline = parse(&yaml_content).unwrap();
+    let (pipeline, mut schema_info, pipeline_def, pipeline_param) = setup_pipeline!(pipeline);
+    let pipeline_ctx = PipelineContext::new(
+        &pipeline_def,
+        &pipeline_param,
+        session::context::Channel::Unknown,
+    );
 
-    let mut status = json_to_intermediate_state(input_value).unwrap();
+    let status = input_value.into();
     let row = pipeline
-        .exec_mut(&mut status)
+        .exec_mut(status, &pipeline_ctx, &mut schema_info)
         .unwrap()
         .into_transformed()
         .expect("expect transformed result ");
 
-    row.values.into_iter().for_each(|v| {
+    row.0.values.into_iter().for_each(|v| {
         if let ValueData::TimestampNanosecondValue(v) = v.value_data.unwrap() {
             let now = chrono::Utc::now().timestamp_nanos_opt().unwrap();
             assert!(now - v < 1_000_000);
@@ -860,24 +905,31 @@ transform:
 "#;
 
     let yaml_content = Content::Yaml(pipeline_yaml);
-    let pipeline: Pipeline<GreptimeTransformer> = parse(&yaml_content).unwrap();
+    let pipeline: Pipeline = parse(&yaml_content).unwrap();
+    let (pipeline, mut schema_info, pipeline_def, pipeline_param) = setup_pipeline!(pipeline);
+    let pipeline_ctx = PipelineContext::new(
+        &pipeline_def,
+        &pipeline_param,
+        session::context::Channel::Unknown,
+    );
 
-    let mut status = json_to_intermediate_state(input_value1).unwrap();
+    let status = input_value1.into();
     let dispatched_to = pipeline
-        .exec_mut(&mut status)
+        .exec_mut(status, &pipeline_ctx, &mut schema_info)
         .unwrap()
         .into_dispatched()
         .expect("expect dispatched result ");
     assert_eq!(dispatched_to.table_suffix, "http");
     assert_eq!(dispatched_to.pipeline.unwrap(), "access_log_pipeline");
 
-    let mut status = json_to_intermediate_state(input_value2).unwrap();
+    let status = input_value2.into();
     let row = pipeline
-        .exec_mut(&mut status)
+        .exec_mut(status, &pipeline_ctx, &mut schema_info)
         .unwrap()
         .into_transformed()
         .expect("expect transformed result ");
     let r = row
+        .0
         .values
         .into_iter()
         .map(|v| v.value_data.unwrap())
@@ -889,4 +941,63 @@ transform:
     ];
 
     assert_eq!(expected, r);
+}
+
+#[test]
+fn test_table_suffix_template() {
+    let input_value = r#"
+{
+    "line": "2024-05-25 20:16:37.217 [http] hello world"
+}
+"#;
+    let input_value = serde_json::from_str::<serde_json::Value>(input_value).unwrap();
+
+    let pipeline_yaml = r#"
+processors:
+  - dissect:
+      fields:
+        - line
+      patterns:
+        - "%{+ts} %{+ts} [%{logger}] %{content}"
+  - date:
+      fields:
+        - ts
+      formats:
+        - "%Y-%m-%d %H:%M:%S%.3f"
+transform:
+  - fields:
+      - content
+    type: string
+  - field: ts
+    type: time
+    index: timestamp
+table_suffix: _${logger}
+"#;
+
+    let yaml_content = Content::Yaml(pipeline_yaml);
+    let pipeline: Pipeline = parse(&yaml_content).unwrap();
+    let (pipeline, mut schema_info, pipeline_def, pipeline_param) = setup_pipeline!(pipeline);
+    let pipeline_ctx = PipelineContext::new(
+        &pipeline_def,
+        &pipeline_param,
+        session::context::Channel::Unknown,
+    );
+
+    let status = input_value.into();
+    let exec_re = pipeline
+        .exec_mut(status, &pipeline_ctx, &mut schema_info)
+        .unwrap();
+
+    let (row, table_name) = exec_re.into_transformed().unwrap();
+    let values = row.values;
+    let expected_values = vec![
+        Value {
+            value_data: Some(ValueData::StringValue("hello world".into())),
+        },
+        Value {
+            value_data: Some(ValueData::TimestampNanosecondValue(1716668197217000000)),
+        },
+    ];
+    assert_eq!(expected_values, values);
+    assert_eq!(table_name, Some("_http".to_string()));
 }

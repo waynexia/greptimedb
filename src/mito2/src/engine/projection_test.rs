@@ -53,7 +53,7 @@ fn build_rows_multi_tags_fields(
 
 #[tokio::test]
 async fn test_scan_projection() {
-    let mut env = TestEnv::new();
+    let mut env = TestEnv::new().await;
     let engine = env.create_engine(MitoConfig::default()).await;
 
     let region_id = RegionId::new(1, 1);
@@ -76,10 +76,7 @@ async fn test_scan_projection() {
     let request = ScanRequest {
         projection: Some(vec![1, 3, 4]),
         filters: Vec::new(),
-        output_ordering: None,
-        limit: None,
-        series_row_selector: None,
-        sequence: None,
+        ..Default::default()
     };
     let stream = engine.scan_to_stream(region_id, request).await.unwrap();
     let batches = RecordBatches::try_collect(stream).await.unwrap();

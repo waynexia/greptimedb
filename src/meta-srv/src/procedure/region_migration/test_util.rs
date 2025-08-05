@@ -18,12 +18,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use api::v1::meta::mailbox_message::Payload;
-use api::v1::meta::{HeartbeatResponse, MailboxMessage, RequestHeader};
+use api::v1::meta::MailboxMessage;
 use common_meta::ddl::NoopRegionFailureDetectorControl;
-use common_meta::instruction::{
-    DowngradeRegionReply, InstructionReply, SimpleReply, UpgradeRegionReply,
-};
 use common_meta::key::table_route::TableRouteValue;
 use common_meta::key::{TableMetadataManager, TableMetadataManagerRef};
 use common_meta::kv_backend::memory::MemoryKvBackend;
@@ -31,26 +27,27 @@ use common_meta::kv_backend::KvBackendRef;
 use common_meta::peer::Peer;
 use common_meta::region_keeper::{MemoryRegionKeeper, MemoryRegionKeeperRef};
 use common_meta::rpc::router::RegionRoute;
-use common_meta::sequence::{Sequence, SequenceBuilder};
+use common_meta::sequence::SequenceBuilder;
 use common_meta::state_store::KvStateStore;
 use common_meta::DatanodeId;
 use common_procedure::local::{LocalManager, ManagerConfig};
+use common_procedure::test_util::InMemoryPoisonStore;
 use common_procedure::{Context as ProcedureContext, ProcedureId, ProcedureManagerRef, Status};
 use common_procedure_test::MockContextProvider;
 use common_telemetry::debug;
-use common_time::util::current_time_millis;
 use futures::future::BoxFuture;
 use store_api::storage::RegionId;
 use table::metadata::RawTableInfo;
-use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::cache_invalidator::MetasrvCacheInvalidator;
 use crate::error::{self, Error, Result};
-use crate::handler::{HeartbeatMailbox, Pusher, Pushers};
 use crate::metasrv::MetasrvInfo;
 use crate::procedure::region_migration::close_downgraded_region::CloseDowngradedRegion;
 use crate::procedure::region_migration::downgrade_leader_region::DowngradeLeaderRegion;
-use crate::procedure::region_migration::manager::RegionMigrationProcedureTracker;
+use crate::procedure::region_migration::flush_leader_region::PreFlushRegion;
+use crate::procedure::region_migration::manager::{
+    RegionMigrationProcedureTracker, RegionMigrationTriggerReason,
+};
 use crate::procedure::region_migration::migration_abort::RegionMigrationAbort;
 use crate::procedure::region_migration::migration_end::RegionMigrationEnd;
 use crate::procedure::region_migration::open_candidate_region::OpenCandidateRegion;
@@ -59,40 +56,8 @@ use crate::procedure::region_migration::upgrade_candidate_region::UpgradeCandida
 use crate::procedure::region_migration::{
     Context, ContextFactory, DefaultContextFactory, PersistentContext, State, VolatileContext,
 };
-use crate::service::mailbox::{Channel, MailboxRef};
-
-pub type MockHeartbeatReceiver = Receiver<std::result::Result<HeartbeatResponse, tonic::Status>>;
-
-/// The context of mailbox.
-pub struct MailboxContext {
-    mailbox: MailboxRef,
-    // The pusher is used in the mailbox.
-    pushers: Pushers,
-}
-
-impl MailboxContext {
-    pub fn new(sequence: Sequence) -> Self {
-        let pushers = Pushers::default();
-        let mailbox = HeartbeatMailbox::create(pushers.clone(), sequence);
-
-        Self { mailbox, pushers }
-    }
-
-    /// Inserts a pusher for `datanode_id`
-    pub async fn insert_heartbeat_response_receiver(
-        &mut self,
-        channel: Channel,
-        tx: Sender<std::result::Result<HeartbeatResponse, tonic::Status>>,
-    ) {
-        let pusher_id = channel.pusher_id();
-        let pusher = Pusher::new(tx, &RequestHeader::default());
-        let _ = self.pushers.insert(pusher_id.string_key(), pusher).await;
-    }
-
-    pub fn mailbox(&self) -> &MailboxRef {
-        &self.mailbox
-    }
-}
+use crate::procedure::test_util::{send_mock_reply, MailboxContext};
+use crate::service::mailbox::Channel;
 
 /// `TestingEnv` provides components during the tests.
 pub struct TestingEnv {
@@ -124,7 +89,13 @@ impl TestingEnv {
         let opening_region_keeper = Arc::new(MemoryRegionKeeper::default());
 
         let state_store = Arc::new(KvStateStore::new(kv_backend.clone()));
-        let procedure_manager = Arc::new(LocalManager::new(ManagerConfig::default(), state_store));
+        let poison_manager = Arc::new(InMemoryPoisonStore::default());
+        let procedure_manager = Arc::new(LocalManager::new(
+            ManagerConfig::default(),
+            state_store,
+            poison_manager,
+            None,
+        ));
 
         Self {
             table_metadata_manager,
@@ -153,11 +124,12 @@ impl TestingEnv {
             table_metadata_manager: self.table_metadata_manager.clone(),
             opening_region_keeper: self.opening_region_keeper.clone(),
             volatile_ctx: Default::default(),
+            in_memory_key: Arc::new(MemoryKvBackend::default()),
             mailbox: self.mailbox_ctx.mailbox().clone(),
             server_addr: self.server_addr.to_string(),
             region_failure_detector_controller: Arc::new(NoopRegionFailureDetectorControl),
             cache_invalidator: Arc::new(MetasrvCacheInvalidator::new(
-                self.mailbox_ctx.mailbox.clone(),
+                self.mailbox_ctx.mailbox().clone(),
                 MetasrvInfo {
                     server_addr: self.server_addr.to_string(),
                 },
@@ -210,105 +182,6 @@ impl TestingEnv {
     }
 }
 
-/// Generates a [InstructionReply::OpenRegion] reply.
-pub(crate) fn new_open_region_reply(
-    id: u64,
-    result: bool,
-    error: Option<String>,
-) -> MailboxMessage {
-    MailboxMessage {
-        id,
-        subject: "mock".to_string(),
-        from: "datanode".to_string(),
-        to: "meta".to_string(),
-        timestamp_millis: current_time_millis(),
-        payload: Some(Payload::Json(
-            serde_json::to_string(&InstructionReply::OpenRegion(SimpleReply { result, error }))
-                .unwrap(),
-        )),
-    }
-}
-
-/// Generates a [InstructionReply::CloseRegion] reply.
-pub fn new_close_region_reply(id: u64) -> MailboxMessage {
-    MailboxMessage {
-        id,
-        subject: "mock".to_string(),
-        from: "datanode".to_string(),
-        to: "meta".to_string(),
-        timestamp_millis: current_time_millis(),
-        payload: Some(Payload::Json(
-            serde_json::to_string(&InstructionReply::CloseRegion(SimpleReply {
-                result: false,
-                error: None,
-            }))
-            .unwrap(),
-        )),
-    }
-}
-
-/// Generates a [InstructionReply::DowngradeRegion] reply.
-pub fn new_downgrade_region_reply(
-    id: u64,
-    last_entry_id: Option<u64>,
-    exist: bool,
-    error: Option<String>,
-) -> MailboxMessage {
-    MailboxMessage {
-        id,
-        subject: "mock".to_string(),
-        from: "datanode".to_string(),
-        to: "meta".to_string(),
-        timestamp_millis: current_time_millis(),
-        payload: Some(Payload::Json(
-            serde_json::to_string(&InstructionReply::DowngradeRegion(DowngradeRegionReply {
-                last_entry_id,
-                exists: exist,
-                error,
-            }))
-            .unwrap(),
-        )),
-    }
-}
-
-/// Generates a [InstructionReply::UpgradeRegion] reply.
-pub fn new_upgrade_region_reply(
-    id: u64,
-    ready: bool,
-    exists: bool,
-    error: Option<String>,
-) -> MailboxMessage {
-    MailboxMessage {
-        id,
-        subject: "mock".to_string(),
-        from: "datanode".to_string(),
-        to: "meta".to_string(),
-        timestamp_millis: current_time_millis(),
-        payload: Some(Payload::Json(
-            serde_json::to_string(&InstructionReply::UpgradeRegion(UpgradeRegionReply {
-                ready,
-                exists,
-                error,
-            }))
-            .unwrap(),
-        )),
-    }
-}
-
-/// Sends a mock reply.
-pub fn send_mock_reply(
-    mailbox: MailboxRef,
-    mut rx: MockHeartbeatReceiver,
-    msg: impl Fn(u64) -> Result<MailboxMessage> + Send + 'static,
-) {
-    common_runtime::spawn_global(async move {
-        while let Some(Ok(resp)) = rx.recv().await {
-            let reply_id = resp.mailbox_message.unwrap().id;
-            mailbox.on_recv(reply_id, msg(reply_id)).await.unwrap();
-        }
-    });
-}
-
 /// Generates a [PersistentContext].
 pub fn new_persistent_context(from: u64, to: u64, region_id: RegionId) -> PersistentContext {
     PersistentContext {
@@ -317,8 +190,8 @@ pub fn new_persistent_context(from: u64, to: u64, region_id: RegionId) -> Persis
         from_peer: Peer::empty(from),
         to_peer: Peer::empty(to),
         region_id,
-        cluster_id: 0,
         timeout: Duration::from_secs(10),
+        trigger_reason: RegionMigrationTriggerReason::default(),
     }
 }
 
@@ -394,7 +267,8 @@ impl ProcedureMigrationTestSuite {
         }
 
         debug!("suite test: {name} invoking next");
-        let result = self.state.next(&mut self.context).await;
+        let procedure_ctx = new_procedure_context();
+        let result = self.state.next(&mut self.context, &procedure_ctx).await;
 
         match assertion {
             Assertion::Simple(state_assert, status_assert) => {
@@ -548,6 +422,11 @@ pub(crate) fn assert_open_candidate_region(next: &dyn State) {
     let _ = next.as_any().downcast_ref::<OpenCandidateRegion>().unwrap();
 }
 
+/// Asserts the [State] should be [FlushLeaderRegion].
+pub(crate) fn assert_flush_leader_region(next: &dyn State) {
+    let _ = next.as_any().downcast_ref::<PreFlushRegion>().unwrap();
+}
+
 /// Asserts the [State] should be [UpdateMetadata::Downgrade].
 pub(crate) fn assert_update_metadata_downgrade(next: &dyn State) {
     let state = next.as_any().downcast_ref::<UpdateMetadata>().unwrap();
@@ -688,5 +567,13 @@ fn test_merge_mailbox_messages() {
         assert_eq!(violated, "second");
     } else {
         unreachable!()
+    }
+}
+
+/// Returns a new [ProcedureContext].
+pub fn new_procedure_context() -> ProcedureContext {
+    ProcedureContext {
+        procedure_id: ProcedureId::random(),
+        provider: Arc::new(MockContextProvider::default()),
     }
 }

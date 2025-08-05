@@ -33,7 +33,7 @@ use crate::test_util::{CreateRequestBuilder, TestEnv};
 
 #[tokio::test]
 async fn test_edit_region_schedule_compaction() {
-    let mut env = TestEnv::new();
+    let mut env = TestEnv::new().await;
 
     struct EditRegionListener {
         tx: Mutex<Option<oneshot::Sender<RegionId>>>,
@@ -122,7 +122,7 @@ async fn test_edit_region_schedule_compaction() {
 
 #[tokio::test]
 async fn test_edit_region_fill_cache() {
-    let mut env = TestEnv::new();
+    let mut env = TestEnv::new().await;
 
     struct EditRegionListener {
         tx: Mutex<Option<oneshot::Sender<FileId>>>,
@@ -165,7 +165,7 @@ async fn test_edit_region_fill_cache() {
     env.get_object_store()
         .unwrap()
         .write(
-            &format!("{}/{}.parquet", region.region_dir(), file_id),
+            &format!("{}/{}.parquet", region.table_dir(), file_id),
             b"x".as_slice(),
         )
         .await
@@ -215,7 +215,7 @@ async fn test_edit_region_concurrently() {
                 };
                 object_store
                     .write(
-                        &format!("{}/{}.parquet", self.region.region_dir(), file.file_id),
+                        &format!("{}/{}.parquet", self.region.table_dir(), file.file_id),
                         b"x".as_slice(),
                     )
                     .await
@@ -241,7 +241,7 @@ async fn test_edit_region_concurrently() {
         }
     }
 
-    let mut env = TestEnv::new();
+    let mut env = TestEnv::new().await;
     let engine = env
         .create_engine(MitoConfig {
             // Suppress the compaction to not impede the speed of this kinda stress testing.

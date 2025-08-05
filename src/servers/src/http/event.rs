@@ -12,12 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::BTreeMap;
+use std::fmt::Display;
+use std::io::BufRead;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
 
-use api::v1::RowInsertRequests;
 use async_trait::async_trait;
+use axum::body::Bytes;
 use axum::extract::{FromRequest, Multipart, Path, Query, Request, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, StatusCode};
@@ -30,20 +33,24 @@ use common_telemetry::{error, warn};
 use datatypes::value::column_data_to_json;
 use headers::ContentType;
 use lazy_static::lazy_static;
-use pipeline::error::PipelineTransformSnafu;
+use mime_guess::mime;
 use pipeline::util::to_pipeline_version;
-use pipeline::{GreptimePipelineParams, GreptimeTransformer, PipelineDefinition, PipelineVersion};
+use pipeline::{ContextReq, GreptimePipelineParams, PipelineContext, PipelineDefinition};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Deserializer, Map, Value};
+use serde_json::{json, Deserializer, Map, Value as JsonValue};
 use session::context::{Channel, QueryContext, QueryContextRef};
+use simd_json::Buffers;
 use snafu::{ensure, OptionExt, ResultExt};
+use strum::{EnumIter, IntoEnumIterator};
+use vrl::value::{KeyString, Value as VrlValue};
 
 use crate::error::{
-    status_code_to_http_status, Error, InvalidParameterSnafu, ParseJsonSnafu, PipelineSnafu,
-    Result, UnsupportedContentTypeSnafu,
+    status_code_to_http_status, Error, InvalidParameterSnafu, ParseJsonSnafu, PipelineSnafu, Result,
 };
 use crate::http::header::constants::GREPTIME_PIPELINE_PARAMS_HEADER;
-use crate::http::header::CONTENT_TYPE_PROTOBUF_STR;
+use crate::http::header::{
+    CONTENT_TYPE_NDJSON_STR, CONTENT_TYPE_NDJSON_SUBTYPE_STR, CONTENT_TYPE_PROTOBUF_STR,
+};
 use crate::http::result::greptime_manage_resp::GreptimedbManageResponse;
 use crate::http::result::greptime_result_v1::GreptimedbV1Response;
 use crate::http::HttpResponse;
@@ -56,6 +63,7 @@ use crate::pipeline::run_pipeline;
 use crate::query_handler::PipelineHandlerRef;
 
 const GREPTIME_INTERNAL_PIPELINE_NAME_PREFIX: &str = "greptime_";
+const GREPTIME_PIPELINE_SKIP_ERROR_KEY: &str = "skip_error";
 
 lazy_static! {
     pub static ref JSON_CONTENT_TYPE: ContentType = ContentType::json();
@@ -63,6 +71,8 @@ lazy_static! {
     pub static ref TEXT_UTF8_CONTENT_TYPE: ContentType = ContentType::text_utf8();
     pub static ref PB_CONTENT_TYPE: ContentType =
         ContentType::from_str(CONTENT_TYPE_PROTOBUF_STR).unwrap();
+    pub static ref NDJSON_CONTENT_TYPE: ContentType =
+        ContentType::from_str(CONTENT_TYPE_NDJSON_STR).unwrap();
 }
 
 /// LogIngesterQueryParams is used for query params of log ingester API.
@@ -83,16 +93,31 @@ pub struct LogIngesterQueryParams {
     /// The JSON field name of the log message. If not provided, it will take the whole log as the message.
     /// The field must be at the top level of the JSON structure.
     pub msg_field: Option<String>,
+    /// Specify a custom time index from the input data rather than server's arrival time.
+    /// Valid formats:
+    /// - <field_name>;epoch;<resolution>
+    /// - <field_name>;datestr;<format>
+    ///
+    /// If an error occurs while parsing the config, the error will be returned in the response.
+    /// If an error occurs while ingesting the data, the `ignore_errors` will be used to determine if the error should be ignored.
+    /// If so, use the current server's timestamp as the event time.
+    pub custom_time_index: Option<String>,
+    /// Whether to skip errors during log ingestion.
+    /// If set to true, the ingestion will continue even if there are errors in the data.
+    /// If set to false, the ingestion will stop at the first error.
+    /// This is different from `ignore_errors`, which is used to ignore errors during the pipeline execution.
+    /// The priority of query params is lower than that headers of x-greptime-pipeline-params.
+    pub skip_error: Option<bool>,
 }
 
 /// LogIngestRequest is the internal request for log ingestion. The raw log input can be transformed into multiple LogIngestRequests.
 /// Multiple LogIngestRequests will be ingested into the same database with the same pipeline.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct LogIngestRequest {
+#[derive(Debug, PartialEq)]
+pub(crate) struct PipelineIngestRequest {
     /// The table where the log data will be written to.
     pub table: String,
     /// The log data to be ingested.
-    pub values: Vec<Value>,
+    pub values: Vec<VrlValue>,
 }
 
 pub struct PipelineContent(String);
@@ -136,6 +161,41 @@ where
 }
 
 #[axum_macros::debug_handler]
+pub async fn query_pipeline(
+    State(state): State<LogState>,
+    Extension(mut query_ctx): Extension<QueryContext>,
+    Query(query_params): Query<LogIngesterQueryParams>,
+    Path(pipeline_name): Path<String>,
+) -> Result<GreptimedbManageResponse> {
+    let start = Instant::now();
+    let handler = state.log_handler;
+    ensure!(
+        !pipeline_name.is_empty(),
+        InvalidParameterSnafu {
+            reason: "pipeline_name is required in path",
+        }
+    );
+
+    let version = to_pipeline_version(query_params.version.as_deref()).context(PipelineSnafu)?;
+
+    query_ctx.set_channel(Channel::Log);
+    let query_ctx = Arc::new(query_ctx);
+
+    let (pipeline, pipeline_version) = handler
+        .get_pipeline_str(&pipeline_name, version, query_ctx)
+        .await?;
+
+    Ok(GreptimedbManageResponse::from_pipeline(
+        pipeline_name,
+        query_params
+            .version
+            .unwrap_or(pipeline_version.0.to_timezone_aware_string(None)),
+        start.elapsed().as_millis() as u64,
+        Some(pipeline),
+    ))
+}
+
+#[axum_macros::debug_handler]
 pub async fn add_pipeline(
     State(state): State<LogState>,
     Path(pipeline_name): Path<String>,
@@ -163,7 +223,7 @@ pub async fn add_pipeline(
         }
     );
 
-    query_ctx.set_channel(Channel::Http);
+    query_ctx.set_channel(Channel::Log);
     let query_ctx = Arc::new(query_ctx);
 
     let content_type = "yaml";
@@ -177,6 +237,7 @@ pub async fn add_pipeline(
                 pipeline_name,
                 pipeline.0.to_timezone_aware_string(None),
                 start.elapsed().as_millis() as u64,
+                None,
             )
         })
         .map_err(|e| {
@@ -205,9 +266,9 @@ pub async fn delete_pipeline(
         reason: "version is required",
     })?;
 
-    let version = to_pipeline_version(Some(version_str.clone())).context(PipelineSnafu)?;
+    let version = to_pipeline_version(Some(&version_str)).context(PipelineSnafu)?;
 
-    query_ctx.set_channel(Channel::Http);
+    query_ctx.set_channel(Channel::Log);
     let query_ctx = Arc::new(query_ctx);
 
     handler
@@ -219,6 +280,7 @@ pub async fn delete_pipeline(
                     pipeline_name,
                     version_str,
                     start.elapsed().as_millis() as u64,
+                    None,
                 )
             } else {
                 GreptimedbManageResponse::from_pipelines(vec![], start.elapsed().as_millis() as u64)
@@ -233,25 +295,25 @@ pub async fn delete_pipeline(
 /// Transform NDJSON array into a single array
 /// always return an array
 fn transform_ndjson_array_factory(
-    values: impl IntoIterator<Item = Result<Value, serde_json::Error>>,
+    values: impl IntoIterator<Item = Result<VrlValue, serde_json::Error>>,
     ignore_error: bool,
-) -> Result<Vec<Value>> {
+) -> Result<Vec<VrlValue>> {
     values
         .into_iter()
         .try_fold(Vec::with_capacity(100), |mut acc_array, item| match item {
             Ok(item_value) => {
                 match item_value {
-                    Value::Array(item_array) => {
+                    VrlValue::Array(item_array) => {
                         acc_array.extend(item_array);
                     }
-                    Value::Object(_) => {
+                    VrlValue::Object(_) => {
                         acc_array.push(item_value);
                     }
                     _ => {
                         if !ignore_error {
                             warn!("invalid item in array: {:?}", item_value);
                             return InvalidParameterSnafu {
-                                reason: format!("invalid item:{} in array", item_value),
+                                reason: format!("invalid item: {} in array", item_value),
                             }
                             .fail();
                         }
@@ -269,21 +331,22 @@ fn transform_ndjson_array_factory(
 
 /// Dryrun pipeline with given data
 async fn dryrun_pipeline_inner(
-    value: Vec<Value>,
-    pipeline: Arc<pipeline::Pipeline<GreptimeTransformer>>,
+    value: Vec<VrlValue>,
+    pipeline: Arc<pipeline::Pipeline>,
     pipeline_handler: PipelineHandlerRef,
     query_ctx: &QueryContextRef,
 ) -> Result<Response> {
     let params = GreptimePipelineParams::default();
 
+    let pipeline_def = PipelineDefinition::Resolved(pipeline);
+    let pipeline_ctx = PipelineContext::new(&pipeline_def, &params, query_ctx.channel());
     let results = run_pipeline(
         &pipeline_handler,
-        PipelineDefinition::Resolved(pipeline),
-        &params,
-        pipeline::json_array_to_intermediate_state(value)
-            .context(PipelineTransformSnafu)
-            .context(PipelineSnafu)?,
-        "dry_run".to_owned(),
+        &pipeline_ctx,
+        PipelineIngestRequest {
+            table: "dry_run".to_owned(),
+            values: value,
+        },
         query_ctx,
         true,
     )
@@ -294,7 +357,7 @@ async fn dryrun_pipeline_inner(
     let name_key = "name";
 
     let results = results
-        .into_iter()
+        .all_req()
         .filter_map(|row| {
             if let Some(rows) = row.rows {
                 let table_name = row.table_name;
@@ -304,24 +367,27 @@ async fn dryrun_pipeline_inner(
                     .iter()
                     .map(|cs| {
                         let mut map = Map::new();
-                        map.insert(name_key.to_string(), Value::String(cs.column_name.clone()));
+                        map.insert(
+                            name_key.to_string(),
+                            JsonValue::String(cs.column_name.clone()),
+                        );
                         map.insert(
                             data_type_key.to_string(),
-                            Value::String(cs.datatype().as_str_name().to_string()),
+                            JsonValue::String(cs.datatype().as_str_name().to_string()),
                         );
                         map.insert(
                             colume_type_key.to_string(),
-                            Value::String(cs.semantic_type().as_str_name().to_string()),
+                            JsonValue::String(cs.semantic_type().as_str_name().to_string()),
                         );
                         map.insert(
                             "fulltext".to_string(),
-                            Value::Bool(
+                            JsonValue::Bool(
                                 cs.options
                                     .clone()
                                     .is_some_and(|x| x.options.contains_key("fulltext")),
                             ),
                         );
-                        Value::Object(map)
+                        JsonValue::Object(map)
                     })
                     .collect::<Vec<_>>();
 
@@ -349,26 +415,26 @@ async fn dryrun_pipeline_inner(
                                             "data_type".to_string(),
                                             schema[idx][data_type_key].clone(),
                                         );
-                                        Value::Object(map)
+                                        JsonValue::Object(map)
                                     })
-                                    .unwrap_or(Value::Null)
+                                    .unwrap_or(JsonValue::Null)
                             })
                             .collect()
                     })
                     .collect();
 
                 let mut result = Map::new();
-                result.insert("schema".to_string(), Value::Array(schema));
-                result.insert("rows".to_string(), Value::Array(rows));
-                result.insert("table_name".to_string(), Value::String(table_name));
-                let result = Value::Object(result);
+                result.insert("schema".to_string(), JsonValue::Array(schema));
+                result.insert("rows".to_string(), JsonValue::Array(rows));
+                result.insert("table_name".to_string(), JsonValue::String(table_name));
+                let result = JsonValue::Object(result);
                 Some(result)
             } else {
                 None
             }
         })
         .collect();
-    Ok(Json(Value::Array(results)).into_response())
+    Ok(Json(JsonValue::Array(results)).into_response())
 }
 
 /// Dryrun pipeline with given data
@@ -381,14 +447,15 @@ pub struct PipelineDryrunParams {
     pub pipeline_name: Option<String>,
     pub pipeline_version: Option<String>,
     pub pipeline: Option<String>,
-    pub data: Vec<Value>,
+    pub data_type: Option<String>,
+    pub data: String,
 }
 
 /// Check if the payload is valid json
 /// Check if the payload contains pipeline or pipeline_name and data
 /// Return Some if valid, None if invalid
-fn check_pipeline_dryrun_params_valid(payload: &str) -> Option<PipelineDryrunParams> {
-    match serde_json::from_str::<PipelineDryrunParams>(payload) {
+fn check_pipeline_dryrun_params_valid(payload: &Bytes) -> Option<PipelineDryrunParams> {
+    match serde_json::from_slice::<PipelineDryrunParams>(payload) {
         // payload with pipeline or pipeline_name and data is array
         Ok(params) if params.pipeline.is_some() || params.pipeline_name.is_some() => Some(params),
         // because of the pipeline_name or pipeline is required
@@ -424,29 +491,50 @@ fn add_step_info_for_pipeline_dryrun_error(step_msg: &str, e: Error) -> Response
     (status_code_to_http_status(&e.status_code()), body).into_response()
 }
 
+/// Parse the data with given content type
+/// If the content type is invalid, return error
+/// content type is one of application/json, text/plain, application/x-ndjson
+fn parse_dryrun_data(data_type: String, data: String) -> Result<Vec<VrlValue>> {
+    if let Ok(content_type) = ContentType::from_str(&data_type) {
+        extract_pipeline_value_by_content_type(content_type, Bytes::from(data), false)
+    } else {
+        InvalidParameterSnafu {
+            reason: format!(
+                "invalid content type: {}, expected: one of {}",
+                data_type,
+                EventPayloadResolver::support_content_type_list().join(", ")
+            ),
+        }
+        .fail()
+    }
+}
+
 #[axum_macros::debug_handler]
 pub async fn pipeline_dryrun(
     State(log_state): State<LogState>,
     Query(query_params): Query<LogIngesterQueryParams>,
     Extension(mut query_ctx): Extension<QueryContext>,
     TypedHeader(content_type): TypedHeader<ContentType>,
-    payload: String,
+    payload: Bytes,
 ) -> Result<Response> {
     let handler = log_state.log_handler;
 
-    query_ctx.set_channel(Channel::Http);
+    query_ctx.set_channel(Channel::Log);
     let query_ctx = Arc::new(query_ctx);
 
     match check_pipeline_dryrun_params_valid(&payload) {
         Some(params) => {
-            let data = params.data;
+            let data = parse_dryrun_data(
+                params.data_type.unwrap_or("application/json".to_string()),
+                params.data,
+            )?;
 
             check_data_valid(data.len())?;
 
             match params.pipeline {
                 None => {
-                    let version =
-                        to_pipeline_version(params.pipeline_version).context(PipelineSnafu)?;
+                    let version = to_pipeline_version(params.pipeline_version.as_deref())
+                        .context(PipelineSnafu)?;
                     let pipeline_name = check_pipeline_name_exists(params.pipeline_name)?;
                     let pipeline = handler
                         .get_pipeline(&pipeline_name, version, query_ctx.clone())
@@ -486,7 +574,8 @@ pub async fn pipeline_dryrun(
             // is specified using query param.
             let pipeline_name = check_pipeline_name_exists(query_params.pipeline_name)?;
 
-            let version = to_pipeline_version(query_params.version).context(PipelineSnafu)?;
+            let version =
+                to_pipeline_version(query_params.version.as_deref()).context(PipelineSnafu)?;
 
             let ignore_errors = query_params.ignore_errors.unwrap_or(false);
 
@@ -504,6 +593,16 @@ pub async fn pipeline_dryrun(
     }
 }
 
+pub(crate) fn extract_pipeline_params_map_from_headers(
+    headers: &HeaderMap,
+) -> ahash::HashMap<String, String> {
+    GreptimePipelineParams::parse_header_str_to_map(
+        headers
+            .get(GREPTIME_PIPELINE_PARAMS_HEADER)
+            .and_then(|v| v.to_str().ok()),
+    )
+}
+
 #[axum_macros::debug_handler]
 pub async fn log_ingester(
     State(log_state): State<LogState>,
@@ -511,7 +610,7 @@ pub async fn log_ingester(
     Extension(mut query_ctx): Extension<QueryContext>,
     TypedHeader(content_type): TypedHeader<ContentType>,
     headers: HeaderMap,
-    payload: String,
+    payload: Bytes,
 ) -> Result<HttpResponse> {
     // validate source and payload
     let source = query_params.source.as_deref();
@@ -525,20 +624,27 @@ pub async fn log_ingester(
 
     let handler = log_state.log_handler;
 
-    let pipeline_name = query_params.pipeline_name.context(InvalidParameterSnafu {
-        reason: "pipeline_name is required",
-    })?;
     let table_name = query_params.table.context(InvalidParameterSnafu {
         reason: "table is required",
     })?;
 
-    let version = to_pipeline_version(query_params.version).context(PipelineSnafu)?;
-
     let ignore_errors = query_params.ignore_errors.unwrap_or(false);
+
+    let pipeline_name = query_params.pipeline_name.context(InvalidParameterSnafu {
+        reason: "pipeline_name is required",
+    })?;
+    let skip_error = query_params.skip_error.unwrap_or(false);
+    let version = to_pipeline_version(query_params.version.as_deref()).context(PipelineSnafu)?;
+    let pipeline = PipelineDefinition::from_name(
+        &pipeline_name,
+        version,
+        query_params.custom_time_index.map(|s| (s, ignore_errors)),
+    )
+    .context(PipelineSnafu)?;
 
     let value = extract_pipeline_value_by_content_type(content_type, payload, ignore_errors)?;
 
-    query_ctx.set_channel(Channel::Http);
+    query_ctx.set_channel(Channel::Log);
     let query_ctx = Arc::new(query_ctx);
 
     let value = log_state
@@ -546,102 +652,231 @@ pub async fn log_ingester(
         .as_ref()
         .pre_pipeline(value, query_ctx.clone())?;
 
+    let mut pipeline_params_map = extract_pipeline_params_map_from_headers(&headers);
+    if !pipeline_params_map.contains_key(GREPTIME_PIPELINE_SKIP_ERROR_KEY) && skip_error {
+        pipeline_params_map.insert(GREPTIME_PIPELINE_SKIP_ERROR_KEY.to_string(), "true".into());
+    }
+    let pipeline_params = GreptimePipelineParams::from_map(pipeline_params_map);
+
     ingest_logs_inner(
         handler,
-        pipeline_name,
-        version,
-        vec![LogIngestRequest {
+        pipeline,
+        vec![PipelineIngestRequest {
             table: table_name,
             values: value,
         }],
         query_ctx,
-        headers,
+        pipeline_params,
     )
     .await
 }
 
+#[derive(Debug, EnumIter)]
+enum EventPayloadResolverInner {
+    Json,
+    Ndjson,
+    Text,
+}
+
+impl Display for EventPayloadResolverInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EventPayloadResolverInner::Json => write!(f, "{}", *JSON_CONTENT_TYPE),
+            EventPayloadResolverInner::Ndjson => write!(f, "{}", *NDJSON_CONTENT_TYPE),
+            EventPayloadResolverInner::Text => write!(f, "{}", *TEXT_CONTENT_TYPE),
+        }
+    }
+}
+
+impl TryFrom<&ContentType> for EventPayloadResolverInner {
+    type Error = Error;
+
+    fn try_from(content_type: &ContentType) -> Result<Self> {
+        let mime: mime_guess::Mime = content_type.clone().into();
+        match (mime.type_(), mime.subtype()) {
+            (mime::APPLICATION, mime::JSON) => Ok(EventPayloadResolverInner::Json),
+            (mime::APPLICATION, subtype) if subtype == CONTENT_TYPE_NDJSON_SUBTYPE_STR => {
+                Ok(EventPayloadResolverInner::Ndjson)
+            }
+            (mime::TEXT, mime::PLAIN) => Ok(EventPayloadResolverInner::Text),
+            _ => InvalidParameterSnafu {
+                reason: format!(
+                    "invalid content type: {}, expected: one of {}",
+                    content_type,
+                    EventPayloadResolver::support_content_type_list().join(", ")
+                ),
+            }
+            .fail(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct EventPayloadResolver<'a> {
+    inner: EventPayloadResolverInner,
+    /// The content type of the payload.
+    /// keep it for logging original content type
+    #[allow(dead_code)]
+    content_type: &'a ContentType,
+}
+
+impl EventPayloadResolver<'_> {
+    pub(super) fn support_content_type_list() -> Vec<String> {
+        EventPayloadResolverInner::iter()
+            .map(|x| x.to_string())
+            .collect()
+    }
+}
+
+impl<'a> TryFrom<&'a ContentType> for EventPayloadResolver<'a> {
+    type Error = Error;
+
+    fn try_from(content_type: &'a ContentType) -> Result<Self> {
+        let inner = EventPayloadResolverInner::try_from(content_type)?;
+        Ok(EventPayloadResolver {
+            inner,
+            content_type,
+        })
+    }
+}
+
+impl EventPayloadResolver<'_> {
+    fn parse_payload(&self, payload: Bytes, ignore_errors: bool) -> Result<Vec<VrlValue>> {
+        match self.inner {
+            EventPayloadResolverInner::Json => transform_ndjson_array_factory(
+                Deserializer::from_slice(&payload).into_iter(),
+                ignore_errors,
+            ),
+            EventPayloadResolverInner::Ndjson => {
+                let mut result = Vec::with_capacity(1000);
+                let mut buffer = Buffers::new(1000);
+                for (index, line) in payload.lines().enumerate() {
+                    let mut line = match line {
+                        Ok(line) if !line.is_empty() => line,
+                        Ok(_) => continue, // Skip empty lines
+                        Err(_) if ignore_errors => continue,
+                        Err(e) => {
+                            warn!(e; "invalid string at index: {}", index);
+                            return InvalidParameterSnafu {
+                                reason: format!("invalid line at index: {}", index),
+                            }
+                            .fail();
+                        }
+                    };
+
+                    // simd_json, according to description, only de-escapes string at character level,
+                    // like any other json parser. So it should be safe here.
+                    if let Ok(v) = simd_json::serde::from_slice_with_buffers(
+                        unsafe { line.as_bytes_mut() },
+                        &mut buffer,
+                    ) {
+                        result.push(v);
+                    } else if !ignore_errors {
+                        warn!("invalid JSON at index: {}, content: {:?}", index, line);
+                        return InvalidParameterSnafu {
+                            reason: format!("invalid JSON at index: {}", index),
+                        }
+                        .fail();
+                    }
+                }
+                Ok(result)
+            }
+            EventPayloadResolverInner::Text => {
+                let result = payload
+                    .lines()
+                    .filter_map(|line| line.ok().filter(|line| !line.is_empty()))
+                    .map(|line| {
+                        let mut map = BTreeMap::new();
+                        map.insert(
+                            KeyString::from("message"),
+                            VrlValue::Bytes(Bytes::from(line)),
+                        );
+                        VrlValue::Object(map)
+                    })
+                    .collect::<Vec<_>>();
+                Ok(result)
+            }
+        }
+    }
+}
+
 fn extract_pipeline_value_by_content_type(
     content_type: ContentType,
-    payload: String,
+    payload: Bytes,
     ignore_errors: bool,
-) -> Result<Vec<Value>> {
-    Ok(match content_type {
-        ct if ct == *JSON_CONTENT_TYPE => transform_ndjson_array_factory(
-            Deserializer::from_str(&payload).into_iter(),
-            ignore_errors,
-        )?,
-        ct if ct == *TEXT_CONTENT_TYPE || ct == *TEXT_UTF8_CONTENT_TYPE => payload
-            .lines()
-            .filter(|line| !line.is_empty())
-            .map(|line| json!({"message": line}))
-            .collect(),
-        _ => UnsupportedContentTypeSnafu { content_type }.fail()?,
+) -> Result<Vec<VrlValue>> {
+    EventPayloadResolver::try_from(&content_type).and_then(|resolver| {
+        resolver
+            .parse_payload(payload, ignore_errors)
+            .map_err(|e| match &e {
+                Error::InvalidParameter { reason, .. } if content_type == *JSON_CONTENT_TYPE => {
+                    if reason.contains("invalid item:") {
+                        InvalidParameterSnafu {
+                            reason: "json format error, please check the date is valid JSON.",
+                        }
+                        .build()
+                    } else {
+                        e
+                    }
+                }
+                _ => e,
+            })
     })
 }
 
 pub(crate) async fn ingest_logs_inner(
-    state: PipelineHandlerRef,
-    pipeline_name: String,
-    version: PipelineVersion,
-    log_ingest_requests: Vec<LogIngestRequest>,
+    handler: PipelineHandlerRef,
+    pipeline: PipelineDefinition,
+    log_ingest_requests: Vec<PipelineIngestRequest>,
     query_ctx: QueryContextRef,
-    headers: HeaderMap,
+    pipeline_params: GreptimePipelineParams,
 ) -> Result<HttpResponse> {
     let db = query_ctx.get_db_string();
     let exec_timer = std::time::Instant::now();
 
-    let mut insert_requests = Vec::with_capacity(log_ingest_requests.len());
+    let mut req = ContextReq::default();
 
-    let pipeline_params = GreptimePipelineParams::from_params(
-        headers
-            .get(GREPTIME_PIPELINE_PARAMS_HEADER)
-            .and_then(|v| v.to_str().ok()),
-    );
+    let pipeline_ctx = PipelineContext::new(&pipeline, &pipeline_params, query_ctx.channel());
+    for pipeline_req in log_ingest_requests {
+        let requests =
+            run_pipeline(&handler, &pipeline_ctx, pipeline_req, &query_ctx, true).await?;
 
-    for request in log_ingest_requests {
-        let requests = run_pipeline(
-            &state,
-            PipelineDefinition::from_name(&pipeline_name, version),
-            &pipeline_params,
-            pipeline::json_array_to_intermediate_state(request.values)
-                .context(PipelineTransformSnafu)
-                .context(PipelineSnafu)?,
-            request.table,
-            &query_ctx,
-            true,
-        )
-        .await?;
-
-        insert_requests.extend(requests);
+        req.merge(requests);
     }
 
-    let output = state
-        .insert(
-            RowInsertRequests {
-                inserts: insert_requests,
-            },
-            query_ctx,
-        )
-        .await;
+    let mut outputs = Vec::new();
+    let mut total_rows: u64 = 0;
+    let mut fail = false;
+    for (temp_ctx, act_req) in req.as_req_iter(query_ctx) {
+        let output = handler.insert(act_req, temp_ctx).await;
 
-    if let Ok(Output {
-        data: OutputData::AffectedRows(rows),
-        meta: _,
-    }) = &output
-    {
+        if let Ok(Output {
+            data: OutputData::AffectedRows(rows),
+            meta: _,
+        }) = &output
+        {
+            total_rows += *rows as u64;
+        } else {
+            fail = true;
+        }
+        outputs.push(output);
+    }
+
+    if total_rows > 0 {
         METRIC_HTTP_LOGS_INGESTION_COUNTER
             .with_label_values(&[db.as_str()])
-            .inc_by(*rows as u64);
+            .inc_by(total_rows);
         METRIC_HTTP_LOGS_INGESTION_ELAPSED
             .with_label_values(&[db.as_str(), METRIC_SUCCESS_VALUE])
             .observe(exec_timer.elapsed().as_secs_f64());
-    } else {
+    }
+    if fail {
         METRIC_HTTP_LOGS_INGESTION_ELAPSED
             .with_label_values(&[db.as_str(), METRIC_FAILURE_VALUE])
             .observe(exec_timer.elapsed().as_secs_f64());
     }
 
-    let response = GreptimedbV1Response::from_output(vec![output])
+    let response = GreptimedbV1Response::from_output(outputs)
         .await
         .with_execution_time(exec_timer.elapsed().as_millis() as u64);
     Ok(response)
@@ -651,7 +886,8 @@ pub(crate) async fn ingest_logs_inner(
 pub trait LogValidator: Send + Sync {
     /// validate payload by source before processing
     /// Return a `Some` result to indicate validation failure.
-    async fn validate(&self, source: Option<&str>, payload: &str) -> Option<Result<HttpResponse>>;
+    async fn validate(&self, source: Option<&str>, payload: &Bytes)
+        -> Option<Result<HttpResponse>>;
 }
 
 pub type LogValidatorRef = Arc<dyn LogValidator + 'static>;
@@ -666,36 +902,65 @@ pub struct LogState {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]
     fn test_transform_ndjson() {
         let s = "{\"a\": 1}\n{\"b\": 2}";
-        let a = Value::Array(
-            transform_ndjson_array_factory(Deserializer::from_str(s).into_iter(), false).unwrap(),
+        let a = serde_json::to_string(
+            &transform_ndjson_array_factory(Deserializer::from_str(s).into_iter(), false).unwrap(),
         )
-        .to_string();
+        .unwrap();
         assert_eq!(a, "[{\"a\":1},{\"b\":2}]");
 
         let s = "{\"a\": 1}";
-        let a = Value::Array(
-            transform_ndjson_array_factory(Deserializer::from_str(s).into_iter(), false).unwrap(),
+        let a = serde_json::to_string(
+            &transform_ndjson_array_factory(Deserializer::from_str(s).into_iter(), false).unwrap(),
         )
-        .to_string();
+        .unwrap();
         assert_eq!(a, "[{\"a\":1}]");
 
         let s = "[{\"a\": 1}]";
-        let a = Value::Array(
-            transform_ndjson_array_factory(Deserializer::from_str(s).into_iter(), false).unwrap(),
+        let a = serde_json::to_string(
+            &transform_ndjson_array_factory(Deserializer::from_str(s).into_iter(), false).unwrap(),
         )
-        .to_string();
+        .unwrap();
         assert_eq!(a, "[{\"a\":1}]");
 
         let s = "[{\"a\": 1}, {\"b\": 2}]";
-        let a = Value::Array(
-            transform_ndjson_array_factory(Deserializer::from_str(s).into_iter(), false).unwrap(),
+        let a = serde_json::to_string(
+            &transform_ndjson_array_factory(Deserializer::from_str(s).into_iter(), false).unwrap(),
         )
-        .to_string();
+        .unwrap();
         assert_eq!(a, "[{\"a\":1},{\"b\":2}]");
+    }
+
+    #[test]
+    fn test_extract_by_content() {
+        let payload = r#"
+        {"a": 1}
+        {"b": 2"}
+        {"c": 1}
+"#
+        .as_bytes();
+        let payload = Bytes::from_static(payload);
+
+        let fail_rest =
+            extract_pipeline_value_by_content_type(ContentType::json(), payload.clone(), true);
+        assert!(fail_rest.is_ok());
+        assert_eq!(fail_rest.unwrap(), vec![json!({"a": 1}).into()]);
+
+        let fail_only_wrong =
+            extract_pipeline_value_by_content_type(NDJSON_CONTENT_TYPE.clone(), payload, true);
+        assert!(fail_only_wrong.is_ok());
+
+        let mut map1 = BTreeMap::new();
+        map1.insert(KeyString::from("a"), VrlValue::Integer(1));
+        let map1 = VrlValue::Object(map1);
+        let mut map2 = BTreeMap::new();
+        map2.insert(KeyString::from("c"), VrlValue::Integer(1));
+        let map2 = VrlValue::Object(map2);
+        assert_eq!(fail_only_wrong.unwrap(), vec![map1, map2]);
     }
 }

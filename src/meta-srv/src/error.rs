@@ -26,6 +26,7 @@ use tonic::codegen::http;
 
 use crate::metasrv::SelectTarget;
 use crate::pubsub::Message;
+use crate::service::mailbox::Channel;
 
 #[derive(Snafu)]
 #[snafu(visibility(pub))]
@@ -36,7 +37,7 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
         #[snafu(source)]
-        error: rand::distributions::WeightedError,
+        error: rand::distr::weighted::Error,
     },
 
     #[snafu(display("Exceeded deadline, operation: {}", operation))]
@@ -53,19 +54,23 @@ pub enum Error {
         peer_id: u64,
     },
 
-    #[snafu(display("Failed to lookup peer: {}", peer_id))]
-    LookupPeer {
-        #[snafu(implicit)]
-        location: Location,
-        source: common_meta::error::Error,
-        peer_id: u64,
-    },
-
     #[snafu(display("Another migration procedure is running for region: {}", region_id))]
     MigrationRunning {
         #[snafu(implicit)]
         location: Location,
         region_id: RegionId,
+    },
+
+    #[snafu(display(
+        "The region migration procedure is completed for region: {}, target_peer: {}",
+        region_id,
+        target_peer_id
+    ))]
+    RegionMigrated {
+        #[snafu(implicit)]
+        location: Location,
+        region_id: RegionId,
+        target_peer_id: u64,
     },
 
     #[snafu(display("The region migration procedure aborted, reason: {}", reason))]
@@ -94,6 +99,13 @@ pub enum Error {
         source: common_meta::error::Error,
     },
 
+    #[snafu(display("Failed to init reconciliation manager"))]
+    InitReconciliationManager {
+        #[snafu(implicit)]
+        location: Location,
+        source: common_meta::error::Error,
+    },
+
     #[snafu(display("Failed to create default catalog and schema"))]
     InitMetadata {
         #[snafu(implicit)]
@@ -108,6 +120,20 @@ pub enum Error {
         source: common_meta::error::Error,
     },
 
+    #[snafu(display("Failed to set next sequence number"))]
+    SetNextSequence {
+        #[snafu(implicit)]
+        location: Location,
+        source: common_meta::error::Error,
+    },
+
+    #[snafu(display("Failed to peek sequence number"))]
+    PeekSequence {
+        #[snafu(implicit)]
+        location: Location,
+        source: common_meta::error::Error,
+    },
+
     #[snafu(display("Failed to start telemetry task"))]
     StartTelemetryTask {
         #[snafu(implicit)]
@@ -117,6 +143,13 @@ pub enum Error {
 
     #[snafu(display("Failed to submit ddl task"))]
     SubmitDdlTask {
+        #[snafu(implicit)]
+        location: Location,
+        source: common_meta::error::Error,
+    },
+
+    #[snafu(display("Failed to submit reconcile procedure"))]
+    SubmitReconcileProcedure {
         #[snafu(implicit)]
         location: Location,
         source: common_meta::error::Error,
@@ -336,9 +369,44 @@ pub enum Error {
         location: Location,
     },
 
+    #[snafu(display("Failed to downgrade region leader, region: {}", region_id))]
+    DowngradeLeader {
+        region_id: RegionId,
+        #[snafu(implicit)]
+        location: Location,
+        #[snafu(source)]
+        source: BoxedError,
+    },
+
+    #[snafu(display("Region's leader peer changed: {}", msg))]
+    LeaderPeerChanged {
+        msg: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("Invalid arguments: {}", err_msg))]
     InvalidArguments {
         err_msg: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[cfg(feature = "mysql_kvbackend")]
+    #[snafu(display("Failed to parse mysql url: {}", mysql_url))]
+    ParseMySqlUrl {
+        #[snafu(source)]
+        error: sqlx::error::Error,
+        mysql_url: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[cfg(feature = "mysql_kvbackend")]
+    #[snafu(display("Failed to decode sql value"))]
+    DecodeSqlValue {
+        #[snafu(source)]
+        error: sqlx::error::Error,
         #[snafu(implicit)]
         location: Location,
     },
@@ -374,6 +442,18 @@ pub enum Error {
 
     #[snafu(display("Metasrv has no leader at this moment"))]
     NoLeader {
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Leader lease expired"))]
+    LeaderLeaseExpired {
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Leader lease changed during election"))]
+    LeaderLeaseChanged {
         #[snafu(implicit)]
         location: Location,
     },
@@ -508,6 +588,13 @@ pub enum Error {
         source: common_procedure::Error,
     },
 
+    #[snafu(display("A prune task for topic {} is already running", topic))]
+    PruneTaskAlreadyRunning {
+        topic: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("Schema already exists, name: {schema_name}"))]
     SchemaAlreadyExists {
         schema_name: String,
@@ -554,6 +641,13 @@ pub enum Error {
     MailboxReceiver {
         id: u64,
         err_msg: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Mailbox channel closed: {channel}"))]
+    MailboxChannelClosed {
+        channel: Channel,
         #[snafu(implicit)]
         location: Location,
     },
@@ -622,8 +716,8 @@ pub enum Error {
         location: Location,
     },
 
-    #[snafu(display("Maintenance mode manager error"))]
-    MaintenanceModeManager {
+    #[snafu(display("Runtime switch manager error"))]
+    RuntimeSwitchManager {
         source: common_meta::error::Error,
         #[snafu(implicit)]
         location: Location,
@@ -695,21 +789,31 @@ pub enum Error {
     },
 
     #[cfg(feature = "pg_kvbackend")]
-    #[snafu(display("Failed to execute via postgres"))]
+    #[snafu(display("Failed to execute via postgres, sql: {}", sql))]
     PostgresExecution {
         #[snafu(source)]
         error: tokio_postgres::Error,
+        sql: String,
         #[snafu(implicit)]
         location: Location,
     },
 
     #[cfg(feature = "pg_kvbackend")]
-    #[snafu(display("Failed to connect to Postgres"))]
-    ConnectPostgres {
-        #[snafu(source)]
-        error: tokio_postgres::Error,
+    #[snafu(display("Failed to get Postgres client"))]
+    GetPostgresClient {
         #[snafu(implicit)]
         location: Location,
+        #[snafu(source)]
+        error: deadpool::managed::PoolError<tokio_postgres::Error>,
+    },
+
+    #[cfg(any(feature = "pg_kvbackend", feature = "mysql_kvbackend"))]
+    #[snafu(display("Sql execution timeout, sql: {}, duration: {:?}", sql, duration))]
+    SqlExecutionTimeout {
+        #[snafu(implicit)]
+        location: Location,
+        sql: String,
+        duration: std::time::Duration,
     },
 
     #[cfg(feature = "pg_kvbackend")]
@@ -725,6 +829,34 @@ pub enum Error {
     #[snafu(display("Failed to get connection from Postgres pool: {}", reason))]
     GetPostgresConnection {
         reason: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[cfg(feature = "mysql_kvbackend")]
+    #[snafu(display("Failed to execute via mysql, sql: {}", sql))]
+    MySqlExecution {
+        #[snafu(source)]
+        error: sqlx::Error,
+        #[snafu(implicit)]
+        location: Location,
+        sql: String,
+    },
+
+    #[cfg(feature = "mysql_kvbackend")]
+    #[snafu(display("Failed to create mysql pool"))]
+    CreateMySqlPool {
+        #[snafu(source)]
+        error: sqlx::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[cfg(feature = "mysql_kvbackend")]
+    #[snafu(display("Failed to acquire mysql client from pool"))]
+    AcquireMySqlClient {
+        #[snafu(source)]
+        error: sqlx::Error,
         #[snafu(implicit)]
         location: Location,
     },
@@ -747,6 +879,53 @@ pub enum Error {
     BuildWalOptionsAllocator {
         #[snafu(implicit)]
         location: Location,
+        source: common_meta::error::Error,
+    },
+
+    #[snafu(display("Failed to build kafka client."))]
+    BuildKafkaClient {
+        #[snafu(implicit)]
+        location: Location,
+        #[snafu(source)]
+        error: common_meta::error::Error,
+    },
+
+    #[snafu(display(
+        "Failed to build a Kafka partition client, topic: {}, partition: {}",
+        topic,
+        partition
+    ))]
+    BuildPartitionClient {
+        topic: String,
+        partition: i32,
+        #[snafu(implicit)]
+        location: Location,
+        #[snafu(source)]
+        error: rskafka::client::error::Error,
+    },
+
+    #[snafu(display(
+        "Failed to delete records from Kafka, topic: {}, partition: {}, offset: {}",
+        topic,
+        partition,
+        offset
+    ))]
+    DeleteRecords {
+        #[snafu(implicit)]
+        location: Location,
+        #[snafu(source)]
+        error: rskafka::client::error::Error,
+        topic: String,
+        partition: i32,
+        offset: u64,
+    },
+
+    #[snafu(display("Failed to update the TopicNameValue in kvbackend, topic: {}", topic))]
+    UpdateTopicNameValue {
+        topic: String,
+        #[snafu(implicit)]
+        location: Location,
+        #[snafu(source)]
         source: common_meta::error::Error,
     },
 }
@@ -773,6 +952,8 @@ impl ErrorExt for Error {
             | Error::SerializeToJson { .. }
             | Error::DeserializeFromJson { .. }
             | Error::NoLeader { .. }
+            | Error::LeaderLeaseExpired { .. }
+            | Error::LeaderLeaseChanged { .. }
             | Error::CreateChannel { .. }
             | Error::BatchGet { .. }
             | Error::Range { .. }
@@ -786,17 +967,21 @@ impl ErrorExt for Error {
             | Error::MailboxClosed { .. }
             | Error::MailboxTimeout { .. }
             | Error::MailboxReceiver { .. }
+            | Error::MailboxChannelClosed { .. }
             | Error::RetryLater { .. }
             | Error::RetryLaterWithSource { .. }
             | Error::StartGrpc { .. }
-            | Error::NoEnoughAvailableNode { .. }
             | Error::PublishMessage { .. }
             | Error::Join { .. }
             | Error::PeerUnavailable { .. }
             | Error::ExceededDeadline { .. }
             | Error::ChooseItems { .. }
             | Error::FlowStateHandler { .. }
-            | Error::BuildWalOptionsAllocator { .. } => StatusCode::Internal,
+            | Error::BuildWalOptionsAllocator { .. }
+            | Error::BuildPartitionClient { .. }
+            | Error::BuildKafkaClient { .. }
+            | Error::DeleteRecords { .. }
+            | Error::PruneTaskAlreadyRunning { .. } => StatusCode::Internal,
 
             Error::Unsupported { .. } => StatusCode::Unsupported,
 
@@ -818,7 +1003,8 @@ impl ErrorExt for Error {
             | Error::ProcedureNotFound { .. }
             | Error::TooManyPartitions { .. }
             | Error::TomlFormat { .. }
-            | Error::HandlerNotFound { .. } => StatusCode::InvalidArguments,
+            | Error::HandlerNotFound { .. }
+            | Error::LeaderPeerChanged { .. } => StatusCode::InvalidArguments,
             Error::LeaseKeyFromUtf8 { .. }
             | Error::LeaseValueFromUtf8 { .. }
             | Error::InvalidRegionKeyFromUtf8 { .. }
@@ -831,7 +1017,8 @@ impl ErrorExt for Error {
             | Error::RegionOpeningRace { .. }
             | Error::RegionRouteNotFound { .. }
             | Error::MigrationAbort { .. }
-            | Error::MigrationRunning { .. } => StatusCode::Unexpected,
+            | Error::MigrationRunning { .. }
+            | Error::RegionMigrated { .. } => StatusCode::Unexpected,
             Error::TableNotFound { .. } => StatusCode::TableNotFound,
             Error::SaveClusterInfo { source, .. }
             | Error::InvalidClusterInfoFormat { source, .. }
@@ -851,27 +1038,40 @@ impl ErrorExt for Error {
             | Error::ListTables { source, .. } => source.status_code(),
             Error::StartTelemetryTask { source, .. } => source.status_code(),
 
-            Error::NextSequence { source, .. } => source.status_code(),
-
+            Error::NextSequence { source, .. }
+            | Error::SetNextSequence { source, .. }
+            | Error::PeekSequence { source, .. } => source.status_code(),
+            Error::DowngradeLeader { source, .. } => source.status_code(),
             Error::RegisterProcedureLoader { source, .. } => source.status_code(),
-            Error::SubmitDdlTask { source, .. } => source.status_code(),
+            Error::SubmitDdlTask { source, .. }
+            | Error::SubmitReconcileProcedure { source, .. } => source.status_code(),
             Error::ConvertProtoData { source, .. }
             | Error::TableMetadataManager { source, .. }
-            | Error::MaintenanceModeManager { source, .. }
+            | Error::RuntimeSwitchManager { source, .. }
             | Error::KvBackend { source, .. }
-            | Error::UnexpectedLogicalRouteTable { source, .. } => source.status_code(),
+            | Error::UnexpectedLogicalRouteTable { source, .. }
+            | Error::UpdateTopicNameValue { source, .. } => source.status_code(),
 
-            Error::InitMetadata { source, .. } | Error::InitDdlManager { source, .. } => {
-                source.status_code()
-            }
+            Error::InitMetadata { source, .. }
+            | Error::InitDdlManager { source, .. }
+            | Error::InitReconciliationManager { source, .. } => source.status_code(),
 
             Error::Other { source, .. } => source.status_code(),
-            Error::LookupPeer { source, .. } => source.status_code(),
+            Error::NoEnoughAvailableNode { .. } => StatusCode::RuntimeResourcesExhausted,
+
             #[cfg(feature = "pg_kvbackend")]
             Error::CreatePostgresPool { .. }
+            | Error::GetPostgresClient { .. }
             | Error::GetPostgresConnection { .. }
-            | Error::PostgresExecution { .. }
-            | Error::ConnectPostgres { .. } => StatusCode::Internal,
+            | Error::PostgresExecution { .. } => StatusCode::Internal,
+            #[cfg(feature = "mysql_kvbackend")]
+            Error::MySqlExecution { .. }
+            | Error::CreateMySqlPool { .. }
+            | Error::ParseMySqlUrl { .. }
+            | Error::DecodeSqlValue { .. }
+            | Error::AcquireMySqlClient { .. } => StatusCode::Internal,
+            #[cfg(any(feature = "pg_kvbackend", feature = "mysql_kvbackend"))]
+            Error::SqlExecutionTimeout { .. } => StatusCode::Internal,
         }
     }
 

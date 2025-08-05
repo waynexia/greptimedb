@@ -14,8 +14,8 @@
 
 use std::collections::BTreeMap;
 
-use hydroflow::scheduled::graph_ext::GraphExt;
-use hydroflow::scheduled::port::{PortCtx, SEND};
+use dfir_rs::scheduled::graph_ext::GraphExt;
+use dfir_rs::scheduled::port::{PortCtx, SEND};
 use itertools::Itertools;
 use snafu::OptionExt;
 
@@ -256,7 +256,7 @@ fn eval_mfp_core(
 mod test {
 
     use datatypes::data_type::ConcreteDataType;
-    use hydroflow::scheduled::graph::Hydroflow;
+    use dfir_rs::scheduled::graph::Dfir;
 
     use super::*;
     use crate::compute::render::test::{get_output_handle, harness_test_ctx, run_and_check};
@@ -269,7 +269,7 @@ mod test {
     /// namely: if mfp operator can schedule a delete at the correct time
     #[test]
     fn test_render_mfp_with_temporal() {
-        let mut df = Hydroflow::new();
+        let mut df = Dfir::new();
         let mut state = DataflowState::default();
         let mut ctx = harness_test_ctx(&mut df, &mut state);
 
@@ -290,7 +290,9 @@ mod test {
         let mfp = MapFilterProject::new(1)
             .filter(vec![
                 ScalarExpr::Column(0)
-                    .call_unary(expr::UnaryFunc::Cast(ConcreteDataType::datetime_datatype()))
+                    .call_unary(expr::UnaryFunc::Cast(
+                        ConcreteDataType::timestamp_microsecond_datatype(),
+                    ))
                     .call_binary(
                         ScalarExpr::CallUnmaterializable(expr::UnmaterializableFunc::Now),
                         BinaryFunc::Gte,
@@ -300,7 +302,9 @@ mod test {
                         ScalarExpr::literal(4i64.into(), ConcreteDataType::int64_datatype()),
                         BinaryFunc::SubInt64,
                     )
-                    .call_unary(expr::UnaryFunc::Cast(ConcreteDataType::datetime_datatype()))
+                    .call_unary(expr::UnaryFunc::Cast(
+                        ConcreteDataType::timestamp_microsecond_datatype(),
+                    ))
                     .call_binary(
                         ScalarExpr::CallUnmaterializable(expr::UnmaterializableFunc::Now),
                         BinaryFunc::Lt,
@@ -344,7 +348,7 @@ mod test {
     /// that is it filter the rows correctly
     #[test]
     fn test_render_mfp() {
-        let mut df = Hydroflow::new();
+        let mut df = Dfir::new();
         let mut state = DataflowState::default();
         let mut ctx = harness_test_ctx(&mut df, &mut state);
 
@@ -384,7 +388,7 @@ mod test {
     /// test if mfp operator can run multiple times within same tick
     #[test]
     fn test_render_mfp_multiple_times() {
-        let mut df = Hydroflow::new();
+        let mut df = Dfir::new();
         let mut state = DataflowState::default();
         let mut ctx = harness_test_ctx(&mut df, &mut state);
 

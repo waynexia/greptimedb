@@ -12,71 +12,61 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use common_telemetry::warn;
-use datafusion_common::ScalarValue;
+use datafusion_common::{Column, ScalarValue};
 use datafusion_expr::expr::InList;
 use datafusion_expr::{BinaryExpr, Expr, Operator};
 use datatypes::data_type::ConcreteDataType;
 use datatypes::value::Value;
+use index::bloom_filter::applier::InListPredicate;
 use index::Bytes;
+use mito_codec::index::IndexValueCodec;
+use mito_codec::row_converter::SortField;
 use object_store::ObjectStore;
 use puffin::puffin_manager::cache::PuffinMetadataCacheRef;
 use snafu::{OptionExt, ResultExt};
 use store_api::metadata::RegionMetadata;
+use store_api::region_request::PathType;
 use store_api::storage::ColumnId;
 
 use crate::cache::file_cache::FileCacheRef;
 use crate::cache::index::bloom_filter_index::BloomFilterIndexCacheRef;
-use crate::error::{ColumnNotFoundSnafu, ConvertValueSnafu, Result};
-use crate::row_converter::SortField;
+use crate::error::{ColumnNotFoundSnafu, ConvertValueSnafu, EncodeSnafu, Result};
 use crate::sst::index::bloom_filter::applier::BloomFilterIndexApplier;
-use crate::sst::index::codec::IndexValueCodec;
 use crate::sst::index::puffin_manager::PuffinManagerFactory;
 
-/// Enumerates types of predicates for value filtering.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Predicate {
-    /// Predicate for matching values in a list.
-    InList(InListPredicate),
-}
-
-/// `InListPredicate` contains a list of acceptable values. A value needs to match at least
-/// one of the elements (logical OR semantic) for the predicate to be satisfied.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InListPredicate {
-    /// List of acceptable values.
-    pub list: HashSet<Bytes>,
-}
-
 pub struct BloomFilterIndexApplierBuilder<'a> {
-    region_dir: String,
+    table_dir: String,
+    path_type: PathType,
     object_store: ObjectStore,
     metadata: &'a RegionMetadata,
     puffin_manager_factory: PuffinManagerFactory,
     file_cache: Option<FileCacheRef>,
     puffin_metadata_cache: Option<PuffinMetadataCacheRef>,
     bloom_filter_index_cache: Option<BloomFilterIndexCacheRef>,
-    output: HashMap<ColumnId, Vec<Predicate>>,
+    predicates: BTreeMap<ColumnId, Vec<InListPredicate>>,
 }
 
 impl<'a> BloomFilterIndexApplierBuilder<'a> {
     pub fn new(
-        region_dir: String,
+        table_dir: String,
+        path_type: PathType,
         object_store: ObjectStore,
         metadata: &'a RegionMetadata,
         puffin_manager_factory: PuffinManagerFactory,
     ) -> Self {
         Self {
-            region_dir,
+            table_dir,
+            path_type,
             object_store,
             metadata,
             puffin_manager_factory,
             file_cache: None,
             puffin_metadata_cache: None,
             bloom_filter_index_cache: None,
-            output: HashMap::default(),
+            predicates: BTreeMap::default(),
         }
     }
 
@@ -107,16 +97,16 @@ impl<'a> BloomFilterIndexApplierBuilder<'a> {
             self.traverse_and_collect(expr);
         }
 
-        if self.output.is_empty() {
+        if self.predicates.is_empty() {
             return Ok(None);
         }
 
         let applier = BloomFilterIndexApplier::new(
-            self.region_dir,
-            self.metadata.region_id,
+            self.table_dir,
+            self.path_type,
             self.object_store,
             self.puffin_manager_factory,
-            self.output,
+            self.predicates,
         )
         .with_file_cache(self.file_cache)
         .with_puffin_metadata_cache(self.puffin_metadata_cache)
@@ -135,6 +125,7 @@ impl<'a> BloomFilterIndexApplierBuilder<'a> {
                     Ok(())
                 }
                 Operator::Eq => self.collect_eq(left, right),
+                Operator::Or => self.collect_or_eq_list(left, right),
                 _ => Ok(()),
             },
             Expr::InList(in_list) => self.collect_in_list(in_list),
@@ -166,10 +157,8 @@ impl<'a> BloomFilterIndexApplierBuilder<'a> {
 
     /// Collects an equality expression (column = value)
     fn collect_eq(&mut self, left: &Expr, right: &Expr) -> Result<()> {
-        let (col, lit) = match (left, right) {
-            (Expr::Column(col), Expr::Literal(lit)) => (col, lit),
-            (Expr::Literal(lit), Expr::Column(col)) => (col, lit),
-            _ => return Ok(()),
+        let Some((col, lit)) = Self::eq_expr_col_lit(left, right)? else {
+            return Ok(());
         };
         if lit.is_null() {
             return Ok(());
@@ -178,14 +167,12 @@ impl<'a> BloomFilterIndexApplierBuilder<'a> {
             return Ok(());
         };
         let value = encode_lit(lit, data_type)?;
-
-        // Create bloom filter predicate
-        let mut set = HashSet::new();
-        set.insert(value);
-        let predicate = Predicate::InList(InListPredicate { list: set });
-
-        // Add to output predicates
-        self.output.entry(column_id).or_default().push(predicate);
+        self.predicates
+            .entry(column_id)
+            .or_default()
+            .push(InListPredicate {
+                list: BTreeSet::from([value]),
+            });
 
         Ok(())
     }
@@ -212,7 +199,7 @@ impl<'a> BloomFilterIndexApplierBuilder<'a> {
             .map(|lit| encode_lit(lit, data_type.clone()));
 
         // Collect successful conversions
-        let mut valid_predicates = HashSet::new();
+        let mut valid_predicates = BTreeSet::new();
         for predicate in predicates {
             match predicate {
                 Ok(p) => {
@@ -223,15 +210,92 @@ impl<'a> BloomFilterIndexApplierBuilder<'a> {
         }
 
         if !valid_predicates.is_empty() {
-            self.output
+            self.predicates
                 .entry(column_id)
                 .or_default()
-                .push(Predicate::InList(InListPredicate {
+                .push(InListPredicate {
                     list: valid_predicates,
-                }));
+                });
         }
 
         Ok(())
+    }
+
+    /// Collects an or expression in the form of `column = lit OR column = lit OR ...`.
+    fn collect_or_eq_list(&mut self, left: &Expr, right: &Expr) -> Result<()> {
+        let (eq_left, eq_right, or_list) = if let Expr::BinaryExpr(BinaryExpr {
+            left: l,
+            op: Operator::Eq,
+            right: r,
+        }) = left
+        {
+            (l, r, right)
+        } else if let Expr::BinaryExpr(BinaryExpr {
+            left: l,
+            op: Operator::Eq,
+            right: r,
+        }) = right
+        {
+            (l, r, left)
+        } else {
+            return Ok(());
+        };
+
+        let Some((col, lit)) = Self::eq_expr_col_lit(eq_left, eq_right)? else {
+            return Ok(());
+        };
+        if lit.is_null() {
+            return Ok(());
+        }
+        let Some((column_id, data_type)) = self.column_id_and_type(&col.name)? else {
+            return Ok(());
+        };
+
+        let mut inlist = BTreeSet::new();
+        inlist.insert(encode_lit(lit, data_type.clone())?);
+        if Self::collect_or_eq_list_rec(&col.name, &data_type, or_list, &mut inlist)? {
+            self.predicates
+                .entry(column_id)
+                .or_default()
+                .push(InListPredicate { list: inlist });
+        }
+
+        Ok(())
+    }
+
+    fn collect_or_eq_list_rec(
+        column_name: &str,
+        data_type: &ConcreteDataType,
+        expr: &Expr,
+        inlist: &mut BTreeSet<Bytes>,
+    ) -> Result<bool> {
+        if let Expr::BinaryExpr(BinaryExpr { left, op, right }) = expr {
+            match op {
+                Operator::Or => {
+                    let r = Self::collect_or_eq_list_rec(column_name, data_type, left, inlist)?
+                        .then(|| {
+                            Self::collect_or_eq_list_rec(column_name, data_type, right, inlist)
+                        })
+                        .transpose()?
+                        .unwrap_or(false);
+                    return Ok(r);
+                }
+                Operator::Eq => {
+                    let Some((col, lit)) = Self::eq_expr_col_lit(left, right)? else {
+                        return Ok(false);
+                    };
+                    if lit.is_null() || column_name != col.name {
+                        return Ok(false);
+                    }
+                    let bytes = encode_lit(lit, data_type.clone())?;
+                    inlist.insert(bytes);
+                    return Ok(true);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(false)
     }
 
     /// Helper function to get non-null literal value
@@ -241,15 +305,29 @@ impl<'a> BloomFilterIndexApplierBuilder<'a> {
             _ => None,
         }
     }
+
+    /// Helper function to get the column and literal value from an equality expr (column = lit)
+    fn eq_expr_col_lit<'b>(
+        left: &'b Expr,
+        right: &'b Expr,
+    ) -> Result<Option<(&'b Column, &'b ScalarValue)>> {
+        let (col, lit) = match (left, right) {
+            (Expr::Column(col), Expr::Literal(lit)) => (col, lit),
+            (Expr::Literal(lit), Expr::Column(col)) => (col, lit),
+            _ => return Ok(None),
+        };
+        Ok(Some((col, lit)))
+    }
 }
 
 // TODO(ruihang): extract this and the one under inverted_index into a common util mod.
 /// Helper function to encode a literal into bytes.
-fn encode_lit(lit: &ScalarValue, data_type: ConcreteDataType) -> Result<Vec<u8>> {
+fn encode_lit(lit: &ScalarValue, data_type: ConcreteDataType) -> Result<Bytes> {
     let value = Value::try_from(lit.clone()).context(ConvertValueSnafu)?;
     let mut bytes = vec![];
     let field = SortField::new(data_type);
-    IndexValueCodec::encode_nonnull_value(value.as_value_ref(), &field, &mut bytes)?;
+    IndexValueCodec::encode_nonnull_value(value.as_value_ref(), &field, &mut bytes)
+        .context(EncodeSnafu)?;
     Ok(bytes)
 }
 
@@ -257,6 +335,7 @@ fn encode_lit(lit: &ScalarValue, data_type: ConcreteDataType) -> Result<Vec<u8>>
 mod tests {
     use api::v1::SemanticType;
     use datafusion_common::Column;
+    use datafusion_expr::{col, lit};
     use datatypes::schema::ColumnSchema;
     use object_store::services::Memory;
     use store_api::metadata::{ColumnMetadata, RegionMetadata, RegionMetadataBuilder};
@@ -303,10 +382,7 @@ mod tests {
     }
 
     fn column(name: &str) -> Expr {
-        Expr::Column(Column {
-            relation: None,
-            name: name.to_string(),
-        })
+        Expr::Column(Column::from_name(name))
     }
 
     fn string_lit(s: impl Into<String>) -> Expr {
@@ -319,24 +395,23 @@ mod tests {
         let metadata = test_region_metadata();
         let builder = BloomFilterIndexApplierBuilder::new(
             "test".to_string(),
+            PathType::Bare,
             test_object_store(),
             &metadata,
             factory,
         );
-
         let exprs = vec![Expr::BinaryExpr(BinaryExpr {
             left: Box::new(column("column1")),
             op: Operator::Eq,
             right: Box::new(string_lit("value1")),
         })];
-
         let result = builder.build(&exprs).unwrap();
         assert!(result.is_some());
 
-        let filters = result.unwrap().filters;
-        assert_eq!(filters.len(), 1);
+        let predicates = result.unwrap().predicates;
+        assert_eq!(predicates.len(), 1);
 
-        let column_predicates = filters.get(&1).unwrap();
+        let column_predicates = predicates.get(&1).unwrap();
         assert_eq!(column_predicates.len(), 1);
 
         let expected = encode_lit(
@@ -344,11 +419,7 @@ mod tests {
             ConcreteDataType::string_datatype(),
         )
         .unwrap();
-        match &column_predicates[0] {
-            Predicate::InList(p) => {
-                assert_eq!(p.list.iter().next().unwrap(), &expected);
-            }
-        }
+        assert_eq!(column_predicates[0].list, BTreeSet::from([expected]));
     }
 
     fn int64_lit(i: i64) -> Expr {
@@ -361,6 +432,7 @@ mod tests {
         let metadata = test_region_metadata();
         let builder = BloomFilterIndexApplierBuilder::new(
             "test".to_string(),
+            PathType::Bare,
             test_object_store(),
             &metadata,
             factory,
@@ -375,15 +447,71 @@ mod tests {
         let result = builder.build(&exprs).unwrap();
         assert!(result.is_some());
 
-        let filters = result.unwrap().filters;
-        let column_predicates = filters.get(&2).unwrap();
+        let predicates = result.unwrap().predicates;
+        let column_predicates = predicates.get(&2).unwrap();
         assert_eq!(column_predicates.len(), 1);
+        assert_eq!(column_predicates[0].list.len(), 3);
+    }
 
-        match &column_predicates[0] {
-            Predicate::InList(p) => {
-                assert_eq!(p.list.len(), 3);
-            }
-        }
+    #[test]
+    fn test_build_with_or_chain() {
+        let (_d, factory) = PuffinManagerFactory::new_for_test_block("test_build_with_or_chain_");
+        let metadata = test_region_metadata();
+        let builder = || {
+            BloomFilterIndexApplierBuilder::new(
+                "test".to_string(),
+                PathType::Bare,
+                test_object_store(),
+                &metadata,
+                factory.clone(),
+            )
+        };
+
+        let expr = col("column1")
+            .eq(lit("value1"))
+            .or(col("column1")
+                .eq(lit("value2"))
+                .or(col("column1").eq(lit("value4"))))
+            .or(col("column1").eq(lit("value3")));
+
+        let result = builder().build(&[expr]).unwrap();
+        assert!(result.is_some());
+
+        let predicates = result.unwrap().predicates;
+        let column_predicates = predicates.get(&1).unwrap();
+        assert_eq!(column_predicates.len(), 1);
+        assert_eq!(column_predicates[0].list.len(), 4);
+        let or_chain_predicates = &column_predicates[0].list;
+        let encode_str = |s: &str| {
+            encode_lit(
+                &ScalarValue::Utf8(Some(s.to_string())),
+                ConcreteDataType::string_datatype(),
+            )
+            .unwrap()
+        };
+        assert!(or_chain_predicates.contains(&encode_str("value1")));
+        assert!(or_chain_predicates.contains(&encode_str("value2")));
+        assert!(or_chain_predicates.contains(&encode_str("value3")));
+        assert!(or_chain_predicates.contains(&encode_str("value4")));
+
+        // Test with null value
+        let expr = col("column1").eq(Expr::Literal(ScalarValue::Utf8(None)));
+        let result = builder().build(&[expr]).unwrap();
+        assert!(result.is_none());
+
+        // Test with different column
+        let expr = col("column1")
+            .eq(lit("value1"))
+            .or(col("column2").eq(lit("value2")));
+        let result = builder().build(&[expr]).unwrap();
+        assert!(result.is_none());
+
+        // Test with non or chain
+        let expr = col("column1")
+            .eq(lit("value1"))
+            .or(col("column1").gt_eq(lit("value2")));
+        let result = builder().build(&[expr]).unwrap();
+        assert!(result.is_none());
     }
 
     #[test]
@@ -392,11 +520,11 @@ mod tests {
         let metadata = test_region_metadata();
         let builder = BloomFilterIndexApplierBuilder::new(
             "test".to_string(),
+            PathType::Bare,
             test_object_store(),
             &metadata,
             factory,
         );
-
         let exprs = vec![Expr::BinaryExpr(BinaryExpr {
             left: Box::new(Expr::BinaryExpr(BinaryExpr {
                 left: Box::new(column("column1")),
@@ -410,14 +538,13 @@ mod tests {
                 right: Box::new(int64_lit(42)),
             })),
         })];
-
         let result = builder.build(&exprs).unwrap();
         assert!(result.is_some());
 
-        let filters = result.unwrap().filters;
-        assert_eq!(filters.len(), 2);
-        assert!(filters.contains_key(&1));
-        assert!(filters.contains_key(&2));
+        let predicates = result.unwrap().predicates;
+        assert_eq!(predicates.len(), 2);
+        assert!(predicates.contains_key(&1));
+        assert!(predicates.contains_key(&2));
     }
 
     #[test]
@@ -426,6 +553,7 @@ mod tests {
         let metadata = test_region_metadata();
         let builder = BloomFilterIndexApplierBuilder::new(
             "test".to_string(),
+            PathType::Bare,
             test_object_store(),
             &metadata,
             factory,
@@ -451,14 +579,10 @@ mod tests {
         let result = builder.build(&exprs).unwrap();
         assert!(result.is_some());
 
-        let filters = result.unwrap().filters;
-        assert!(!filters.contains_key(&1)); // Null equality should be ignored
-        let column2_predicates = filters.get(&2).unwrap();
-        match &column2_predicates[0] {
-            Predicate::InList(p) => {
-                assert_eq!(p.list.len(), 2); // Only non-null values should be included
-            }
-        }
+        let predicates = result.unwrap().predicates;
+        assert!(!predicates.contains_key(&1)); // Null equality should be ignored
+        let column2_predicates = predicates.get(&2).unwrap();
+        assert_eq!(column2_predicates[0].list.len(), 2);
     }
 
     #[test]
@@ -467,11 +591,11 @@ mod tests {
         let metadata = test_region_metadata();
         let builder = BloomFilterIndexApplierBuilder::new(
             "test".to_string(),
+            PathType::Bare,
             test_object_store(),
             &metadata,
             factory,
         );
-
         let exprs = vec![
             // Non-equality operator
             Expr::BinaryExpr(BinaryExpr {
@@ -503,11 +627,11 @@ mod tests {
         let metadata = test_region_metadata();
         let builder = BloomFilterIndexApplierBuilder::new(
             "test".to_string(),
+            PathType::Bare,
             test_object_store(),
             &metadata,
             factory,
         );
-
         let exprs = vec![
             Expr::BinaryExpr(BinaryExpr {
                 left: Box::new(column("column1")),
@@ -524,8 +648,8 @@ mod tests {
         let result = builder.build(&exprs).unwrap();
         assert!(result.is_some());
 
-        let filters = result.unwrap().filters;
-        let column_predicates = filters.get(&1).unwrap();
+        let predicates = result.unwrap().predicates;
+        let column_predicates = predicates.get(&1).unwrap();
         assert_eq!(column_predicates.len(), 2);
     }
 }

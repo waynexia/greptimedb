@@ -16,9 +16,13 @@ use std::sync::Arc;
 
 use crate::error::Result;
 use crate::flow_name::FlowName;
-use crate::instruction::CacheIdent;
+use crate::instruction::{CacheIdent, DropFlow};
 use crate::key::flow::flow_info::FlowInfoKey;
 use crate::key::flow::flow_name::FlowNameKey;
+use crate::key::flow::flow_route::FlowRouteKey;
+use crate::key::flow::flownode_flow::FlownodeFlowKey;
+use crate::key::flow::table_flow::TableFlowKey;
+use crate::key::node_address::NodeAddressKey;
 use crate::key::schema_name::SchemaNameKey;
 use crate::key::table_info::TableInfoKey;
 use crate::key::table_name::TableNameKey;
@@ -50,6 +54,10 @@ pub struct Context {
 #[async_trait::async_trait]
 pub trait CacheInvalidator: Send + Sync {
     async fn invalidate(&self, ctx: &Context, caches: &[CacheIdent]) -> Result<()>;
+
+    fn name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
 }
 
 pub type CacheInvalidatorRef = Arc<dyn CacheInvalidator>;
@@ -89,8 +97,39 @@ where
                     let key: SchemaNameKey = schema_name.into();
                     self.invalidate_key(&key.to_bytes()).await;
                 }
-                CacheIdent::CreateFlow(_) | CacheIdent::DropFlow(_) => {
+                CacheIdent::CreateFlow(_) => {
                     // Do nothing
+                }
+                CacheIdent::DropFlow(DropFlow {
+                    flow_id,
+                    source_table_ids,
+                    flow_part2node_id,
+                }) => {
+                    // invalidate flow route/flownode flow/table flow
+                    let mut keys = Vec::with_capacity(
+                        source_table_ids.len() * flow_part2node_id.len()
+                            + flow_part2node_id.len() * 2,
+                    );
+                    for table_id in source_table_ids {
+                        for (partition_id, node_id) in flow_part2node_id {
+                            let key =
+                                TableFlowKey::new(*table_id, *node_id, *flow_id, *partition_id)
+                                    .to_bytes();
+                            keys.push(key);
+                        }
+                    }
+
+                    for (partition_id, node_id) in flow_part2node_id {
+                        let key =
+                            FlownodeFlowKey::new(*node_id, *flow_id, *partition_id).to_bytes();
+                        keys.push(key);
+                        let key = FlowRouteKey::new(*flow_id, *partition_id).to_bytes();
+                        keys.push(key);
+                    }
+
+                    for key in keys {
+                        self.invalidate_key(&key).await;
+                    }
                 }
                 CacheIdent::FlowName(FlowName {
                     catalog_name,
@@ -101,6 +140,13 @@ where
                 }
                 CacheIdent::FlowId(flow_id) => {
                     let key = FlowInfoKey::new(*flow_id);
+                    self.invalidate_key(&key.to_bytes()).await;
+                }
+                CacheIdent::FlowNodeAddressChange(node_id) => {
+                    // other caches doesn't need to be invalidated
+                    // since this is only for flownode address change not id change
+                    common_telemetry::info!("Invalidate flow node cache for node_id: {}", node_id);
+                    let key = NodeAddressKey::with_flownode(*node_id);
                     self.invalidate_key(&key.to_bytes()).await;
                 }
             }

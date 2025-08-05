@@ -56,7 +56,8 @@ impl MetricEngineInner {
                 metadata_region_id,
                 RegionRequest::Catchup(RegionCatchupRequest {
                     set_writable: req.set_writable,
-                    entry_id: None,
+                    entry_id: req.metadata_entry_id,
+                    metadata_entry_id: None,
                     location_id: req.location_id,
                 }),
             )
@@ -70,6 +71,7 @@ impl MetricEngineInner {
                 RegionRequest::Catchup(RegionCatchupRequest {
                     set_writable: req.set_writable,
                     entry_id: req.entry_id,
+                    metadata_entry_id: None,
                     location_id: req.location_id,
                 }),
             )
@@ -77,12 +79,7 @@ impl MetricEngineInner {
             .context(MitoCatchupOperationSnafu)
             .map(|response| response.affected_rows)?;
 
-        let primary_key_encoding = self.mito.get_primary_key_encoding(data_region_id).context(
-            PhysicalRegionNotFoundSnafu {
-                region_id: data_region_id,
-            },
-        )?;
-        self.recover_states(region_id, primary_key_encoding, physical_region_options)
+        self.recover_states(region_id, physical_region_options)
             .await?;
         Ok(0)
     }

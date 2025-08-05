@@ -18,9 +18,11 @@ use std::collections::HashMap;
 
 use common_meta::SchemaOptions;
 use datatypes::schema::{
-    ColumnDefaultConstraint, ColumnSchema, SchemaRef, COLUMN_FULLTEXT_OPT_KEY_ANALYZER,
-    COLUMN_FULLTEXT_OPT_KEY_CASE_SENSITIVE, COLUMN_SKIPPING_INDEX_OPT_KEY_GRANULARITY,
-    COLUMN_SKIPPING_INDEX_OPT_KEY_TYPE, COMMENT_KEY,
+    ColumnDefaultConstraint, ColumnSchema, FulltextBackend, SchemaRef,
+    COLUMN_FULLTEXT_OPT_KEY_ANALYZER, COLUMN_FULLTEXT_OPT_KEY_BACKEND,
+    COLUMN_FULLTEXT_OPT_KEY_CASE_SENSITIVE, COLUMN_FULLTEXT_OPT_KEY_FALSE_POSITIVE_RATE,
+    COLUMN_FULLTEXT_OPT_KEY_GRANULARITY, COLUMN_SKIPPING_INDEX_OPT_KEY_FALSE_POSITIVE_RATE,
+    COLUMN_SKIPPING_INDEX_OPT_KEY_GRANULARITY, COLUMN_SKIPPING_INDEX_OPT_KEY_TYPE, COMMENT_KEY,
 };
 use snafu::ResultExt;
 use sql::ast::{ColumnDef, ColumnOption, ColumnOptionDef, Expr, Ident, ObjectName};
@@ -104,7 +106,7 @@ fn create_column(column_schema: &ColumnSchema, quote_style: char) -> Result<Colu
         .context(GetFulltextOptionsSnafu)?
         && opt.enable
     {
-        let map = HashMap::from([
+        let mut map = HashMap::from([
             (
                 COLUMN_FULLTEXT_OPT_KEY_ANALYZER.to_string(),
                 opt.analyzer.to_string(),
@@ -113,7 +115,21 @@ fn create_column(column_schema: &ColumnSchema, quote_style: char) -> Result<Colu
                 COLUMN_FULLTEXT_OPT_KEY_CASE_SENSITIVE.to_string(),
                 opt.case_sensitive.to_string(),
             ),
+            (
+                COLUMN_FULLTEXT_OPT_KEY_BACKEND.to_string(),
+                opt.backend.to_string(),
+            ),
         ]);
+        if opt.backend == FulltextBackend::Bloom {
+            map.insert(
+                COLUMN_FULLTEXT_OPT_KEY_GRANULARITY.to_string(),
+                opt.granularity.to_string(),
+            );
+            map.insert(
+                COLUMN_FULLTEXT_OPT_KEY_FALSE_POSITIVE_RATE.to_string(),
+                opt.false_positive_rate().to_string(),
+            );
+        }
         extensions.fulltext_index_options = Some(map.into());
     }
 
@@ -125,6 +141,10 @@ fn create_column(column_schema: &ColumnSchema, quote_style: char) -> Result<Colu
             (
                 COLUMN_SKIPPING_INDEX_OPT_KEY_GRANULARITY.to_string(),
                 opt.granularity.to_string(),
+            ),
+            (
+                COLUMN_SKIPPING_INDEX_OPT_KEY_FALSE_POSITIVE_RATE.to_string(),
+                opt.false_positive_rate().to_string(),
             ),
             (
                 COLUMN_SKIPPING_INDEX_OPT_KEY_TYPE.to_string(),
@@ -291,7 +311,7 @@ mod tests {
             .extra_options
             .insert("compaction.type".to_string(), "twcs".to_string());
 
-        let meta = TableMetaBuilder::default()
+        let meta = TableMetaBuilder::empty()
             .schema(table_schema)
             .primary_key_indices(vec![0, 1])
             .value_indices(vec![2, 3])
@@ -323,11 +343,11 @@ mod tests {
         assert_eq!(
             r#"
 CREATE TABLE IF NOT EXISTS "system_metrics" (
-  "id" INT UNSIGNED NULL SKIPPING INDEX WITH(granularity = '4096', type = 'BLOOM'),
+  "id" INT UNSIGNED NULL SKIPPING INDEX WITH(false_positive_rate = '0.01', granularity = '4096', type = 'BLOOM'),
   "host" STRING NULL INVERTED INDEX,
   "cpu" DOUBLE NULL,
   "disk" FLOAT NULL,
-  "msg" STRING NULL FULLTEXT INDEX WITH(analyzer = 'English', case_sensitive = 'false'),
+  "msg" STRING NULL FULLTEXT INDEX WITH(analyzer = 'English', backend = 'bloom', case_sensitive = 'false', false_positive_rate = '0.01', granularity = '10240'),
   "ts" TIMESTAMP(3) NOT NULL DEFAULT current_timestamp(),
   TIME INDEX ("ts"),
   PRIMARY KEY ("id", "host")
@@ -362,7 +382,7 @@ WITH(
         let _ = options
             .extra_options
             .insert(FILE_TABLE_FORMAT_KEY.to_string(), "csv".to_string());
-        let meta = TableMetaBuilder::default()
+        let meta = TableMetaBuilder::empty()
             .schema(table_schema)
             .primary_key_indices(vec![])
             .engine("file".to_string())

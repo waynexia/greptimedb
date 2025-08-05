@@ -14,6 +14,7 @@
 
 use datafusion_common::ScalarValue;
 use snafu::{OptionExt, ResultExt};
+use sqlparser::ast::AnalyzeFormat;
 use sqlparser::keywords::Keyword;
 use sqlparser::parser::ParserError;
 use sqlparser::tokenizer::Token;
@@ -23,22 +24,25 @@ use crate::parser::ParserContext;
 use crate::parsers::utils;
 use crate::statements::statement::Statement;
 use crate::statements::tql::{Tql, TqlAnalyze, TqlEval, TqlExplain, TqlParameters};
+use crate::util::location_to_index;
 
 pub const TQL: &str = "TQL";
 const EVAL: &str = "EVAL";
 const EVALUATE: &str = "EVALUATE";
 const VERBOSE: &str = "VERBOSE";
+const FORMAT: &str = "FORMAT";
 
 use sqlparser::parser::Parser;
 
-use super::error::ConvertToLogicalExpressionSnafu;
 use crate::dialect::GreptimeDbDialect;
-use crate::parsers::error::{EvaluationSnafu, ParserSnafu, TQLError};
+use crate::parsers::error::{
+    ConvertToLogicalExpressionSnafu, EvaluationSnafu, ParserSnafu, TQLError,
+};
 
 /// TQL extension parser, including:
 /// - `TQL EVAL <query>`
-/// - `TQL EXPLAIN [VERBOSE] <query>`
-/// - `TQL ANALYZE [VERBOSE] <query>`
+/// - `TQL EXPLAIN [VERBOSE] [FORMAT format] <query>`
+/// - `TQL ANALYZE [VERBOSE] [FORMAT format] <query>`
 impl ParserContext<'_> {
     pub(crate) fn parse_tql(&mut self) -> Result<Statement> {
         let _ = self.parser.next_token();
@@ -62,9 +66,11 @@ impl ParserContext<'_> {
                         if is_verbose {
                             let _consume_verbose_token = self.parser.next_token();
                         }
+                        let format = self.parse_format_option();
                         self.parse_tql_params()
                             .map(|mut params| {
                                 params.is_verbose = is_verbose;
+                                params.format = format;
                                 Statement::Tql(Tql::Explain(TqlExplain::from(params)))
                             })
                             .context(error::TQLSyntaxSnafu)
@@ -75,9 +81,11 @@ impl ParserContext<'_> {
                         if is_verbose {
                             let _consume_verbose_token = self.parser.next_token();
                         }
+                        let format = self.parse_format_option();
                         self.parse_tql_params()
                             .map(|mut params| {
                                 params.is_verbose = is_verbose;
+                                params.format = format;
                                 Statement::Tql(Tql::Analyze(TqlAnalyze::from(params)))
                             })
                             .context(error::TQLSyntaxSnafu)
@@ -133,6 +141,27 @@ impl ParserContext<'_> {
         self.peek_token_as_string().eq_ignore_ascii_case(VERBOSE)
     }
 
+    fn parse_format_option(&mut self) -> Option<AnalyzeFormat> {
+        if self.peek_token_as_string().eq_ignore_ascii_case(FORMAT) {
+            let _consume_format_token = self.parser.next_token();
+            // Parse format type
+            if let Token::Word(w) = &self.parser.peek_token().token {
+                let format_type = w.value.to_uppercase();
+                let _consume_format_type_token = self.parser.next_token();
+                match format_type.as_str() {
+                    "JSON" => Some(AnalyzeFormat::JSON),
+                    "TEXT" => Some(AnalyzeFormat::TEXT),
+                    "GRAPHVIZ" => Some(AnalyzeFormat::GRAPHVIZ),
+                    _ => None, // Invalid format, ignore silently
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
     /// Try to parse and consume a string, number or word token.
     /// Return `Ok` if it's parsed and one of the given delimiter tokens is consumed.
     /// The string and matched delimiter will be returned as a tuple.
@@ -158,7 +187,7 @@ impl ParserContext<'_> {
                 let value = match tokens[0].clone() {
                     Token::Number(n, _) => n,
                     Token::DoubleQuotedString(s) | Token::SingleQuotedString(s) => s,
-                    Token::Word(_) => Self::parse_tokens(tokens)?,
+                    Token::Word(_) => Self::parse_tokens_to_ts(tokens)?,
                     unexpected => {
                         return Err(ParserError::ParserError(format!(
                             "Expected number, string or word, but have {unexpected:?}"
@@ -168,7 +197,7 @@ impl ParserContext<'_> {
                 };
                 Ok(value)
             }
-            _ => Self::parse_tokens(tokens),
+            _ => Self::parse_tokens_to_ts(tokens),
         };
         for token in delimiter_tokens {
             if parser.consume_token(token) {
@@ -181,9 +210,10 @@ impl ParserContext<'_> {
         .context(ParserSnafu)
     }
 
-    fn parse_tokens(tokens: Vec<Token>) -> std::result::Result<String, TQLError> {
+    /// Parse the tokens to seconds and convert to string.
+    fn parse_tokens_to_ts(tokens: Vec<Token>) -> std::result::Result<String, TQLError> {
         let parser_expr = Self::parse_to_expr(tokens)?;
-        let lit = utils::parser_expr_to_scalar_value(parser_expr)
+        let lit = utils::parser_expr_to_scalar_value_literal(parser_expr)
             .map_err(Box::new)
             .context(ConvertToLogicalExpressionSnafu)?;
 
@@ -216,10 +246,14 @@ impl ParserContext<'_> {
         while matches!(parser.peek_token().token, Token::Comma) {
             let _skip_token = parser.next_token();
         }
-        let index = parser.next_token().location.column as usize;
-        if index == 0 {
+        let start_tql = parser.next_token();
+        if start_tql == Token::EOF {
             return Err(ParserError::ParserError("empty TQL query".to_string()));
         }
+
+        let start_location = start_tql.span.start;
+        // translate the start location to the index in the sql string
+        let index = location_to_index(sql, &start_location);
 
         let query = &sql[index - 1..];
         while parser.next_token() != Token::EOF {
@@ -415,6 +449,7 @@ mod tests {
                 assert_eq!(explain.step, "5m");
                 assert_eq!(explain.lookback, None);
                 assert!(!explain.is_verbose);
+                assert_eq!(explain.format, None);
             }
             _ => unreachable!(),
         }
@@ -428,6 +463,49 @@ mod tests {
                 assert_eq!(explain.step, "5m");
                 assert_eq!(explain.lookback, None);
                 assert!(explain.is_verbose);
+                assert_eq!(explain.format, None);
+            }
+            _ => unreachable!(),
+        }
+
+        let sql = "TQL EXPLAIN FORMAT JSON http_requests_total{environment=~'staging|testing|development',method!='GET'} @ 1609746000 offset 5m";
+        match parse_into_statement(sql) {
+            Statement::Tql(Tql::Explain(explain)) => {
+                assert_eq!(explain.query, "http_requests_total{environment=~'staging|testing|development',method!='GET'} @ 1609746000 offset 5m");
+                assert_eq!(explain.start, "0");
+                assert_eq!(explain.end, "0");
+                assert_eq!(explain.step, "5m");
+                assert_eq!(explain.lookback, None);
+                assert!(!explain.is_verbose);
+                assert_eq!(explain.format, Some(AnalyzeFormat::JSON));
+            }
+            _ => unreachable!(),
+        }
+
+        let sql = "TQL EXPLAIN VERBOSE FORMAT JSON http_requests_total{environment=~'staging|testing|development',method!='GET'} @ 1609746000 offset 5m";
+        match parse_into_statement(sql) {
+            Statement::Tql(Tql::Explain(explain)) => {
+                assert_eq!(explain.query, "http_requests_total{environment=~'staging|testing|development',method!='GET'} @ 1609746000 offset 5m");
+                assert_eq!(explain.start, "0");
+                assert_eq!(explain.end, "0");
+                assert_eq!(explain.step, "5m");
+                assert_eq!(explain.lookback, None);
+                assert!(explain.is_verbose);
+                assert_eq!(explain.format, Some(AnalyzeFormat::JSON));
+            }
+            _ => unreachable!(),
+        }
+
+        let sql = "TQL EXPLAIN FORMAT TEXT (20,100,10) http_requests_total{environment=~'staging|testing|development',method!='GET'} @ 1609746000 offset 5m";
+        match parse_into_statement(sql) {
+            Statement::Tql(Tql::Explain(explain)) => {
+                assert_eq!(explain.query, "http_requests_total{environment=~'staging|testing|development',method!='GET'} @ 1609746000 offset 5m");
+                assert_eq!(explain.start, "20");
+                assert_eq!(explain.end, "100");
+                assert_eq!(explain.step, "10");
+                assert_eq!(explain.lookback, None);
+                assert!(!explain.is_verbose);
+                assert_eq!(explain.format, Some(AnalyzeFormat::TEXT));
             }
             _ => unreachable!(),
         }
@@ -441,6 +519,7 @@ mod tests {
                 assert_eq!(explain.step, "10");
                 assert_eq!(explain.lookback, None);
                 assert!(!explain.is_verbose);
+                assert_eq!(explain.format, None);
             }
             _ => unreachable!(),
         }
@@ -454,6 +533,7 @@ mod tests {
                 assert_eq!(explain.step, "10");
                 assert_eq!(explain.lookback, None);
                 assert!(!explain.is_verbose);
+                assert_eq!(explain.format, None);
             }
             _ => unreachable!(),
         }
@@ -467,6 +547,7 @@ mod tests {
                 assert_eq!(explain.step, "10");
                 assert_eq!(explain.lookback, None);
                 assert!(explain.is_verbose);
+                assert_eq!(explain.format, None);
             }
             _ => unreachable!(),
         }
@@ -480,6 +561,7 @@ mod tests {
                 assert_eq!(explain.step, "10");
                 assert_eq!(explain.lookback, None);
                 assert!(explain.is_verbose);
+                assert_eq!(explain.format, None);
             }
             _ => unreachable!(),
         }
@@ -493,6 +575,7 @@ mod tests {
                 assert_eq!(explain.step, "10");
                 assert_eq!(explain.lookback, None);
                 assert!(explain.is_verbose);
+                assert_eq!(explain.format, None);
             }
             _ => unreachable!(),
         }
@@ -509,6 +592,35 @@ mod tests {
                 assert_eq!(analyze.lookback, None);
                 assert_eq!(analyze.query, "http_requests_total{environment=~'staging|testing|development',method!='GET'} @ 1609746000 offset 5m");
                 assert!(!analyze.is_verbose);
+                assert_eq!(analyze.format, None);
+            }
+            _ => unreachable!(),
+        }
+
+        let sql = "TQL ANALYZE FORMAT JSON (1676887657.1, 1676887659.5, 30.3) http_requests_total{environment=~'staging|testing|development',method!='GET'} @ 1609746000 offset 5m";
+        match parse_into_statement(sql) {
+            Statement::Tql(Tql::Analyze(analyze)) => {
+                assert_eq!(analyze.start, "1676887657.1");
+                assert_eq!(analyze.end, "1676887659.5");
+                assert_eq!(analyze.step, "30.3");
+                assert_eq!(analyze.lookback, None);
+                assert_eq!(analyze.query, "http_requests_total{environment=~'staging|testing|development',method!='GET'} @ 1609746000 offset 5m");
+                assert!(!analyze.is_verbose);
+                assert_eq!(analyze.format, Some(AnalyzeFormat::JSON));
+            }
+            _ => unreachable!(),
+        }
+
+        let sql = "TQL ANALYZE VERBOSE FORMAT JSON (1676887657.1, 1676887659.5, 30.3) http_requests_total{environment=~'staging|testing|development',method!='GET'} @ 1609746000 offset 5m";
+        match parse_into_statement(sql) {
+            Statement::Tql(Tql::Analyze(analyze)) => {
+                assert_eq!(analyze.start, "1676887657.1");
+                assert_eq!(analyze.end, "1676887659.5");
+                assert_eq!(analyze.step, "30.3");
+                assert_eq!(analyze.lookback, None);
+                assert_eq!(analyze.query, "http_requests_total{environment=~'staging|testing|development',method!='GET'} @ 1609746000 offset 5m");
+                assert!(analyze.is_verbose);
+                assert_eq!(analyze.format, Some(AnalyzeFormat::JSON));
             }
             _ => unreachable!(),
         }
@@ -522,6 +634,7 @@ mod tests {
                 assert_eq!(analyze.lookback, None);
                 assert_eq!(analyze.query, "http_requests_total{environment=~'staging|testing|development',method!='GET'} @ 1609746000 offset 5m");
                 assert!(!analyze.is_verbose);
+                assert_eq!(analyze.format, None);
             }
             _ => unreachable!(),
         }
@@ -535,6 +648,7 @@ mod tests {
                 assert_eq!(analyze.lookback, None);
                 assert_eq!(analyze.query, "http_requests_total{environment=~'staging|testing|development',method!='GET'} @ 1609746000 offset 5m");
                 assert!(analyze.is_verbose);
+                assert_eq!(analyze.format, None);
             }
             _ => unreachable!(),
         }
@@ -548,6 +662,7 @@ mod tests {
                 assert_eq!(analyze.lookback, None);
                 assert_eq!(analyze.query, "http_requests_total{environment=~'staging|testing|development',method!='GET'} @ 1609746000 offset 5m");
                 assert!(analyze.is_verbose);
+                assert_eq!(analyze.format, None);
             }
             _ => unreachable!(),
         }
@@ -561,6 +676,62 @@ mod tests {
                 assert_eq!(analyze.lookback, None);
                 assert_eq!(analyze.query, "http_requests_total{environment=~'staging|testing|development',method!='GET'} @ 1609746000 offset 5m");
                 assert!(analyze.is_verbose);
+                assert_eq!(analyze.format, None);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn test_parse_tql_format() {
+        // Test FORMAT JSON for EXPLAIN
+        let sql = "TQL EXPLAIN FORMAT JSON http_requests_total";
+        match parse_into_statement(sql) {
+            Statement::Tql(Tql::Explain(explain)) => {
+                assert_eq!(explain.format, Some(AnalyzeFormat::JSON));
+                assert!(!explain.is_verbose);
+            }
+            _ => unreachable!(),
+        }
+
+        // Test FORMAT TEXT for EXPLAIN
+        let sql = "TQL EXPLAIN FORMAT TEXT http_requests_total";
+        match parse_into_statement(sql) {
+            Statement::Tql(Tql::Explain(explain)) => {
+                assert_eq!(explain.format, Some(AnalyzeFormat::TEXT));
+                assert!(!explain.is_verbose);
+            }
+            _ => unreachable!(),
+        }
+
+        // Test FORMAT GRAPHVIZ for EXPLAIN
+        let sql = "TQL EXPLAIN FORMAT GRAPHVIZ http_requests_total";
+        match parse_into_statement(sql) {
+            Statement::Tql(Tql::Explain(explain)) => {
+                assert_eq!(explain.format, Some(AnalyzeFormat::GRAPHVIZ));
+                assert!(!explain.is_verbose);
+            }
+            _ => unreachable!(),
+        }
+
+        // Test VERBOSE FORMAT JSON for ANALYZE
+        let sql = "TQL ANALYZE VERBOSE FORMAT JSON (0,10,'5s') http_requests_total";
+        match parse_into_statement(sql) {
+            Statement::Tql(Tql::Analyze(analyze)) => {
+                assert_eq!(analyze.format, Some(AnalyzeFormat::JSON));
+                assert!(analyze.is_verbose);
+            }
+            _ => unreachable!(),
+        }
+
+        // Test FORMAT before parameters
+        let sql = "TQL EXPLAIN FORMAT JSON (0,10,'5s') http_requests_total";
+        match parse_into_statement(sql) {
+            Statement::Tql(Tql::Explain(explain)) => {
+                assert_eq!(explain.format, Some(AnalyzeFormat::JSON));
+                assert_eq!(explain.start, "0");
+                assert_eq!(explain.end, "10");
+                assert_eq!(explain.step, "5s");
             }
             _ => unreachable!(),
         }

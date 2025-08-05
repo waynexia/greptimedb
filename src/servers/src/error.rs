@@ -25,6 +25,7 @@ use common_error::ext::{BoxedError, ErrorExt};
 use common_error::status_code::StatusCode;
 use common_macro::stack_trace_debug;
 use common_telemetry::{error, warn};
+use common_time::Duration;
 use datafusion::error::DataFusionError;
 use datatypes::prelude::ConcreteDataType;
 use headers::ContentType;
@@ -151,18 +152,10 @@ pub enum Error {
     #[snafu(display("Failed to describe statement"))]
     DescribeStatement { source: BoxedError },
 
-    #[snafu(display("Pipeline management api error"))]
+    #[snafu(display("Pipeline error"))]
     Pipeline {
         #[snafu(source)]
         source: pipeline::error::Error,
-        #[snafu(implicit)]
-        location: Location,
-    },
-
-    #[snafu(display("Pipeline transform error"))]
-    PipelineTransform {
-        #[snafu(source)]
-        source: pipeline::etl_error::Error,
         #[snafu(implicit)]
         location: Location,
     },
@@ -235,6 +228,22 @@ pub enum Error {
         location: Location,
         #[snafu(source)]
         error: prost::DecodeError,
+    },
+
+    #[snafu(display(
+        "OTLP metric input have incompatible existing tables, please refer to docs for details"
+    ))]
+    OtlpMetricModeIncompatible {
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Common Meta error"))]
+    CommonMeta {
+        #[snafu(implicit)]
+        location: Location,
+        #[snafu(source)]
+        source: common_meta::error::Error,
     },
 
     #[snafu(display("Failed to decompress snappy prometheus remote request"))]
@@ -410,6 +419,15 @@ pub enum Error {
         source: query::error::Error,
     },
 
+    #[snafu(display("Failed to parse timestamp: {}", timestamp))]
+    ParseTimestamp {
+        timestamp: String,
+        #[snafu(implicit)]
+        location: Location,
+        #[snafu(source)]
+        error: query::error::Error,
+    },
+
     #[snafu(display("{}", reason))]
     UnexpectedResult {
         reason: String,
@@ -538,12 +556,6 @@ pub enum Error {
         location: Location,
     },
 
-    #[snafu(display("Missing query context"))]
-    MissingQueryContext {
-        #[snafu(implicit)]
-        location: Location,
-    },
-
     #[snafu(display("Invalid table name"))]
     InvalidTableName {
         #[snafu(source)]
@@ -573,6 +585,7 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+
     #[snafu(display("Convert SQL value error"))]
     ConvertSqlValue {
         source: datatypes::error::Error,
@@ -614,6 +627,19 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+
+    #[snafu(display("Overflow while casting `{:?}` to Interval", val))]
+    DurationOverflow { val: Duration },
+
+    #[snafu(display("Failed to handle otel-arrow request, error message: {}", err_msg))]
+    HandleOtelArrowRequest {
+        err_msg: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Unknown hint: {}", hint))]
+    UnknownHint { hint: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -636,7 +662,8 @@ impl ErrorExt for Error {
 
             AddressBind { .. }
             | AlreadyStarted { .. }
-            | InvalidPromRemoteReadQueryResult { .. } => StatusCode::IllegalState,
+            | InvalidPromRemoteReadQueryResult { .. }
+            | OtlpMetricModeIncompatible { .. } => StatusCode::IllegalState,
 
             UnsupportedDataType { .. } => StatusCode::Unsupported,
 
@@ -652,7 +679,7 @@ impl ErrorExt for Error {
             | CheckDatabaseValidity { source, .. } => source.status_code(),
 
             Pipeline { source, .. } => source.status_code(),
-            PipelineTransform { source, .. } => source.status_code(),
+            CommonMeta { source, .. } => source.status_code(),
 
             NotSupported { .. }
             | InvalidParameter { .. }
@@ -673,7 +700,6 @@ impl ErrorExt for Error {
             | TimePrecision { .. }
             | UrlDecode { .. }
             | IncompatibleSchema { .. }
-            | MissingQueryContext { .. }
             | MysqlValueConversion { .. }
             | ParseJson { .. }
             | InvalidLokiLabels { .. }
@@ -685,7 +711,9 @@ impl ErrorExt for Error {
             | PrepareStatementNotFound { .. }
             | FailedToParseQuery { .. }
             | InvalidElasticsearchInput { .. }
-            | InvalidJaegerQuery { .. } => StatusCode::InvalidArguments,
+            | InvalidJaegerQuery { .. }
+            | ParseTimestamp { .. }
+            | UnknownHint { .. } => StatusCode::InvalidArguments,
 
             Catalog { source, .. } => source.status_code(),
             RowWriter { source, .. } => source.status_code(),
@@ -733,6 +761,10 @@ impl ErrorExt for Error {
             ConvertSqlValue { source, .. } => source.status_code(),
 
             InFlightWriteBytesExceeded { .. } => StatusCode::RateLimited,
+
+            DurationOverflow { .. } => StatusCode::InvalidArguments,
+
+            HandleOtelArrowRequest { .. } => StatusCode::Internal,
         }
     }
 
@@ -771,9 +803,14 @@ impl IntoResponse for Error {
     }
 }
 
+/// Converts [StatusCode] to [HttpStatusCode].
 pub fn status_code_to_http_status(status_code: &StatusCode) -> HttpStatusCode {
     match status_code {
-        StatusCode::Success | StatusCode::Cancelled => HttpStatusCode::OK,
+        StatusCode::Success => HttpStatusCode::OK,
+
+        // When a request is cancelled by the client (e.g., by a client side timeout),
+        // we should return a gateway timeout status code to the external client.
+        StatusCode::Cancelled | StatusCode::DeadlineExceeded => HttpStatusCode::GATEWAY_TIMEOUT,
 
         StatusCode::Unsupported
         | StatusCode::InvalidArguments
@@ -788,6 +825,8 @@ pub fn status_code_to_http_status(status_code: &StatusCode) -> HttpStatusCode {
         | StatusCode::TableColumnNotFound
         | StatusCode::PlanQuery
         | StatusCode::DatabaseAlreadyExists
+        | StatusCode::TriggerAlreadyExists
+        | StatusCode::TriggerNotFound
         | StatusCode::FlowNotFound
         | StatusCode::FlowAlreadyExists => HttpStatusCode::BAD_REQUEST,
 

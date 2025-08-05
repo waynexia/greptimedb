@@ -34,18 +34,20 @@ use store_api::codec::{infer_primary_key_encoding_from_hint, PrimaryKeyEncoding}
 use store_api::metadata::{ColumnMetadata, RegionMetadata, RegionMetadataRef};
 use store_api::region_engine::{SetRegionRoleStateResponse, SettableRegionRoleState};
 use store_api::region_request::{
-    AffectedRows, RegionAlterRequest, RegionCatchupRequest, RegionCloseRequest,
-    RegionCompactRequest, RegionCreateRequest, RegionFlushRequest, RegionOpenRequest,
-    RegionRequest, RegionTruncateRequest,
+    AffectedRows, RegionAlterRequest, RegionBulkInsertsRequest, RegionCatchupRequest,
+    RegionCloseRequest, RegionCompactRequest, RegionCreateRequest, RegionFlushRequest,
+    RegionOpenRequest, RegionRequest, RegionTruncateRequest,
 };
-use store_api::storage::{RegionId, SequenceNumber};
+use store_api::storage::RegionId;
+use store_api::ManifestVersion;
 use tokio::sync::oneshot::{self, Receiver, Sender};
 
 use crate::error::{
     CompactRegionSnafu, ConvertColumnDataTypeSnafu, CreateDefaultSnafu, Error, FillDefaultSnafu,
-    FlushRegionSnafu, InvalidRequestSnafu, Result, UnexpectedImpureDefaultSnafu,
+    FlushRegionSnafu, InvalidRequestSnafu, Result, UnexpectedSnafu,
 };
-use crate::manifest::action::RegionEdit;
+use crate::manifest::action::{RegionEdit, TruncateKind};
+use crate::memtable::bulk::part::BulkPart;
 use crate::memtable::MemtableId;
 use crate::metrics::COMPACTION_ELAPSED_TOTAL;
 use crate::wal::entry_distributor::WalEntryReceiver;
@@ -61,9 +63,9 @@ pub struct WriteRequest {
     /// Rows to write.
     pub rows: Rows,
     /// Map column name to column index in `rows`.
-    name_to_index: HashMap<String, usize>,
+    pub name_to_index: HashMap<String, usize>,
     /// Whether each column has null.
-    has_null: Vec<bool>,
+    pub has_null: Vec<bool>,
     /// Write hint.
     pub hint: Option<WriteHint>,
     /// Region metadata on the time of this request is created.
@@ -378,10 +380,13 @@ impl WriteRequest {
             OpType::Put => {
                 // For put requests, we use the default value from column schema.
                 if column.column_schema.is_default_impure() {
-                    UnexpectedImpureDefaultSnafu {
-                        region_id: self.region_id,
-                        column: &column.column_schema.name,
-                        default_value: format!("{:?}", column.column_schema.default_constraint()),
+                    UnexpectedSnafu {
+                        reason: format!(
+                            "unexpected impure default value with region_id: {}, column: {}, default_value: {:?}", 
+                            self.region_id,
+                            column.column_schema.name,
+                            column.column_schema.default_constraint(),
+                        ),
                     }
                     .fail()?
                 }
@@ -533,6 +538,29 @@ pub(crate) struct SenderWriteRequest {
     pub(crate) request: WriteRequest,
 }
 
+pub(crate) struct SenderBulkRequest {
+    pub(crate) sender: OptionOutputTx,
+    pub(crate) region_id: RegionId,
+    pub(crate) request: BulkPart,
+    pub(crate) region_metadata: RegionMetadataRef,
+}
+
+/// Request sent to a worker with timestamp
+#[derive(Debug)]
+pub(crate) struct WorkerRequestWithTime {
+    pub(crate) request: WorkerRequest,
+    pub(crate) created_at: Instant,
+}
+
+impl WorkerRequestWithTime {
+    pub(crate) fn new(request: WorkerRequest) -> Self {
+        Self {
+            request,
+            created_at: Instant::now(),
+        }
+    }
+}
+
 /// Request sent to a worker
 #[derive(Debug)]
 pub(crate) enum WorkerRequest {
@@ -565,6 +593,16 @@ pub(crate) enum WorkerRequest {
 
     /// Use [RegionEdit] to edit a region directly.
     EditRegion(RegionEditRequest),
+
+    /// Keep the manifest of a region up to date.
+    SyncRegion(RegionSyncRequest),
+
+    /// Bulk inserts request and region metadata.
+    BulkInserts {
+        metadata: Option<RegionMetadataRef>,
+        request: RegionBulkInsertsRequest,
+        sender: OptionOutputTx,
+    },
 }
 
 impl WorkerRequest {
@@ -664,6 +702,11 @@ impl WorkerRequest {
                 sender: sender.into(),
                 request: DdlRequest::Catchup(v),
             }),
+            RegionRequest::BulkInserts(region_bulk_inserts_request) => WorkerRequest::BulkInserts {
+                metadata: region_metadata,
+                sender: sender.into(),
+                request: region_bulk_inserts_request,
+            },
         };
 
         Ok((worker_request, receiver))
@@ -681,6 +724,21 @@ impl WorkerRequest {
                 region_role_state,
                 sender,
             },
+            receiver,
+        )
+    }
+
+    pub(crate) fn new_sync_region_request(
+        region_id: RegionId,
+        manifest_version: ManifestVersion,
+    ) -> (WorkerRequest, Receiver<Result<(ManifestVersion, bool)>>) {
+        let (sender, receiver) = oneshot::channel();
+        (
+            WorkerRequest::SyncRegion(RegionSyncRequest {
+                region_id,
+                manifest_version,
+                sender,
+            }),
             receiver,
         )
     }
@@ -828,10 +886,7 @@ pub(crate) struct TruncateResult {
     pub(crate) sender: OptionOutputTx,
     /// Truncate result.
     pub(crate) result: Result<()>,
-    /// Truncated entry id.
-    pub(crate) truncated_entry_id: EntryId,
-    /// Truncated sequence.
-    pub(crate) truncated_sequence: SequenceNumber,
+    pub(crate) kind: TruncateKind,
 }
 
 /// Notifies the region the result of writing region change action.
@@ -869,17 +924,26 @@ pub(crate) struct RegionEditResult {
     pub(crate) result: Result<()>,
 }
 
+#[derive(Debug)]
+pub(crate) struct RegionSyncRequest {
+    pub(crate) region_id: RegionId,
+    pub(crate) manifest_version: ManifestVersion,
+    /// Returns the latest manifest version and a boolean indicating whether new maniefst is installed.
+    pub(crate) sender: Sender<Result<(ManifestVersion, bool)>>,
+}
+
 #[cfg(test)]
 mod tests {
     use api::v1::value::ValueData;
     use api::v1::{Row, SemanticType};
     use datatypes::prelude::ConcreteDataType;
     use datatypes::schema::ColumnDefaultConstraint;
+    use mito_codec::test_util::i64_value;
     use store_api::metadata::RegionMetadataBuilder;
 
     use super::*;
     use crate::error::Error;
-    use crate::test_util::{i64_value, ts_ms_value};
+    use crate::test_util::ts_ms_value;
 
     fn new_column_schema(
         name: &str,
@@ -1153,7 +1217,7 @@ mod tests {
             .fill_missing_columns(&metadata)
             .unwrap_err()
             .to_string()
-            .contains("Unexpected impure default value with region_id"));
+            .contains("unexpected impure default value with region_id"));
     }
 
     #[test]

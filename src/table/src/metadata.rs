@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
+use common_macro::ToMetaBuilder;
 use common_query::AddColumnLocation;
 use datafusion_expr::TableProviderFilterPushDown;
 pub use datatypes::error::{Error as ConvertError, Result as ConvertResult};
@@ -34,9 +35,10 @@ use store_api::storage::{ColumnDescriptor, ColumnDescriptorBuilder, ColumnId, Re
 
 use crate::error::{self, Result};
 use crate::requests::{
-    AddColumnRequest, AlterKind, ModifyColumnTypeRequest, SetIndexOptions, TableOptions,
-    UnsetIndexOptions,
+    AddColumnRequest, AlterKind, ModifyColumnTypeRequest, SetDefaultRequest, SetIndexOption,
+    TableOptions, UnsetIndexOption,
 };
+use crate::table_reference::TableReference;
 
 pub type TableId = u32;
 pub type TableVersion = u64;
@@ -112,9 +114,8 @@ pub struct TableIdent {
 /// The table metadata.
 ///
 /// Note: if you add new fields to this struct, please ensure 'new_meta_builder' function works.
-/// TODO(dennis): find a better way to ensure 'new_meta_builder' works when adding new fields.
-#[derive(Clone, Debug, Builder, PartialEq, Eq)]
-#[builder(pattern = "mutable")]
+#[derive(Clone, Debug, Builder, PartialEq, Eq, ToMetaBuilder)]
+#[builder(pattern = "mutable", custom_constructor)]
 pub struct TableMeta {
     pub schema: SchemaRef,
     /// The indices of columns in primary key. Note that the index of timestamp column
@@ -134,6 +135,27 @@ pub struct TableMeta {
     pub created_on: DateTime<Utc>,
     #[builder(default = "Vec::new()")]
     pub partition_key_indices: Vec<usize>,
+    #[builder(default = "Vec::new()")]
+    pub column_ids: Vec<ColumnId>,
+}
+
+impl TableMetaBuilder {
+    /// Note: Please always use [new_meta_builder] to create new [TableMetaBuilder].
+    #[cfg(any(test, feature = "testing"))]
+    pub fn empty() -> Self {
+        Self {
+            schema: None,
+            primary_key_indices: None,
+            value_indices: None,
+            engine: None,
+            region_numbers: None,
+            next_column_id: None,
+            options: None,
+            created_on: None,
+            partition_key_indices: None,
+            column_ids: None,
+        }
+    }
 }
 
 impl TableMetaBuilder {
@@ -151,11 +173,16 @@ impl TableMetaBuilder {
 
     pub fn new_external_table() -> Self {
         Self {
+            schema: None,
             primary_key_indices: Some(Vec::new()),
             value_indices: Some(Vec::new()),
+            engine: None,
             region_numbers: Some(Vec::new()),
             next_column_id: Some(0),
-            ..Default::default()
+            options: None,
+            created_on: None,
+            partition_key_indices: None,
+            column_ids: None,
         }
     }
 }
@@ -191,6 +218,13 @@ impl TableMeta {
             .map(|(_, cs)| &cs.name)
     }
 
+    pub fn partition_column_names(&self) -> impl Iterator<Item = &String> {
+        let columns_schemas = &self.schema.column_schemas();
+        self.partition_key_indices
+            .iter()
+            .map(|idx| &columns_schemas[*idx].name)
+    }
+
     /// Returns the new [TableMetaBuilder] after applying given `alter_kind`.
     ///
     /// The returned builder would derive the next column id of this meta.
@@ -209,39 +243,10 @@ impl TableMeta {
             AlterKind::RenameTable { .. } => Ok(self.new_meta_builder()),
             AlterKind::SetTableOptions { options } => self.set_table_options(options),
             AlterKind::UnsetTableOptions { keys } => self.unset_table_options(keys),
-            AlterKind::SetIndex { options } => match options {
-                SetIndexOptions::Fulltext {
-                    column_name,
-                    options,
-                } => self.change_column_fulltext_options(
-                    table_name,
-                    column_name,
-                    true,
-                    Some(options),
-                ),
-                SetIndexOptions::Inverted { column_name } => {
-                    self.change_column_modify_inverted_index(table_name, column_name, true)
-                }
-                SetIndexOptions::Skipping {
-                    column_name,
-                    options,
-                } => self.change_column_skipping_index_options(
-                    table_name,
-                    column_name,
-                    Some(options),
-                ),
-            },
-            AlterKind::UnsetIndex { options } => match options {
-                UnsetIndexOptions::Fulltext { column_name } => {
-                    self.change_column_fulltext_options(table_name, column_name, false, None)
-                }
-                UnsetIndexOptions::Inverted { column_name } => {
-                    self.change_column_modify_inverted_index(table_name, column_name, false)
-                }
-                UnsetIndexOptions::Skipping { column_name } => {
-                    self.change_column_skipping_index_options(table_name, column_name, None)
-                }
-            },
+            AlterKind::SetIndexes { options } => self.set_indexes(table_name, options),
+            AlterKind::UnsetIndexes { options } => self.unset_indexes(table_name, options),
+            AlterKind::DropDefaults { names } => self.drop_defaults(table_name, names),
+            AlterKind::SetDefaults { defaults } => self.set_defaults(table_name, defaults),
         }
     }
 
@@ -282,30 +287,38 @@ impl TableMeta {
         self.set_table_options(&requests)
     }
 
-    /// Creates a [TableMetaBuilder] with modified column inverted index.
-    fn change_column_modify_inverted_index(
+    fn set_indexes(
         &self,
         table_name: &str,
-        column_name: &str,
-        value: bool,
+        requests: &[SetIndexOption],
     ) -> Result<TableMetaBuilder> {
         let table_schema = &self.schema;
-        let mut meta_builder = self.new_meta_builder();
-
-        let mut columns: Vec<ColumnSchema> =
-            Vec::with_capacity(table_schema.column_schemas().len());
-
-        for column_schema in table_schema.column_schemas().iter() {
-            if column_schema.name == column_name {
-                let mut new_column_schema = column_schema.clone();
-                new_column_schema.set_inverted_index(value);
-                columns.push(new_column_schema);
-            } else {
-                columns.push(column_schema.clone());
-            }
+        let mut set_index_options: HashMap<&str, Vec<_>> = HashMap::new();
+        for request in requests {
+            let column_name = request.column_name();
+            table_schema
+                .column_index_by_name(column_name)
+                .with_context(|| error::ColumnNotExistsSnafu {
+                    column_name,
+                    table_name,
+                })?;
+            set_index_options
+                .entry(column_name)
+                .or_default()
+                .push(request);
         }
 
-        // TODO(CookiePieWw): This part for all alter table operations is similar. We can refactor it.
+        let mut meta_builder = self.new_meta_builder();
+        let mut columns: Vec<_> = Vec::with_capacity(table_schema.column_schemas().len());
+        for mut column in table_schema.column_schemas().iter().cloned() {
+            if let Some(request) = set_index_options.get(column.name.as_str()) {
+                for request in request {
+                    self.set_index(&mut column, request)?;
+                }
+            }
+            columns.push(column);
+        }
+
         let mut builder = SchemaBuilder::try_from_columns(columns)
             .with_context(|_| error::SchemaBuildSnafu {
                 msg: format!("Failed to convert column schemas into schema for table {table_name}"),
@@ -316,12 +329,17 @@ impl TableMeta {
             builder = builder.add_metadata(k, v);
         }
 
-        let new_schema = builder.build().with_context(|_| error::SchemaBuildSnafu {
-            msg: format!(
-                "Table {table_name} cannot change fulltext options for column {column_name}",
-            ),
+        let new_schema = builder.build().with_context(|_| {
+            let column_names = requests
+                .iter()
+                .map(|request| request.column_name())
+                .collect::<Vec<_>>();
+            error::SchemaBuildSnafu {
+                msg: format!(
+                    "Table {table_name} cannot set index options with columns {column_names:?}",
+                ),
+            }
         })?;
-
         let _ = meta_builder
             .schema(Arc::new(new_schema))
             .primary_key_indices(self.primary_key_indices.clone());
@@ -329,68 +347,38 @@ impl TableMeta {
         Ok(meta_builder)
     }
 
-    /// Creates a [TableMetaBuilder] with modified column fulltext options.
-    fn change_column_fulltext_options(
+    fn unset_indexes(
         &self,
         table_name: &str,
-        column_name: &str,
-        enable: bool,
-        options: Option<&FulltextOptions>,
+        requests: &[UnsetIndexOption],
     ) -> Result<TableMetaBuilder> {
         let table_schema = &self.schema;
-        let mut meta_builder = self.new_meta_builder();
-
-        let column = &table_schema
-            .column_schema_by_name(column_name)
-            .with_context(|| error::ColumnNotExistsSnafu {
-                column_name,
-                table_name,
-            })?;
-
-        ensure!(
-            column.data_type.is_string(),
-            error::InvalidColumnOptionSnafu {
-                column_name,
-                msg: "FULLTEXT index only supports string type",
-            }
-        );
-
-        let current_fulltext_options = column
-            .fulltext_options()
-            .context(error::SetFulltextOptionsSnafu { column_name })?;
-
-        let mut columns = Vec::with_capacity(table_schema.column_schemas().len());
-        for column_schema in table_schema.column_schemas() {
-            if column_schema.name == column_name {
-                let mut new_column_schema = column_schema.clone();
-                if enable {
-                    ensure!(
-                        options.is_some(),
-                        error::InvalidColumnOptionSnafu {
-                            column_name,
-                            msg: "FULLTEXT index options must be provided",
-                        }
-                    );
-                    set_column_fulltext_options(
-                        &mut new_column_schema,
-                        column_name,
-                        options.unwrap(),
-                        current_fulltext_options.clone(),
-                    )?
-                } else {
-                    unset_column_fulltext_options(
-                        &mut new_column_schema,
-                        column_name,
-                        current_fulltext_options.clone(),
-                    )?
-                }
-                columns.push(new_column_schema);
-            } else {
-                columns.push(column_schema.clone());
-            }
+        let mut set_index_options: HashMap<&str, Vec<_>> = HashMap::new();
+        for request in requests {
+            let column_name = request.column_name();
+            table_schema
+                .column_index_by_name(column_name)
+                .with_context(|| error::ColumnNotExistsSnafu {
+                    column_name,
+                    table_name,
+                })?;
+            set_index_options
+                .entry(column_name)
+                .or_default()
+                .push(request);
         }
 
-        // TODO(CookiePieWw): This part for all alter table operations is similar. We can refactor it.
+        let mut meta_builder = self.new_meta_builder();
+        let mut columns: Vec<_> = Vec::with_capacity(table_schema.column_schemas().len());
+        for mut column in table_schema.column_schemas().iter().cloned() {
+            if let Some(request) = set_index_options.get(column.name.as_str()) {
+                for request in request {
+                    self.unset_index(&mut column, request)?;
+                }
+            }
+            columns.push(column);
+        }
+
         let mut builder = SchemaBuilder::try_from_columns(columns)
             .with_context(|_| error::SchemaBuildSnafu {
                 msg: format!("Failed to convert column schemas into schema for table {table_name}"),
@@ -401,12 +389,17 @@ impl TableMeta {
             builder = builder.add_metadata(k, v);
         }
 
-        let new_schema = builder.build().with_context(|_| error::SchemaBuildSnafu {
-            msg: format!(
-                "Table {table_name} cannot change fulltext options for column {column_name}",
-            ),
+        let new_schema = builder.build().with_context(|_| {
+            let column_names = requests
+                .iter()
+                .map(|request| request.column_name())
+                .collect::<Vec<_>>();
+            error::SchemaBuildSnafu {
+                msg: format!(
+                    "Table {table_name} cannot set index options with columns {column_names:?}",
+                ),
+            }
         })?;
-
         let _ = meta_builder
             .schema(Arc::new(new_schema))
             .primary_key_indices(self.primary_key_indices.clone());
@@ -414,54 +407,70 @@ impl TableMeta {
         Ok(meta_builder)
     }
 
-    /// Creates a [TableMetaBuilder] with modified column skipping index options.
-    fn change_column_skipping_index_options(
-        &self,
-        table_name: &str,
-        column_name: &str,
-        options: Option<&SkippingIndexOptions>,
-    ) -> Result<TableMetaBuilder> {
-        let table_schema = &self.schema;
-        let mut meta_builder = self.new_meta_builder();
-
-        let mut columns = Vec::with_capacity(table_schema.column_schemas().len());
-        for column_schema in table_schema.column_schemas() {
-            if column_schema.name == column_name {
-                let mut new_column_schema = column_schema.clone();
-                if let Some(options) = options {
-                    set_column_skipping_index_options(
-                        &mut new_column_schema,
+    fn set_index(&self, column_schema: &mut ColumnSchema, request: &SetIndexOption) -> Result<()> {
+        match request {
+            SetIndexOption::Fulltext {
+                column_name,
+                options,
+            } => {
+                ensure!(
+                    column_schema.data_type.is_string(),
+                    error::InvalidColumnOptionSnafu {
                         column_name,
-                        options,
-                    )?;
-                } else {
-                    unset_column_skipping_index_options(&mut new_column_schema, column_name)?;
-                }
-                columns.push(new_column_schema);
-            } else {
-                columns.push(column_schema.clone());
+                        msg: "FULLTEXT index only supports string type",
+                    }
+                );
+
+                let current_fulltext_options = column_schema
+                    .fulltext_options()
+                    .context(error::SetFulltextOptionsSnafu { column_name })?;
+                set_column_fulltext_options(
+                    column_schema,
+                    column_name,
+                    options,
+                    current_fulltext_options,
+                )?;
+            }
+            SetIndexOption::Inverted { column_name } => {
+                debug_assert_eq!(column_schema.name, *column_name);
+                column_schema.set_inverted_index(true);
+            }
+            SetIndexOption::Skipping {
+                column_name,
+                options,
+            } => {
+                set_column_skipping_index_options(column_schema, column_name, options)?;
             }
         }
 
-        let mut builder = SchemaBuilder::try_from_columns(columns)
-            .with_context(|_| error::SchemaBuildSnafu {
-                msg: format!("Failed to convert column schemas into schema for table {table_name}"),
-            })?
-            .version(table_schema.version() + 1);
+        Ok(())
+    }
 
-        for (k, v) in table_schema.metadata().iter() {
-            builder = builder.add_metadata(k, v);
+    fn unset_index(
+        &self,
+        column_schema: &mut ColumnSchema,
+        request: &UnsetIndexOption,
+    ) -> Result<()> {
+        match request {
+            UnsetIndexOption::Fulltext { column_name } => {
+                let current_fulltext_options = column_schema
+                    .fulltext_options()
+                    .context(error::SetFulltextOptionsSnafu { column_name })?;
+                unset_column_fulltext_options(
+                    column_schema,
+                    column_name,
+                    current_fulltext_options.clone(),
+                )?
+            }
+            UnsetIndexOption::Inverted { .. } => {
+                column_schema.set_inverted_index(false);
+            }
+            UnsetIndexOption::Skipping { column_name } => {
+                unset_column_skipping_index_options(column_schema, column_name)?;
+            }
         }
 
-        let new_schema = builder.build().with_context(|_| error::SchemaBuildSnafu {
-            msg: format!("Failed to convert column schemas into schema for table {table_name}"),
-        })?;
-
-        let _ = meta_builder
-            .schema(Arc::new(new_schema))
-            .primary_key_indices(self.primary_key_indices.clone());
-
-        Ok(meta_builder)
+        Ok(())
     }
 
     // TODO(yingwen): Remove this.
@@ -492,20 +501,11 @@ impl TableMeta {
         Ok(desc)
     }
 
-    /// Create a [`TableMetaBuilder`].
-    ///
-    /// Note: please always use this function to create the builder.
+    /// Create a [`TableMetaBuilder`] from the current TableMeta.
     fn new_meta_builder(&self) -> TableMetaBuilder {
-        let mut builder = TableMetaBuilder::default();
-        let _ = builder
-            .schema(self.schema.clone())
-            .primary_key_indices(self.primary_key_indices.clone())
-            .engine(&self.engine)
-            .options(self.options.clone())
-            .created_on(self.created_on)
-            .region_numbers(self.region_numbers.clone())
-            .next_column_id(self.next_column_id);
-
+        let mut builder = TableMetaBuilder::from(self);
+        // Manually remove value_indices.
+        builder.value_indices = None;
         builder
     }
 
@@ -631,10 +631,19 @@ impl TableMeta {
             msg: format!("Table {table_name} cannot add new columns {column_names:?}"),
         })?;
 
+        let partition_key_indices = self
+            .partition_key_indices
+            .iter()
+            .map(|idx| table_schema.column_name_by_index(*idx))
+            // This unwrap is safe since we only add new columns.
+            .map(|name| new_schema.column_index_by_name(name).unwrap())
+            .collect();
+
         // value_indices would be generated automatically.
         let _ = meta_builder
             .schema(Arc::new(new_schema))
-            .primary_key_indices(primary_key_indices);
+            .primary_key_indices(primary_key_indices)
+            .partition_key_indices(partition_key_indices);
 
         Ok(meta_builder)
     }
@@ -657,6 +666,14 @@ impl TableMeta {
                 ensure!(
                     !self.primary_key_indices.contains(&index),
                     error::RemoveColumnInIndexSnafu {
+                        column_name: *column_name,
+                        table_name,
+                    }
+                );
+
+                ensure!(
+                    !self.partition_key_indices.contains(&index),
+                    error::RemovePartitionColumnSnafu {
                         column_name: *column_name,
                         table_name,
                     }
@@ -711,9 +728,18 @@ impl TableMeta {
             .map(|name| new_schema.column_index_by_name(name).unwrap())
             .collect();
 
+        let partition_key_indices = self
+            .partition_key_indices
+            .iter()
+            .map(|idx| table_schema.column_name_by_index(*idx))
+            // This unwrap is safe since we don't allow removing a partition key column.
+            .map(|name| new_schema.column_index_by_name(name).unwrap())
+            .collect();
+
         let _ = meta_builder
             .schema(Arc::new(new_schema))
-            .primary_key_indices(primary_key_indices);
+            .primary_key_indices(primary_key_indices)
+            .partition_key_indices(partition_key_indices);
 
         Ok(meta_builder)
     }
@@ -804,17 +830,34 @@ impl TableMeta {
             );
         }
         // Collect columns after changed.
-        let columns: Vec<_> = table_schema
-            .column_schemas()
-            .iter()
-            .cloned()
-            .map(|mut column| {
-                if let Some(change_column) = modify_column_types.get(&column.name) {
-                    column.data_type = change_column.target_type.clone();
-                }
-                column
-            })
-            .collect();
+
+        let mut columns: Vec<_> = Vec::with_capacity(table_schema.column_schemas().len());
+        for mut column in table_schema.column_schemas().iter().cloned() {
+            if let Some(change_column) = modify_column_types.get(&column.name) {
+                column.data_type = change_column.target_type.clone();
+                let new_default = if let Some(default_value) = column.default_constraint() {
+                    Some(
+                        default_value
+                            .cast_to_datatype(&change_column.target_type)
+                            .with_context(|_| error::CastDefaultValueSnafu {
+                                reason: format!(
+                                    "Failed to cast default value from {:?} to type {:?}",
+                                    default_value, &change_column.target_type
+                                ),
+                            })?,
+                    )
+                } else {
+                    None
+                };
+                column = column
+                    .clone()
+                    .with_default_constraint(new_default.clone())
+                    .with_context(|_| error::CastDefaultValueSnafu {
+                        reason: format!("Failed to set new default: {:?}", new_default),
+                    })?;
+            }
+            columns.push(column)
+        }
 
         let mut builder = SchemaBuilder::try_from_columns(columns)
             .with_context(|_| error::SchemaBuildSnafu {
@@ -896,6 +939,102 @@ impl TableMeta {
             column_names,
         })
     }
+
+    fn drop_defaults(&self, table_name: &str, column_names: &[String]) -> Result<TableMetaBuilder> {
+        let table_schema = &self.schema;
+        let mut meta_builder = self.new_meta_builder();
+        let mut columns = Vec::with_capacity(table_schema.num_columns());
+        for column_schema in table_schema.column_schemas() {
+            if let Some(name) = column_names.iter().find(|s| **s == column_schema.name) {
+                // Drop default constraint.
+                ensure!(
+                    column_schema.default_constraint().is_some(),
+                    error::InvalidAlterRequestSnafu {
+                        table: table_name,
+                        err: format!("column {name} does not have a default value"),
+                    }
+                );
+                if !column_schema.is_nullable() {
+                    return error::InvalidAlterRequestSnafu {
+                        table: table_name,
+                        err: format!(
+                            "column {name} is not nullable and `default` cannot be dropped",
+                        ),
+                    }
+                    .fail();
+                }
+                let new_column_schema = column_schema.clone();
+                let new_column_schema = new_column_schema
+                    .with_default_constraint(None)
+                    .with_context(|_| error::SchemaBuildSnafu {
+                        msg: format!("Table {table_name} cannot drop default values"),
+                    })?;
+                columns.push(new_column_schema);
+            } else {
+                columns.push(column_schema.clone());
+            }
+        }
+
+        let mut builder = SchemaBuilder::try_from_columns(columns)
+            .with_context(|_| error::SchemaBuildSnafu {
+                msg: format!("Failed to convert column schemas into schema for table {table_name}"),
+            })?
+            // Also bump the schema version.
+            .version(table_schema.version() + 1);
+        for (k, v) in table_schema.metadata().iter() {
+            builder = builder.add_metadata(k, v);
+        }
+        let new_schema = builder.build().with_context(|_| error::SchemaBuildSnafu {
+            msg: format!("Table {table_name} cannot drop default values"),
+        })?;
+
+        let _ = meta_builder.schema(Arc::new(new_schema));
+
+        Ok(meta_builder)
+    }
+
+    fn set_defaults(
+        &self,
+        table_name: &str,
+        set_defaults: &[SetDefaultRequest],
+    ) -> Result<TableMetaBuilder> {
+        let table_schema = &self.schema;
+        let mut meta_builder = self.new_meta_builder();
+        let mut columns = Vec::with_capacity(table_schema.num_columns());
+        for column_schema in table_schema.column_schemas() {
+            if let Some(set_default) = set_defaults
+                .iter()
+                .find(|s| s.column_name == column_schema.name)
+            {
+                let new_column_schema = column_schema.clone();
+                let new_column_schema = new_column_schema
+                    .with_default_constraint(set_default.default_constraint.clone())
+                    .with_context(|_| error::SchemaBuildSnafu {
+                        msg: format!("Table {table_name} cannot set default values"),
+                    })?;
+                columns.push(new_column_schema);
+            } else {
+                columns.push(column_schema.clone());
+            }
+        }
+
+        let mut builder = SchemaBuilder::try_from_columns(columns)
+            .with_context(|_| error::SchemaBuildSnafu {
+                msg: format!("Failed to convert column schemas into schema for table {table_name}"),
+            })?
+            // Also bump the schema version.
+            .version(table_schema.version() + 1);
+        for (k, v) in table_schema.metadata().iter() {
+            builder = builder.add_metadata(k, v);
+        }
+        let new_schema = builder.build().with_context(|_| error::SchemaBuildSnafu {
+            msg: format!("Table {table_name} cannot set default values"),
+        })?;
+
+        let _ = meta_builder.schema(Arc::new(new_schema));
+
+        Ok(meta_builder)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Builder)]
@@ -936,6 +1075,10 @@ impl TableInfo {
     /// Returns the full table name in the form of `{catalog}.{schema}.{table}`.
     pub fn full_table_name(&self) -> String {
         common_catalog::format_full_table_name(&self.catalog_name, &self.schema_name, &self.name)
+    }
+
+    pub fn get_db_string(&self) -> String {
+        common_catalog::build_db_string(&self.catalog_name, &self.schema_name)
     }
 
     /// Returns true when the table is the metric engine's physical table.
@@ -1000,12 +1143,13 @@ pub struct RawTableMeta {
     /// The indices of columns in primary key. Note that the index of timestamp column
     /// is not included. Order matters to this array.
     pub primary_key_indices: Vec<usize>,
-    ///  The indices of columns in value. Order doesn't matter to this array.
+    ///  The indices of columns in value. The index of timestamp column is included.
+    /// Order doesn't matter to this array.
     pub value_indices: Vec<usize>,
     /// Engine type of this table. Usually in small case.
     pub engine: String,
     /// Next column id of a new column.
-    /// Deprecated. See https://github.com/GreptimeTeam/greptimedb/issues/2982
+    /// It's used to ensure all columns with the same name across all regions have the same column id.
     pub next_column_id: ColumnId,
     pub region_numbers: Vec<u32>,
     pub options: TableOptions,
@@ -1013,6 +1157,10 @@ pub struct RawTableMeta {
     /// Order doesn't matter to this array.
     #[serde(default)]
     pub partition_key_indices: Vec<usize>,
+    /// Map of column name to column id.
+    /// Note: This field may be empty for older versions that did not include this field.
+    #[serde(default)]
+    pub column_ids: Vec<ColumnId>,
 }
 
 impl From<TableMeta> for RawTableMeta {
@@ -1027,6 +1175,7 @@ impl From<TableMeta> for RawTableMeta {
             options: meta.options,
             created_on: meta.created_on,
             partition_key_indices: meta.partition_key_indices,
+            column_ids: meta.column_ids,
         }
     }
 }
@@ -1045,6 +1194,7 @@ impl TryFrom<RawTableMeta> for TableMeta {
             options: raw.options,
             created_on: raw.created_on,
             partition_key_indices: raw.partition_key_indices,
+            column_ids: raw.column_ids,
         })
     }
 }
@@ -1062,6 +1212,24 @@ pub struct RawTableInfo {
 }
 
 impl RawTableInfo {
+    /// Returns the map of column name to column id.
+    ///
+    /// Note: This method may return an empty map for older versions that did not include this field.
+    pub fn name_to_ids(&self) -> Option<HashMap<String, ColumnId>> {
+        if self.meta.column_ids.len() != self.meta.schema.column_schemas.len() {
+            None
+        } else {
+            Some(
+                self.meta
+                    .column_ids
+                    .iter()
+                    .enumerate()
+                    .map(|(index, id)| (self.meta.schema.column_schemas[index].name.clone(), *id))
+                    .collect(),
+            )
+        }
+    }
+
     /// Sort the columns in [RawTableInfo], logical tables require it.
     pub fn sort_columns(&mut self) {
         let column_schemas = &self.meta.schema.column_schemas;
@@ -1072,6 +1240,7 @@ impl RawTableInfo {
             .map(|index| column_schemas[*index].name.clone())
             .collect::<HashSet<_>>();
 
+        let name_to_ids = self.name_to_ids().unwrap_or_default();
         self.meta
             .schema
             .column_schemas
@@ -1081,14 +1250,19 @@ impl RawTableInfo {
         let mut primary_key_indices = Vec::with_capacity(primary_keys.len());
         let mut timestamp_index = None;
         let mut value_indices =
-            Vec::with_capacity(self.meta.schema.column_schemas.len() - primary_keys.len() - 1);
+            Vec::with_capacity(self.meta.schema.column_schemas.len() - primary_keys.len());
+        let mut column_ids = Vec::with_capacity(self.meta.schema.column_schemas.len());
         for (index, column_schema) in self.meta.schema.column_schemas.iter().enumerate() {
             if primary_keys.contains(&column_schema.name) {
                 primary_key_indices.push(index);
             } else if column_schema.is_time_index() {
+                value_indices.push(index);
                 timestamp_index = Some(index);
             } else {
                 value_indices.push(index);
+            }
+            if let Some(id) = name_to_ids.get(&column_schema.name) {
+                column_ids.push(*id);
             }
         }
 
@@ -1096,6 +1270,7 @@ impl RawTableInfo {
         self.meta.schema.timestamp_index = timestamp_index;
         self.meta.primary_key_indices = primary_key_indices;
         self.meta.value_indices = value_indices;
+        self.meta.column_ids = column_ids;
     }
 
     /// Extracts region options from table info.
@@ -1103,6 +1278,15 @@ impl RawTableInfo {
     /// All "region options" are actually a copy of table options for redundancy.
     pub fn to_region_options(&self) -> HashMap<String, String> {
         HashMap::from(&self.meta.options)
+    }
+
+    /// Returns the table reference.
+    pub fn table_ref(&self) -> TableReference {
+        TableReference::full(
+            self.catalog_name.as_str(),
+            self.schema_name.as_str(),
+            self.name.as_str(),
+        )
     }
 }
 
@@ -1136,6 +1320,14 @@ impl TryFrom<RawTableInfo> for TableInfo {
     }
 }
 
+/// Set column fulltext options if it passed the validation.
+///
+/// Options allowed to modify:
+/// * backend
+///
+/// Options not allowed to modify:
+/// * analyzer
+/// * case_sensitive
 fn set_column_fulltext_options(
     column_schema: &mut ColumnSchema,
     column_name: &str,
@@ -1143,14 +1335,6 @@ fn set_column_fulltext_options(
     current_options: Option<FulltextOptions>,
 ) -> Result<()> {
     if let Some(current_options) = current_options {
-        ensure!(
-            !current_options.enable,
-            error::InvalidColumnOptionSnafu {
-                column_name,
-                msg: "FULLTEXT index already enabled",
-            }
-        );
-
         ensure!(
             current_options.analyzer == options.analyzer
                 && current_options.case_sensitive == options.case_sensitive,
@@ -1217,12 +1401,17 @@ fn unset_column_skipping_index_options(
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches::assert_matches;
+
     use common_error::ext::ErrorExt;
     use common_error::status_code::StatusCode;
     use datatypes::data_type::ConcreteDataType;
-    use datatypes::schema::{ColumnSchema, Schema, SchemaBuilder};
+    use datatypes::schema::{
+        ColumnSchema, FulltextAnalyzer, FulltextBackend, Schema, SchemaBuilder,
+    };
 
     use super::*;
+    use crate::Error;
 
     /// Create a test schema with 3 columns: `[col1 int32, ts timestampmills, col2 int32]`.
     fn new_test_schema() -> Schema {
@@ -1246,7 +1435,7 @@ mod tests {
     #[test]
     fn test_raw_convert() {
         let schema = Arc::new(new_test_schema());
-        let meta = TableMetaBuilder::default()
+        let meta = TableMetaBuilder::empty()
             .schema(schema)
             .primary_key_indices(vec![0])
             .engine("engine")
@@ -1300,6 +1489,11 @@ mod tests {
             ConcreteDataType::string_datatype(),
             true,
         );
+        let yet_another_field = ColumnSchema::new(
+            "yet_another_field_after_ts",
+            ConcreteDataType::int64_datatype(),
+            true,
+        );
         let alter_kind = AlterKind::AddColumns {
             columns: vec![
                 AddColumnRequest {
@@ -1311,6 +1505,14 @@ mod tests {
                 AddColumnRequest {
                     column_schema: new_field,
                     is_key: false,
+                    location: Some(AddColumnLocation::After {
+                        column_name: "ts".to_string(),
+                    }),
+                    add_if_not_exists: false,
+                },
+                AddColumnRequest {
+                    column_schema: yet_another_field,
+                    is_key: true,
                     location: Some(AddColumnLocation::After {
                         column_name: "ts".to_string(),
                     }),
@@ -1328,7 +1530,7 @@ mod tests {
     #[test]
     fn test_add_columns() {
         let schema = Arc::new(new_test_schema());
-        let meta = TableMetaBuilder::default()
+        let meta = TableMetaBuilder::empty()
             .schema(schema)
             .primary_key_indices(vec![0])
             .engine("engine")
@@ -1353,7 +1555,7 @@ mod tests {
     #[test]
     fn test_add_columns_multiple_times() {
         let schema = Arc::new(new_test_schema());
-        let meta = TableMetaBuilder::default()
+        let meta = TableMetaBuilder::empty()
             .schema(schema)
             .primary_key_indices(vec![0])
             .engine("engine")
@@ -1395,7 +1597,7 @@ mod tests {
     #[test]
     fn test_remove_columns() {
         let schema = Arc::new(new_test_schema());
-        let meta = TableMetaBuilder::default()
+        let meta = TableMetaBuilder::empty()
             .schema(schema.clone())
             .primary_key_indices(vec![0])
             .engine("engine")
@@ -1451,7 +1653,7 @@ mod tests {
                 .build()
                 .unwrap(),
         );
-        let meta = TableMetaBuilder::default()
+        let meta = TableMetaBuilder::empty()
             .schema(schema.clone())
             .primary_key_indices(vec![1])
             .engine("engine")
@@ -1487,7 +1689,7 @@ mod tests {
     #[test]
     fn test_add_existing_column() {
         let schema = Arc::new(new_test_schema());
-        let meta = TableMetaBuilder::default()
+        let meta = TableMetaBuilder::empty()
             .schema(schema)
             .primary_key_indices(vec![0])
             .engine("engine")
@@ -1534,7 +1736,7 @@ mod tests {
     #[test]
     fn test_add_different_type_column() {
         let schema = Arc::new(new_test_schema());
-        let meta = TableMetaBuilder::default()
+        let meta = TableMetaBuilder::empty()
             .schema(schema)
             .primary_key_indices(vec![0])
             .engine("engine")
@@ -1561,7 +1763,7 @@ mod tests {
     #[test]
     fn test_add_invalid_column() {
         let schema = Arc::new(new_test_schema());
-        let meta = TableMetaBuilder::default()
+        let meta = TableMetaBuilder::empty()
             .schema(schema)
             .primary_key_indices(vec![0])
             .engine("engine")
@@ -1593,7 +1795,7 @@ mod tests {
     #[test]
     fn test_remove_unknown_column() {
         let schema = Arc::new(new_test_schema());
-        let meta = TableMetaBuilder::default()
+        let meta = TableMetaBuilder::empty()
             .schema(schema)
             .primary_key_indices(vec![0])
             .engine("engine")
@@ -1615,7 +1817,7 @@ mod tests {
     #[test]
     fn test_change_unknown_column_data_type() {
         let schema = Arc::new(new_test_schema());
-        let meta = TableMetaBuilder::default()
+        let meta = TableMetaBuilder::empty()
             .schema(schema)
             .primary_key_indices(vec![0])
             .engine("engine")
@@ -1640,7 +1842,7 @@ mod tests {
     #[test]
     fn test_remove_key_column() {
         let schema = Arc::new(new_test_schema());
-        let meta = TableMetaBuilder::default()
+        let meta = TableMetaBuilder::empty()
             .schema(schema)
             .primary_key_indices(vec![0])
             .engine("engine")
@@ -1672,9 +1874,32 @@ mod tests {
     }
 
     #[test]
+    fn test_remove_partition_column() {
+        let schema = Arc::new(new_test_schema());
+        let meta = TableMetaBuilder::empty()
+            .schema(schema)
+            .primary_key_indices(vec![])
+            .partition_key_indices(vec![0])
+            .engine("engine")
+            .next_column_id(3)
+            .build()
+            .unwrap();
+        // Remove column in primary key.
+        let alter_kind = AlterKind::DropColumns {
+            names: vec![String::from("col1")],
+        };
+
+        let err = meta
+            .builder_with_alter_kind("my_table", &alter_kind)
+            .err()
+            .unwrap();
+        assert_matches!(err, Error::RemovePartitionColumn { .. });
+    }
+
+    #[test]
     fn test_change_key_column_data_type() {
         let schema = Arc::new(new_test_schema());
-        let meta = TableMetaBuilder::default()
+        let meta = TableMetaBuilder::empty()
             .schema(schema)
             .primary_key_indices(vec![0])
             .engine("engine")
@@ -1714,7 +1939,7 @@ mod tests {
     #[test]
     fn test_alloc_new_column() {
         let schema = Arc::new(new_test_schema());
-        let mut meta = TableMetaBuilder::default()
+        let mut meta = TableMetaBuilder::empty()
             .schema(schema)
             .primary_key_indices(vec![0])
             .engine("engine")
@@ -1733,9 +1958,11 @@ mod tests {
     #[test]
     fn test_add_columns_with_location() {
         let schema = Arc::new(new_test_schema());
-        let meta = TableMetaBuilder::default()
+        let meta = TableMetaBuilder::empty()
             .schema(schema)
             .primary_key_indices(vec![0])
+            // partition col: col1, col2
+            .partition_key_indices(vec![0, 2])
             .engine("engine")
             .next_column_id(3)
             .build()
@@ -1751,17 +1978,25 @@ mod tests {
             .map(|column_schema| column_schema.name.clone())
             .collect();
         assert_eq!(
-            &["my_tag_first", "col1", "ts", "my_field_after_ts", "col2"],
+            &[
+                "my_tag_first",               // primary key column
+                "col1",                       // partition column
+                "ts",                         // timestamp column
+                "yet_another_field_after_ts", // primary key column
+                "my_field_after_ts",          // value column
+                "col2",                       // partition column
+            ],
             &names[..]
         );
-        assert_eq!(&[0, 1], &new_meta.primary_key_indices[..]);
-        assert_eq!(&[2, 3, 4], &new_meta.value_indices[..]);
+        assert_eq!(&[0, 1, 3], &new_meta.primary_key_indices[..]);
+        assert_eq!(&[2, 4, 5], &new_meta.value_indices[..]);
+        assert_eq!(&[1, 5], &new_meta.partition_key_indices[..]);
     }
 
     #[test]
     fn test_modify_column_fulltext_options() {
         let schema = Arc::new(new_test_schema());
-        let meta = TableMetaBuilder::default()
+        let meta = TableMetaBuilder::empty()
             .schema(schema)
             .primary_key_indices(vec![0])
             .engine("engine")
@@ -1769,11 +2004,11 @@ mod tests {
             .build()
             .unwrap();
 
-        let alter_kind = AlterKind::SetIndex {
-            options: SetIndexOptions::Fulltext {
+        let alter_kind = AlterKind::SetIndexes {
+            options: vec![SetIndexOption::Fulltext {
                 column_name: "col1".to_string(),
                 options: FulltextOptions::default(),
-            },
+            }],
         };
         let err = meta
             .builder_with_alter_kind("my_table", &alter_kind)
@@ -1788,15 +2023,18 @@ mod tests {
         let new_meta = add_columns_to_meta_with_location(&meta);
         assert_eq!(meta.region_numbers, new_meta.region_numbers);
 
-        let alter_kind = AlterKind::SetIndex {
-            options: SetIndexOptions::Fulltext {
+        let alter_kind = AlterKind::SetIndexes {
+            options: vec![SetIndexOption::Fulltext {
                 column_name: "my_tag_first".to_string(),
-                options: FulltextOptions {
-                    enable: true,
-                    analyzer: datatypes::schema::FulltextAnalyzer::Chinese,
-                    case_sensitive: true,
-                },
-            },
+                options: FulltextOptions::new_unchecked(
+                    true,
+                    FulltextAnalyzer::Chinese,
+                    true,
+                    FulltextBackend::Bloom,
+                    1000,
+                    0.01,
+                ),
+            }],
         };
         let new_meta = new_meta
             .builder_with_alter_kind("my_table", &alter_kind)
@@ -1815,10 +2053,10 @@ mod tests {
         );
         assert!(fulltext_options.case_sensitive);
 
-        let alter_kind = AlterKind::UnsetIndex {
-            options: UnsetIndexOptions::Fulltext {
+        let alter_kind = AlterKind::UnsetIndexes {
+            options: vec![UnsetIndexOption::Fulltext {
                 column_name: "my_tag_first".to_string(),
-            },
+            }],
         };
         let new_meta = new_meta
             .builder_with_alter_kind("my_table", &alter_kind)

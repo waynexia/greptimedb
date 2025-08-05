@@ -22,6 +22,8 @@ use index::inverted_index::create::sort::external_sort::ExternalSorter;
 use index::inverted_index::create::sort_create::SortIndexCreator;
 use index::inverted_index::create::InvertedIndexCreator;
 use index::inverted_index::format::writer::InvertedIndexBlobWriter;
+use mito_codec::index::{IndexValueCodec, IndexValuesCodec};
+use mito_codec::row_converter::SortField;
 use puffin::puffin_manager::{PuffinWriter, PutOptions};
 use snafu::{ensure, ResultExt};
 use store_api::metadata::RegionMetadataRef;
@@ -30,13 +32,11 @@ use tokio::io::duplex;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::error::{
-    BiErrorsSnafu, IndexFinishSnafu, OperateAbortedIndexSnafu, PuffinAddBlobSnafu,
+    BiErrorsSnafu, EncodeSnafu, IndexFinishSnafu, OperateAbortedIndexSnafu, PuffinAddBlobSnafu,
     PushIndexValueSnafu, Result,
 };
 use crate::read::Batch;
-use crate::row_converter::SortField;
 use crate::sst::file::FileId;
-use crate::sst::index::codec::{IndexValueCodec, IndexValuesCodec};
 use crate::sst::index::intermediate::{
     IntermediateLocation, IntermediateManager, TempFileProvider,
 };
@@ -205,7 +205,8 @@ impl InvertedIndexer {
                                 v.as_value_ref(),
                                 field,
                                 &mut self.value_buf,
-                            )?;
+                            )
+                            .context(EncodeSnafu)?;
                             Ok(self.value_buf.as_slice())
                         })
                         .transpose()?;
@@ -238,7 +239,8 @@ impl InvertedIndexer {
                                 value,
                                 &sort_field,
                                 &mut self.value_buf,
-                            )?;
+                            )
+                            .context(EncodeSnafu)?;
                             self.index_creator
                                 .push_with_name(col_id_str, Some(&self.value_buf))
                                 .await
@@ -277,8 +279,15 @@ impl InvertedIndexer {
         let mut index_writer = InvertedIndexBlobWriter::new(tx.compat_write());
 
         let (index_finish, puffin_add_blob) = futures::join!(
-            self.index_creator.finish(&mut index_writer),
-            puffin_writer.put_blob(INDEX_BLOB_TYPE, rx.compat(), PutOptions::default())
+            // TODO(zhongzc): config bitmap type
+            self.index_creator
+                .finish(&mut index_writer, index::bitmap::BitmapType::Roaring),
+            puffin_writer.put_blob(
+                INDEX_BLOB_TYPE,
+                rx.compat(),
+                PutOptions::default(),
+                Default::default(),
+            )
         );
 
         match (
@@ -319,7 +328,6 @@ impl InvertedIndexer {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::iter;
 
     use api::v1::SemanticType;
     use datafusion_expr::{binary_expr, col, lit, Expr as DfExpr, Operator};
@@ -328,11 +336,13 @@ mod tests {
     use datatypes::value::ValueRef;
     use datatypes::vectors::{UInt64Vector, UInt8Vector};
     use futures::future::BoxFuture;
+    use mito_codec::row_converter::{DensePrimaryKeyCodec, PrimaryKeyCodecExt};
     use object_store::services::Memory;
     use object_store::ObjectStore;
     use puffin::puffin_manager::cache::PuffinMetadataCache;
     use puffin::puffin_manager::PuffinManager;
     use store_api::metadata::{ColumnMetadata, RegionMetadataBuilder};
+    use store_api::region_request::PathType;
     use store_api::storage::RegionId;
 
     use super::*;
@@ -340,7 +350,7 @@ mod tests {
     use crate::cache::index::inverted_index::InvertedIndexCache;
     use crate::metrics::CACHE_BYTES;
     use crate::read::BatchColumn;
-    use crate::row_converter::{DensePrimaryKeyCodec, PrimaryKeyCodecExt};
+    use crate::sst::file::RegionFileId;
     use crate::sst::index::inverted_index::applier::builder::InvertedIndexApplierBuilder;
     use crate::sst::index::puffin_manager::PuffinManagerFactory;
 
@@ -417,15 +427,15 @@ mod tests {
 
         Batch::new(
             primary_key,
-            Arc::new(UInt64Vector::from_iter_values(
-                iter::repeat(0).take(num_rows),
-            )),
-            Arc::new(UInt64Vector::from_iter_values(
-                iter::repeat(0).take(num_rows),
-            )),
-            Arc::new(UInt8Vector::from_iter_values(
-                iter::repeat(1).take(num_rows),
-            )),
+            Arc::new(UInt64Vector::from_iter_values(std::iter::repeat_n(
+                0, num_rows,
+            ))),
+            Arc::new(UInt64Vector::from_iter_values(std::iter::repeat_n(
+                0, num_rows,
+            ))),
+            Arc::new(UInt8Vector::from_iter_values(std::iter::repeat_n(
+                1, num_rows,
+            ))),
             vec![u64_field],
         )
         .unwrap()
@@ -436,7 +446,7 @@ mod tests {
         rows: BTreeSet<(&'static str, i32, [u64; 2])>,
     ) -> impl Fn(DfExpr) -> BoxFuture<'static, Vec<usize>> {
         let (d, factory) = PuffinManagerFactory::new_for_test_async(prefix).await;
-        let region_dir = "region0".to_string();
+        let table_dir = "table0".to_string();
         let sst_file_id = FileId::random();
         let object_store = mock_object_store();
         let region_metadata = mock_region_metadata();
@@ -461,8 +471,10 @@ mod tests {
 
         let puffin_manager = factory.build(
             object_store.clone(),
-            RegionFilePathFactory::new(region_dir.clone()),
+            RegionFilePathFactory::new(table_dir.clone(), PathType::Bare),
         );
+
+        let sst_file_id = RegionFileId::new(region_metadata.region_id, sst_file_id);
         let mut writer = puffin_manager.writer(&sst_file_id).await.unwrap();
         let (row_count, _) = creator.finish(&mut writer).await.unwrap();
         assert_eq!(row_count, rows.len() * segment_row_count);
@@ -473,7 +485,8 @@ mod tests {
             let cache = Arc::new(InvertedIndexCache::new(10, 10, 100));
             let puffin_metadata_cache = Arc::new(PuffinMetadataCache::new(10, &CACHE_BYTES));
             let applier = InvertedIndexApplierBuilder::new(
-                region_dir.clone(),
+                table_dir.clone(),
+                PathType::Bare,
                 object_store.clone(),
                 &region_metadata,
                 indexed_column_ids.clone(),

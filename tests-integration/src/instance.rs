@@ -49,7 +49,7 @@ mod tests {
         let standalone = GreptimeDbStandaloneBuilder::new("test_standalone_exec_sql")
             .build()
             .await;
-        let instance = standalone.instance.as_ref();
+        let instance = standalone.fe_instance();
 
         let sql = r#"
             CREATE TABLE demo(
@@ -224,7 +224,7 @@ mod tests {
                 .expect("region routes should be physical"),
         )
         .iter()
-        .map(|(k, v)| (v[0], *k))
+        .map(|(k, v)| (v.leader_regions[0], *k))
         .collect::<HashMap<u32, u64>>();
         assert!(region_to_dn_map.len() <= instance.datanodes().len());
 
@@ -249,11 +249,14 @@ mod tests {
             let region_id = RegionId::new(table_id, *region);
 
             let stream = region_server
-                .handle_remote_read(QueryRequest {
-                    region_id: region_id.as_u64(),
-                    plan: plan.to_vec(),
-                    ..Default::default()
-                })
+                .handle_remote_read(
+                    QueryRequest {
+                        region_id: region_id.as_u64(),
+                        plan: plan.to_vec(),
+                        ..Default::default()
+                    },
+                    QueryContext::arc(),
+                )
                 .await
                 .unwrap();
 
@@ -350,7 +353,7 @@ mod tests {
             .with_plugin(plugins)
             .build()
             .await;
-        let instance = standalone.instance;
+        let instance = standalone.fe_instance().clone();
 
         let sql = r#"CREATE TABLE demo(
                             host STRING,
@@ -412,7 +415,7 @@ mod tests {
             .with_plugin(plugins)
             .build()
             .await;
-        let instance = standalone.instance;
+        let instance = standalone.fe_instance().clone();
 
         let sql = r#"CREATE TABLE demo(
                             host STRING,

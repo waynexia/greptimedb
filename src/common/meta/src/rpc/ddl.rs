@@ -12,9 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(feature = "enterprise")]
+pub mod trigger;
+
 use std::collections::{HashMap, HashSet};
 use std::result;
 
+use api::helper::{from_pb_time_ranges, to_pb_time_ranges};
 use api::v1::alter_database_expr::Kind as PbAlterDatabaseKind;
 use api::v1::meta::ddl_task_request::Task;
 use api::v1::meta::{
@@ -35,17 +39,21 @@ use api::v1::{
 };
 use base64::engine::general_purpose;
 use base64::Engine as _;
-use common_time::DatabaseTimeToLive;
+use common_error::ext::BoxedError;
+use common_time::{DatabaseTimeToLive, Timestamp, Timezone};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DefaultOnNull};
-use session::context::QueryContextRef;
+use session::context::{QueryContextBuilder, QueryContextRef};
 use snafu::{OptionExt, ResultExt};
 use table::metadata::{RawTableInfo, TableId};
 use table::table_name::TableName;
 use table::table_reference::TableReference;
 
-use crate::error::{self, InvalidSetDatabaseOptionSnafu, InvalidUnsetDatabaseOptionSnafu, Result};
+use crate::error::{
+    self, ConvertTimeRangesSnafu, ExternalSnafu, InvalidSetDatabaseOptionSnafu,
+    InvalidTimeZoneSnafu, InvalidUnsetDatabaseOptionSnafu, Result,
+};
 use crate::key::FlowId;
 
 /// DDL tasks
@@ -63,8 +71,12 @@ pub enum DdlTask {
     AlterDatabase(AlterDatabaseTask),
     CreateFlow(CreateFlowTask),
     DropFlow(DropFlowTask),
+    #[cfg(feature = "enterprise")]
+    DropTrigger(trigger::DropTriggerTask),
     CreateView(CreateViewTask),
     DropView(DropViewTask),
+    #[cfg(feature = "enterprise")]
+    CreateTrigger(trigger::CreateTriggerTask),
 }
 
 impl DdlTask {
@@ -169,12 +181,14 @@ impl DdlTask {
         schema: String,
         table: String,
         table_id: TableId,
+        time_ranges: Vec<(Timestamp, Timestamp)>,
     ) -> Self {
         DdlTask::TruncateTable(TruncateTableTask {
             catalog,
             schema,
             table,
             table_id,
+            time_ranges,
         })
     }
 
@@ -239,6 +253,30 @@ impl TryFrom<Task> for DdlTask {
             Task::DropFlowTask(drop_flow) => Ok(DdlTask::DropFlow(drop_flow.try_into()?)),
             Task::CreateViewTask(create_view) => Ok(DdlTask::CreateView(create_view.try_into()?)),
             Task::DropViewTask(drop_view) => Ok(DdlTask::DropView(drop_view.try_into()?)),
+            Task::CreateTriggerTask(create_trigger) => {
+                #[cfg(feature = "enterprise")]
+                return Ok(DdlTask::CreateTrigger(create_trigger.try_into()?));
+                #[cfg(not(feature = "enterprise"))]
+                {
+                    let _ = create_trigger;
+                    crate::error::UnsupportedSnafu {
+                        operation: "create trigger",
+                    }
+                    .fail()
+                }
+            }
+            Task::DropTriggerTask(drop_trigger) => {
+                #[cfg(feature = "enterprise")]
+                return Ok(DdlTask::DropTrigger(drop_trigger.try_into()?));
+                #[cfg(not(feature = "enterprise"))]
+                {
+                    let _ = drop_trigger;
+                    crate::error::UnsupportedSnafu {
+                        operation: "drop trigger",
+                    }
+                    .fail()
+                }
+            }
         }
     }
 }
@@ -289,6 +327,10 @@ impl TryFrom<SubmitDdlTaskRequest> for PbDdlTaskRequest {
             DdlTask::DropFlow(task) => Task::DropFlowTask(task.into()),
             DdlTask::CreateView(task) => Task::CreateViewTask(task.try_into()?),
             DdlTask::DropView(task) => Task::DropViewTask(task.into()),
+            #[cfg(feature = "enterprise")]
+            DdlTask::CreateTrigger(task) => Task::CreateTriggerTask(task.into()),
+            #[cfg(feature = "enterprise")]
+            DdlTask::DropTrigger(task) => Task::DropTriggerTask(task.into()),
         };
 
         Ok(Self {
@@ -788,6 +830,7 @@ pub struct TruncateTableTask {
     pub schema: String,
     pub table: String,
     pub table_id: TableId,
+    pub time_ranges: Vec<(Timestamp, Timestamp)>,
 }
 
 impl TruncateTableTask {
@@ -826,6 +869,13 @@ impl TryFrom<PbTruncateTableTask> for TruncateTableTask {
                     err_msg: "expected table_id",
                 })?
                 .id,
+            time_ranges: truncate_table
+                .time_ranges
+                .map(from_pb_time_ranges)
+                .transpose()
+                .map_err(BoxedError::new)
+                .context(ExternalSnafu)?
+                .unwrap_or_default(),
         })
     }
 }
@@ -840,6 +890,9 @@ impl TryFrom<TruncateTableTask> for PbTruncateTableTask {
                 schema_name: task.schema,
                 table_name: task.table,
                 table_id: Some(api::v1::TableId { id: task.table_id }),
+                time_ranges: Some(
+                    to_pb_time_ranges(&task.time_ranges).context(ConvertTimeRangesSnafu)?,
+                ),
             }),
         })
     }
@@ -1202,7 +1255,7 @@ impl From<DropFlowTask> for PbDropFlowTask {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct QueryContext {
     current_catalog: String,
     current_schema: String,
@@ -1223,6 +1276,19 @@ impl From<QueryContextRef> for QueryContext {
     }
 }
 
+impl TryFrom<QueryContext> for session::context::QueryContext {
+    type Error = error::Error;
+    fn try_from(value: QueryContext) -> std::result::Result<Self, Self::Error> {
+        Ok(QueryContextBuilder::default()
+            .current_catalog(value.current_catalog)
+            .current_schema(value.current_schema)
+            .timezone(Timezone::from_tz_string(&value.timezone).context(InvalidTimeZoneSnafu)?)
+            .extensions(value.extensions)
+            .channel((value.channel as u32).into())
+            .build())
+    }
+}
+
 impl From<QueryContext> for PbQueryContext {
     fn from(
         QueryContext {
@@ -1240,6 +1306,7 @@ impl From<QueryContext> for PbQueryContext {
             extensions,
             channel: channel as u32,
             snapshot_seqs: None,
+            explain: None,
         }
     }
 }
@@ -1322,6 +1389,7 @@ mod tests {
             options: Default::default(),
             created_on: Default::default(),
             partition_key_indices: Default::default(),
+            column_ids: Default::default(),
         };
 
         // construct RawTableInfo
@@ -1387,6 +1455,6 @@ mod tests {
             create_table_task.table_info.meta.primary_key_indices,
             vec![2]
         );
-        assert_eq!(create_table_task.table_info.meta.value_indices, vec![1]);
+        assert_eq!(create_table_task.table_info.meta.value_indices, vec![0, 1]);
     }
 }

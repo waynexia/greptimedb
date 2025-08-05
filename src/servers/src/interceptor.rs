@@ -24,9 +24,9 @@ use common_query::Output;
 use datafusion_expr::LogicalPlan;
 use log_query::LogQuery;
 use query::parser::PromQuery;
-use serde_json::Value;
 use session::context::QueryContextRef;
 use sql::statements::statement::Statement;
+use vrl::value::Value;
 
 /// SqlQueryInterceptor can track life cycle of a sql query and customize or
 /// abort its execution at given point.

@@ -47,7 +47,7 @@ use tokio::io::AsyncWrite;
 use crate::error::{self, DataFrameSnafu, InvalidPrepareStatementSnafu, Result};
 use crate::metrics::METRIC_AUTH_FAILURE;
 use crate::mysql::helper::{
-    self, format_placeholder, replace_placeholders, transform_placeholders,
+    self, fix_placeholder_types, format_placeholder, replace_placeholders, transform_placeholders,
 };
 use crate::mysql::writer;
 use crate::mysql::writer::{create_mysql_column, handle_err};
@@ -82,6 +82,7 @@ pub struct MysqlInstanceShim {
     user_provider: Option<UserProviderRef>,
     prepared_stmts: Arc<RwLock<HashMap<String, SqlPlan>>>,
     prepared_stmts_counter: AtomicU32,
+    process_id: u32,
 }
 
 impl MysqlInstanceShim {
@@ -89,10 +90,11 @@ impl MysqlInstanceShim {
         query_handler: ServerSqlQueryHandlerRef,
         user_provider: Option<UserProviderRef>,
         client_addr: SocketAddr,
+        process_id: u32,
     ) -> MysqlInstanceShim {
         // init a random salt
         let mut bs = vec![0u8; 20];
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         rng.fill_bytes(bs.as_mut());
 
         let mut scramble: [u8; 20] = [0; 20];
@@ -110,10 +112,12 @@ impl MysqlInstanceShim {
                 Some(client_addr),
                 Channel::Mysql,
                 Default::default(),
+                process_id,
             )),
             user_provider,
             prepared_stmts: Default::default(),
             prepared_stmts_counter: AtomicU32::new(1),
+            process_id,
         }
     }
 
@@ -183,7 +187,7 @@ impl MysqlInstanceShim {
         let describe_result = self
             .do_describe(statement.clone(), query_ctx.clone())
             .await?;
-        let (plan, schema) = if let Some(DescribeResult {
+        let (mut plan, schema) = if let Some(DescribeResult {
             logical_plan,
             schema,
         }) = describe_result
@@ -193,7 +197,9 @@ impl MysqlInstanceShim {
             (None, None)
         };
 
-        let params = if let Some(plan) = &plan {
+        let params = if let Some(plan) = &mut plan {
+            fix_placeholder_types(plan)?;
+            debug!("Plan after fix placeholder types: {:#?}", plan);
             prepared_params(
                 &plan
                     .get_parameter_types()
@@ -258,7 +264,8 @@ impl MysqlInstanceShim {
         };
 
         let outputs = match sql_plan.plan {
-            Some(plan) => {
+            Some(mut plan) => {
+                fix_placeholder_types(&mut plan)?;
                 let param_types = plan
                     .get_parameter_types()
                     .context(DataFrameSnafu)?
@@ -295,6 +302,10 @@ impl MysqlInstanceShim {
                     }
                     Params::CliParams(params) => params.iter().map(|x| x.to_string()).collect(),
                 };
+                debug!(
+                    "do_execute Replacing with Params: {:?}, Original Query: {}",
+                    param_strs, sql_plan.query
+                );
                 let query = replace_params(param_strs, sql_plan.query);
                 debug!("Mysql execute replaced query: {}", query);
                 self.do_query(&query, query_ctx.clone()).await
@@ -330,6 +341,10 @@ impl<W: AsyncWrite + Send + Sync + Unpin> AsyncMysqlShim<W> for MysqlInstanceShi
 
     fn version(&self) -> String {
         std::env::var("GREPTIMEDB_MYSQL_SERVER_VERSION").unwrap_or_else(|_| "8.4.2".to_string())
+    }
+
+    fn connect_id(&self) -> u32 {
+        self.process_id
     }
 
     fn default_auth_plugin(&self) -> &str {
@@ -412,6 +427,7 @@ impl<W: AsyncWrite + Send + Sync + Unpin> AsyncMysqlShim<W> for MysqlInstanceShi
         let (params, columns) = self
             .do_prepare(raw_query, query_ctx.clone(), stmt_key)
             .await?;
+        debug!("on_prepare: Params: {:?}, Columns: {:?}", params, columns);
         w.reply(stmt_id, &params, &columns).await?;
         crate::metrics::METRIC_MYSQL_PREPARED_COUNT
             .with_label_values(&[query_ctx.get_db_string().as_str()])
@@ -641,12 +657,13 @@ fn replace_params_with_values(
     debug_assert_eq!(param_types.len(), params.len());
 
     debug!(
-        "replace_params_with_values(param_types: {:#?}, params: {:#?})",
+        "replace_params_with_values(param_types: {:#?}, params: {:#?}, plan: {:#?})",
         param_types,
         params
             .iter()
             .map(|x| format!("({:?}, {:?})", x.value, x.coltype))
-            .join(", ")
+            .join(", "),
+        plan
     );
 
     let mut values = Vec::with_capacity(params.len());
@@ -672,9 +689,10 @@ fn replace_params_with_exprs(
     debug_assert_eq!(param_types.len(), params.len());
 
     debug!(
-        "replace_params_with_exprs(param_types: {:#?}, params: {:#?})",
+        "replace_params_with_exprs(param_types: {:#?}, params: {:#?}, plan: {:#?})",
         param_types,
-        params.iter().map(|x| format!("({:?})", x)).join(", ")
+        params.iter().map(|x| format!("({:?})", x)).join(", "),
+        plan
     );
 
     let mut values = Vec::with_capacity(params.len());

@@ -13,24 +13,24 @@
 // limitations under the License.
 
 use clap::Parser;
-use cli::{BenchTableMetadataCommand, ExportCommand, ImportCommand, Tool};
+use cli::{BenchTableMetadataCommand, DataCommand, MetadataCommand, Tool};
 use common_error::ext::BoxedError;
 
 #[derive(Parser)]
 pub enum SubCommand {
-    // Attach(AttachCommand),
     Bench(BenchTableMetadataCommand),
-    Export(ExportCommand),
-    Import(ImportCommand),
+    #[clap(subcommand)]
+    Data(DataCommand),
+    #[clap(subcommand)]
+    Meta(MetadataCommand),
 }
 
 impl SubCommand {
     pub async fn build(&self) -> std::result::Result<Box<dyn Tool>, BoxedError> {
         match self {
-            // SubCommand::Attach(cmd) => cmd.build().await,
             SubCommand::Bench(cmd) => cmd.build().await,
-            SubCommand::Export(cmd) => cmd.build().await,
-            SubCommand::Import(cmd) => cmd.build().await,
+            SubCommand::Data(cmd) => cmd.build().await,
+            SubCommand::Meta(cmd) => cmd.build().await,
         }
     }
 }

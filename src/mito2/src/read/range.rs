@@ -14,22 +14,22 @@
 
 //! Structs for partition ranges.
 
-use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use common_time::Timestamp;
-use parquet::arrow::arrow_reader::RowSelection;
 use smallvec::{smallvec, SmallVec};
 use store_api::region_engine::PartitionRange;
+use store_api::storage::TimeSeriesDistribution;
 
 use crate::cache::CacheStrategy;
 use crate::error::Result;
-use crate::memtable::{MemtableRange, MemtableRanges, MemtableStats};
+use crate::memtable::{MemtableRange, MemtableStats};
 use crate::read::scan_region::ScanInput;
 use crate::sst::file::{overlaps, FileHandle, FileTimeRange};
 use crate::sst::parquet::file_range::{FileRange, FileRangeContextRef};
 use crate::sst::parquet::format::parquet_row_group_time_range;
 use crate::sst::parquet::reader::ReaderMetrics;
+use crate::sst::parquet::row_selection::RowGroupSelection;
 use crate::sst::parquet::DEFAULT_ROW_GROUP_SIZE;
 
 const ALL_ROW_GROUPS: i64 = -1;
@@ -46,12 +46,12 @@ pub(crate) struct SourceIndex {
 
 /// Index to access a row group.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct RowGroupIndex {
+pub struct RowGroupIndex {
     /// Index to the memtable/file.
     pub(crate) index: usize,
     /// Row group index in the file.
     /// Negative index indicates all row groups.
-    pub(crate) row_group_index: i64,
+    pub row_group_index: i64,
 }
 
 /// Meta data of a partition range.
@@ -97,9 +97,12 @@ impl RangeMeta {
         Self::push_seq_mem_ranges(&input.memtables, &mut ranges);
         Self::push_seq_file_ranges(input.memtables.len(), &input.files, &mut ranges);
 
+        #[cfg(feature = "enterprise")]
+        Self::push_extension_ranges(input.extension_ranges(), &mut ranges);
+
         let ranges = group_ranges_for_seq_scan(ranges);
-        if compaction {
-            // We don't split ranges in compaction.
+        if compaction || input.distribution == Some(TimeSeriesDistribution::PerSeries) {
+            // We don't split ranges in compaction or TimeSeriesDistribution::PerSeries.
             return ranges;
         }
         maybe_split_ranges_for_seq_scan(ranges)
@@ -115,6 +118,9 @@ impl RangeMeta {
             &input.cache_strategy,
             &mut ranges,
         );
+
+        #[cfg(feature = "enterprise")]
+        Self::push_extension_ranges(input.extension_ranges(), &mut ranges);
 
         ranges
     }
@@ -210,8 +216,7 @@ impl RangeMeta {
         for (i, file) in files.iter().enumerate() {
             let file_index = num_memtables + i;
             // Get parquet meta from the cache.
-            let parquet_meta =
-                cache.get_parquet_meta_data_from_mem_cache(file.region_id(), file.file_id());
+            let parquet_meta = cache.get_parquet_meta_data_from_mem_cache(file.file_id());
             if let Some(parquet_meta) = parquet_meta {
                 // Scans each row group.
                 for row_group_index in 0..file.meta_ref().num_row_groups {
@@ -313,6 +318,28 @@ impl RangeMeta {
             });
         }
     }
+
+    #[cfg(feature = "enterprise")]
+    fn push_extension_ranges(
+        ranges: &[crate::extension::BoxedExtensionRange],
+        metas: &mut Vec<RangeMeta>,
+    ) {
+        for range in ranges.iter() {
+            let index = metas.len();
+            metas.push(RangeMeta {
+                time_range: range.time_range(),
+                indices: smallvec![SourceIndex {
+                    index,
+                    num_row_groups: range.num_row_groups(),
+                }],
+                row_group_indices: smallvec![RowGroupIndex {
+                    index,
+                    row_group_index: ALL_ROW_GROUPS,
+                }],
+                num_rows: range.num_rows() as usize,
+            });
+        }
+    }
 }
 
 /// Groups ranges by time range.
@@ -366,51 +393,51 @@ fn maybe_split_ranges_for_seq_scan(ranges: Vec<RangeMeta>) -> Vec<RangeMeta> {
 
 /// Builder to create file ranges.
 #[derive(Default)]
-pub(crate) struct FileRangeBuilder {
+pub struct FileRangeBuilder {
     /// Context for the file.
     /// None indicates nothing to read.
     context: Option<FileRangeContextRef>,
-    /// Row selections for each row group to read.
-    /// It skips the row group if it is not in the map.
-    row_groups: BTreeMap<usize, Option<RowSelection>>,
+    /// Row group selection for the file to read.
+    selection: RowGroupSelection,
 }
 
 impl FileRangeBuilder {
     /// Builds a file range builder from context and row groups.
-    pub(crate) fn new(
-        context: FileRangeContextRef,
-        row_groups: BTreeMap<usize, Option<RowSelection>>,
-    ) -> Self {
+    pub(crate) fn new(context: FileRangeContextRef, selection: RowGroupSelection) -> Self {
         Self {
             context: Some(context),
-            row_groups,
+            selection,
         }
     }
 
     /// Builds file ranges to read.
     /// Negative `row_group_index` indicates all row groups.
-    pub(crate) fn build_ranges(&self, row_group_index: i64, ranges: &mut SmallVec<[FileRange; 2]>) {
+    pub fn build_ranges(&self, row_group_index: i64, ranges: &mut SmallVec<[FileRange; 2]>) {
         let Some(context) = self.context.clone() else {
             return;
         };
         if row_group_index >= 0 {
             let row_group_index = row_group_index as usize;
             // Scans one row group.
-            let Some(row_selection) = self.row_groups.get(&row_group_index) else {
+            let Some(row_selection) = self.selection.get(row_group_index) else {
                 return;
             };
             ranges.push(FileRange::new(
                 context,
                 row_group_index,
-                row_selection.clone(),
+                Some(row_selection.clone()),
             ));
         } else {
             // Scans all row groups.
             ranges.extend(
-                self.row_groups
+                self.selection
                     .iter()
                     .map(|(row_group_index, row_selection)| {
-                        FileRange::new(context.clone(), *row_group_index, row_selection.clone())
+                        FileRange::new(
+                            context.clone(),
+                            *row_group_index,
+                            Some(row_selection.clone()),
+                        )
                     }),
             );
         }
@@ -420,37 +447,30 @@ impl FileRangeBuilder {
 /// Builder to create mem ranges.
 pub(crate) struct MemRangeBuilder {
     /// Ranges of a memtable.
-    ranges: MemtableRanges,
+    range: MemtableRange,
+    /// Stats of a memtable.
+    stats: MemtableStats,
 }
 
 impl MemRangeBuilder {
     /// Builds a mem range builder from row groups.
-    pub(crate) fn new(ranges: MemtableRanges) -> Self {
-        Self { ranges }
+    pub(crate) fn new(range: MemtableRange, stats: MemtableStats) -> Self {
+        Self { range, stats }
     }
 
     /// Builds mem ranges to read in the memtable.
     /// Negative `row_group_index` indicates all row groups.
     pub(crate) fn build_ranges(
         &self,
-        row_group_index: i64,
+        _row_group_index: i64,
         ranges: &mut SmallVec<[MemtableRange; 2]>,
     ) {
-        if row_group_index >= 0 {
-            let row_group_index = row_group_index as usize;
-            // Scans one row group.
-            let Some(range) = self.ranges.ranges.get(&row_group_index) else {
-                return;
-            };
-            ranges.push(range.clone());
-        } else {
-            ranges.extend(self.ranges.ranges.values().cloned());
-        }
+        ranges.push(self.range.clone())
     }
 
     /// Returns the statistics of the memtable.
     pub(crate) fn stats(&self) -> &MemtableStats {
-        &self.ranges.stats
+        &self.stats
     }
 }
 
@@ -485,7 +505,8 @@ impl RangeBuilderList {
         match builder_opt {
             Some(builder) => builder.build_ranges(index.row_group_index, &mut ranges),
             None => {
-                let builder = input.prune_file(file_index, reader_metrics).await?;
+                let file = &input.files[file_index];
+                let builder = input.prune_file(file, reader_metrics).await?;
                 builder.build_ranges(index.row_group_index, &mut ranges);
                 self.set_file_builder(file_index, Arc::new(builder));
             }

@@ -16,11 +16,10 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use common_error::ext::ErrorExt;
 use common_query::{Output, OutputData};
 use common_recordbatch::error::Result as RecordBatchResult;
 use common_recordbatch::RecordBatch;
-use common_telemetry::{debug, error, tracing};
+use common_telemetry::{debug, tracing};
 use datafusion_common::ParamValues;
 use datatypes::prelude::ConcreteDataType;
 use datatypes::schema::SchemaRef;
@@ -37,23 +36,21 @@ use pgwire::messages::PgWireBackendMessage;
 use query::query_engine::DescribeResult;
 use session::context::QueryContextRef;
 use session::Session;
+use snafu::ResultExt;
 use sql::dialect::PostgreSqlDialect;
 use sql::parser::{ParseOptions, ParserContext};
 
-use super::types::*;
-use super::{fixtures, PostgresServerHandlerInner};
-use crate::error::Result;
+use crate::error::{DataFusionSnafu, Result};
+use crate::postgres::types::*;
+use crate::postgres::utils::convert_err;
+use crate::postgres::{fixtures, PostgresServerHandlerInner};
 use crate::query_handler::sql::ServerSqlQueryHandlerRef;
 use crate::SqlPlan;
 
 #[async_trait]
 impl SimpleQueryHandler for PostgresServerHandlerInner {
     #[tracing::instrument(skip_all, fields(protocol = "postgres"))]
-    async fn do_query<'a, C>(
-        &self,
-        client: &mut C,
-        query: &'a str,
-    ) -> PgWireResult<Vec<Response<'a>>>
+    async fn do_query<'a, C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response<'a>>>
     where
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::Error: Debug,
@@ -139,24 +136,7 @@ pub(crate) fn output_to_query_response<'a>(
                 )
             }
         },
-        Err(e) => {
-            let status_code = e.status_code();
-
-            if status_code.should_log_error() {
-                let root_error = e.root_cause().unwrap_or(&e);
-                error!(e; "Failed to handle postgres query, code: {}, db: {}, error: {}", status_code, query_ctx.get_db_string(), root_error.to_string());
-            } else {
-                debug!(
-                    "Failed to handle postgres query, code: {}, db: {}, error: {:?}",
-                    status_code,
-                    query_ctx.get_db_string(),
-                    e
-                );
-            };
-            Ok(Response::Error(Box::new(
-                PgErrorCode::from(status_code).to_err_info(e.output_msg()),
-            )))
-        }
+        Err(e) => Err(convert_err(e)),
     }
 }
 
@@ -169,10 +149,7 @@ fn recordbatches_to_query_response<'a, S>(
 where
     S: Stream<Item = RecordBatchResult<RecordBatch>> + Send + Unpin + 'static,
 {
-    let pg_schema = Arc::new(
-        schema_to_pg(schema.as_ref(), field_format)
-            .map_err(|e| PgWireError::ApiError(Box::new(e)))?,
-    );
+    let pg_schema = Arc::new(schema_to_pg(schema.as_ref(), field_format).map_err(convert_err)?);
     let pg_schema_ref = pg_schema.clone();
     let data_row_stream = recordbatches_stream
         .map(|record_batch_result| match record_batch_result {
@@ -182,7 +159,7 @@ where
                 rb.rows().map(Ok).collect::<Vec<_>>(),
             )
             .boxed(),
-            Err(e) => stream::once(future::err(PgWireError::ApiError(Box::new(e)))).boxed(),
+            Err(e) => stream::once(future::err(convert_err(e))).boxed(),
         })
         .flatten() // flatten into stream<result<row>>
         .map(move |row| {
@@ -219,7 +196,12 @@ impl DefaultQueryParser {
 impl QueryParser for DefaultQueryParser {
     type Statement = SqlPlan;
 
-    async fn parse_sql(&self, sql: &str, _types: &[Type]) -> PgWireResult<Self::Statement> {
+    async fn parse_sql<C>(
+        &self,
+        _client: &C,
+        sql: &str,
+        _types: &[Type],
+    ) -> PgWireResult<Self::Statement> {
         crate::metrics::METRIC_POSTGRES_PREPARED_COUNT.inc();
         let query_ctx = self.session.new_query_context();
 
@@ -237,7 +219,7 @@ impl QueryParser for DefaultQueryParser {
 
         let mut stmts =
             ParserContext::create_with_dialect(sql, &PostgreSqlDialect {}, ParseOptions::default())
-                .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+                .map_err(convert_err)?;
         if stmts.len() != 1 {
             Err(PgWireError::UserError(Box::new(ErrorInfo::from(
                 PgErrorCode::Ec42P14,
@@ -249,7 +231,7 @@ impl QueryParser for DefaultQueryParser {
                 .query_handler
                 .do_describe(stmt, query_ctx)
                 .await
-                .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+                .map_err(convert_err)?;
 
             let (plan, schema) = if let Some(DescribeResult {
                 logical_plan,
@@ -282,7 +264,7 @@ impl ExtendedQueryHandler for PostgresServerHandlerInner {
     async fn do_query<'a, C>(
         &self,
         client: &mut C,
-        portal: &'a Portal<Self::Statement>,
+        portal: &Portal<Self::Statement>,
         _max_rows: usize,
     ) -> PgWireResult<Response<'a>>
     where
@@ -315,7 +297,8 @@ impl ExtendedQueryHandler for PostgresServerHandlerInner {
                 .replace_params_with_values(&ParamValues::List(parameters_to_scalar_values(
                     plan, portal,
                 )?))
-                .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+                .context(DataFusionSnafu)
+                .map_err(convert_err)?;
             self.query_handler
                 .do_exec_plan(plan, query_ctx.clone())
                 .await
@@ -350,13 +333,13 @@ impl ExtendedQueryHandler for PostgresServerHandlerInner {
         let (param_types, sql_plan, format) = if let Some(plan) = &sql_plan.plan {
             let param_types = plan
                 .get_parameter_types()
-                .map_err(|e| PgWireError::ApiError(Box::new(e)))?
+                .context(DataFusionSnafu)
+                .map_err(convert_err)?
                 .into_iter()
                 .map(|(k, v)| (k, v.map(|v| ConcreteDataType::from_arrow_type(&v))))
                 .collect();
 
-            let types = param_types_to_pg_types(&param_types)
-                .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+            let types = param_types_to_pg_types(&param_types).map_err(convert_err)?;
 
             (types, sql_plan, &Format::UnifiedBinary)
         } else {
@@ -367,7 +350,7 @@ impl ExtendedQueryHandler for PostgresServerHandlerInner {
         if let Some(schema) = &sql_plan.schema {
             schema_to_pg(schema, format)
                 .map(|fields| DescribeStatementResponse::new(param_types, fields))
-                .map_err(|e| PgWireError::ApiError(Box::new(e)))
+                .map_err(convert_err)
         } else {
             if let Some(mut resp) =
                 fixtures::process(&sql_plan.query, self.session.new_query_context())
@@ -398,7 +381,7 @@ impl ExtendedQueryHandler for PostgresServerHandlerInner {
         if let Some(schema) = &sql_plan.schema {
             schema_to_pg(schema, format)
                 .map(DescribePortalResponse::new)
-                .map_err(|e| PgWireError::ApiError(Box::new(e)))
+                .map_err(convert_err)
         } else {
             if let Some(mut resp) =
                 fixtures::process(&sql_plan.query, self.session.new_query_context())

@@ -17,6 +17,7 @@ mod fixtures;
 mod handler;
 mod server;
 mod types;
+mod utils;
 
 pub(crate) const METADATA_USER: &str = "user";
 pub(crate) const METADATA_DATABASE: &str = "database";
@@ -49,7 +50,7 @@ pub(crate) struct GreptimeDBStartupParameters {
 impl GreptimeDBStartupParameters {
     fn new() -> GreptimeDBStartupParameters {
         GreptimeDBStartupParameters {
-            version: format!("16.3-greptimedb-{}", env!("CARGO_PKG_VERSION")),
+            version: format!("16.3-greptimedb-{}", common_version::version()),
         }
     }
 }
@@ -119,8 +120,13 @@ impl PgWireServerHandlers for PostgresServerHandler {
 }
 
 impl MakePostgresServerHandler {
-    fn make(&self, addr: Option<SocketAddr>) -> PostgresServerHandler {
-        let session = Arc::new(Session::new(addr, Channel::Postgres, Default::default()));
+    fn make(&self, addr: Option<SocketAddr>, process_id: u32) -> PostgresServerHandler {
+        let session = Arc::new(Session::new(
+            addr,
+            Channel::Postgres,
+            Default::default(),
+            process_id,
+        ));
         let handler = PostgresServerHandlerInner {
             query_handler: self.query_handler.clone(),
             login_verifier: PgLoginVerifier::new(self.user_provider.clone()),

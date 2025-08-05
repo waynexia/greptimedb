@@ -6,7 +6,8 @@ license.workspace = true
 
 [features]
 default = []
-test = ["common-test-util", "log-store", "rstest", "rstest_reuse", "rskafka"]
+test = ["common-test-util", "rstest", "rstest_reuse", "rskafka"]
+enterprise = []
 
 [lints]
 workspace = true
@@ -24,6 +25,7 @@ common-config.workspace = true
 common-datasource.workspace = true
 common-decimal.workspace = true
 common-error.workspace = true
+common-grpc.workspace = true
 common-macro.workspace = true
 common-meta.workspace = true
 common-query.workspace = true
@@ -40,13 +42,15 @@ datafusion-common.workspace = true
 datafusion-expr.workspace = true
 datatypes.workspace = true
 dotenv.workspace = true
+either.workspace = true
 futures.workspace = true
 humantime-serde.workspace = true
 index.workspace = true
 itertools.workspace = true
 lazy_static = "1.4"
-log-store = { workspace = true, optional = true }
+log-store = { workspace = true }
 memcomparable = "0.2"
+mito-codec.workspace = true
 moka = { workspace = true, features = ["sync", "future"] }
 object-store.workspace = true
 parquet = { workspace = true, features = ["async"] }
@@ -56,6 +60,7 @@ prometheus.workspace = true
 prost.workspace = true
 puffin.workspace = true
 rand.workspace = true
+rayon = "1.10"
 regex = "1.5"
 rskafka = { workspace = true, optional = true }
 rstest = { workspace = true, optional = true }
@@ -72,15 +77,17 @@ table.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tokio-util.workspace = true
+tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 common-function.workspace = true
 common-meta = { workspace = true, features = ["testing"] }
 common-test-util.workspace = true
-criterion = "0.4"
+criterion = { version = "0.4", features = ["async", "async_tokio"] }
 dotenv.workspace = true
 log-store.workspace = true
+mito-codec = { workspace = true, features = ["testing"] }
 object-store = { workspace = true, features = ["services-memory"] }
 rskafka.workspace = true
 rstest.workspace = true
@@ -90,5 +97,20 @@ toml.workspace = true
 
 [[bench]]
 name = "memtable_bench"
+harness = false
+required-features = ["test"]
+
+[[bench]]
+name = "bench_filter_time_partition"
+harness = false
+required-features = ["test"]
+
+[[bench]]
+name = "bench_compaction_picker"
+harness = false
+required-features = ["test"]
+
+[[bench]]
+name = "simple_bulk_memtable"
 harness = false
 required-features = ["test"]

@@ -18,6 +18,7 @@ use std::io;
 use common_error::ext::ErrorExt;
 use common_error::status_code::StatusCode;
 use common_macro::stack_trace_debug;
+use datatypes::arrow::error::ArrowError;
 use snafu::{Location, Snafu};
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -51,19 +52,13 @@ pub enum Error {
         location: Location,
     },
 
-    #[snafu(display("Failed to create gRPC channel"))]
+    #[snafu(display("Failed to create gRPC channel from '{addr}'"))]
     CreateChannel {
+        addr: String,
         #[snafu(source)]
         error: tonic::transport::Error,
         #[snafu(implicit)]
         location: Location,
-    },
-
-    #[snafu(display("Failed to create RecordBatch"))]
-    CreateRecordBatch {
-        #[snafu(implicit)]
-        location: Location,
-        source: common_recordbatch::error::Error,
     },
 
     #[snafu(display("Failed to convert Arrow type: {}", from))]
@@ -88,15 +83,24 @@ pub enum Error {
         location: Location,
     },
 
-    #[snafu(display("Failed to convert Arrow Schema"))]
-    ConvertArrowSchema {
-        #[snafu(implicit)]
-        location: Location,
-        source: datatypes::error::Error,
-    },
-
     #[snafu(display("Not supported: {}", feat))]
     NotSupported { feat: String },
+
+    #[snafu(display("Failed to serde Json"))]
+    SerdeJson {
+        #[snafu(source)]
+        error: serde_json::error::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Failed arrow operation"))]
+    Arrow {
+        #[snafu(implicit)]
+        location: Location,
+        #[snafu(source)]
+        error: ArrowError,
+    },
 }
 
 impl ErrorExt for Error {
@@ -110,10 +114,10 @@ impl ErrorExt for Error {
 
             Error::CreateChannel { .. }
             | Error::Conversion { .. }
-            | Error::DecodeFlightData { .. } => StatusCode::Internal,
+            | Error::DecodeFlightData { .. }
+            | Error::SerdeJson { .. } => StatusCode::Internal,
 
-            Error::CreateRecordBatch { source, .. } => source.status_code(),
-            Error::ConvertArrowSchema { source, .. } => source.status_code(),
+            Error::Arrow { .. } => StatusCode::Internal,
         }
     }
 

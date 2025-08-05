@@ -19,8 +19,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use common_telemetry::info;
+use dfir_rs::scheduled::graph::Dfir;
 use enum_as_inner::EnumAsInner;
-use hydroflow::scheduled::graph::Hydroflow;
 use snafu::ensure;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 
@@ -49,9 +49,9 @@ pub fn create_worker<'a>() -> (WorkerHandle, Worker<'a>) {
     (worker_handle, worker)
 }
 
-/// ActiveDataflowState is a wrapper around `Hydroflow` and `DataflowState`
+/// ActiveDataflowState is a wrapper around `Dfir` and `DataflowState`
 pub(crate) struct ActiveDataflowState<'subgraph> {
-    df: Hydroflow<'subgraph>,
+    df: Dfir<'subgraph>,
     state: DataflowState,
     err_collector: ErrCollector,
 }
@@ -59,7 +59,7 @@ pub(crate) struct ActiveDataflowState<'subgraph> {
 impl std::fmt::Debug for ActiveDataflowState<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ActiveDataflowState")
-            .field("df", &"<Hydroflow>")
+            .field("df", &"<Dfir>")
             .field("state", &self.state)
             .field("err_collector", &self.err_collector)
             .finish()
@@ -69,7 +69,7 @@ impl std::fmt::Debug for ActiveDataflowState<'_> {
 impl Default for ActiveDataflowState<'_> {
     fn default() -> Self {
         ActiveDataflowState {
-            df: Hydroflow::new(),
+            df: Dfir::new(),
             state: DataflowState::default(),
             err_collector: ErrCollector::default(),
         }
@@ -96,6 +96,10 @@ impl<'subgraph> ActiveDataflowState<'subgraph> {
 
     pub fn set_current_ts(&mut self, ts: repr::Timestamp) {
         self.state.set_current_ts(ts);
+    }
+
+    pub fn set_last_exec_time(&mut self, ts: repr::Timestamp) {
+        self.state.set_last_exec_time(ts);
     }
 
     /// Run all available subgraph
@@ -207,6 +211,21 @@ impl WorkerHandle {
             InternalSnafu {
                 reason: format!(
                     "Flow Node/Worker itc failed, expect Response::QueryStateSize, found {ret:?}"
+                ),
+            }
+            .build()
+        })
+    }
+
+    pub async fn get_last_exec_time_map(&self) -> Result<BTreeMap<FlowId, i64>, Error> {
+        let ret = self
+            .itc_client
+            .call_with_resp(Request::QueryLastExecTimeMap)
+            .await?;
+        ret.into_query_last_exec_time_map().map_err(|ret| {
+            InternalSnafu {
+                reason: format!(
+                    "Flow Node/Worker get_last_exec_time_map failed, expect Response::QueryLastExecTimeMap, found {ret:?}"
                 ),
             }
             .build()
@@ -335,6 +354,7 @@ impl<'s> Worker<'s> {
     pub fn run_tick(&mut self, now: repr::Timestamp) {
         for (_flow_id, task_state) in self.task_states.iter_mut() {
             task_state.set_current_ts(now);
+            task_state.set_last_exec_time(now);
             task_state.run_available();
         }
     }
@@ -395,6 +415,15 @@ impl<'s> Worker<'s> {
                 }
                 Some(Response::QueryStateSize { result: ret })
             }
+            Request::QueryLastExecTimeMap => {
+                let mut ret = BTreeMap::new();
+                for (flow_id, task_state) in self.task_states.iter() {
+                    if let Some(last_exec_time) = task_state.state.last_exec_time() {
+                        ret.insert(*flow_id, last_exec_time);
+                    }
+                }
+                Some(Response::QueryLastExecTimeMap { result: ret })
+            }
         };
         Ok(ret)
     }
@@ -427,6 +456,7 @@ pub enum Request {
     },
     Shutdown,
     QueryStateSize,
+    QueryLastExecTimeMap,
 }
 
 #[derive(Debug, EnumAsInner)]
@@ -445,6 +475,10 @@ enum Response {
     QueryStateSize {
         /// each flow tasks' state size
         result: BTreeMap<FlowId, usize>,
+    },
+    QueryLastExecTimeMap {
+        /// each flow tasks' last execution time
+        result: BTreeMap<FlowId, i64>,
     },
 }
 

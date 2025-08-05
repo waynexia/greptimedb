@@ -18,11 +18,13 @@ mod print_caller;
 mod range_fn;
 mod stack_trace_debug;
 mod utils;
+
 use aggr_func::{impl_aggr_func_type_store, impl_as_aggr_func_creator};
 use print_caller::process_print_caller;
 use proc_macro::TokenStream;
+use quote::quote;
 use range_fn::process_range_fn;
-use syn::{parse_macro_input, DeriveInput};
+use syn::{parse_macro_input, Data, DeriveInput, Fields};
 
 use crate::admin_fn::process_admin_fn;
 
@@ -89,8 +91,8 @@ pub fn range_fn(args: TokenStream, input: TokenStream) -> TokenStream {
 /// - `ret`: The return type of the generated SQL function, it will be transformed into `ConcreteDataType::{ret}_datatype()` result.
 /// - `display_name`: The display name of the generated SQL function.
 /// - `sig_fn`: the function to returns `Signature` of generated `Function`.
-///
-/// Note that this macro should only be used in `common-function` crate for now
+/// - `user_path`: Optional path to the trait and context (e.g., `crate`);
+///   defaults to `crate` if not provided.
 #[proc_macro_attribute]
 pub fn admin_fn(args: TokenStream, input: TokenStream) -> TokenStream {
     process_admin_fn(args, input)
@@ -135,4 +137,52 @@ pub fn print_caller(args: TokenStream, input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn stack_trace_debug(args: TokenStream, input: TokenStream) -> TokenStream {
     stack_trace_debug::stack_trace_style_impl(args.into(), input.into()).into()
+}
+
+/// Generates implementation for `From<&TableMeta> for TableMetaBuilder`
+#[proc_macro_derive(ToMetaBuilder)]
+pub fn derive_meta_builder(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+
+    let Data::Struct(data_struct) = input.data else {
+        panic!("ToMetaBuilder can only be derived for structs");
+    };
+
+    let Fields::Named(fields) = data_struct.fields else {
+        panic!("ToMetaBuilder can only be derived for structs with named fields");
+    };
+
+    // Check that this is being applied to TableMeta struct
+    if input.ident != "TableMeta" {
+        panic!("ToMetaBuilder can only be derived for TableMeta struct");
+    }
+
+    let field_init = fields.named.iter().map(|field| {
+        let field_name = field.ident.as_ref().unwrap();
+        quote! {
+            #field_name: Default::default(),
+        }
+    });
+
+    let field_assignments = fields.named.iter().map(|field| {
+        let field_name = field.ident.as_ref().unwrap();
+        quote! {
+            builder.#field_name(meta.#field_name.clone());
+        }
+    });
+
+    let gen = quote! {
+        impl From<&TableMeta> for TableMetaBuilder {
+            fn from(meta: &TableMeta) -> Self {
+                let mut builder = Self {
+                    #(#field_init)*
+                };
+
+                #(#field_assignments)*
+                builder
+            }
+        }
+    };
+
+    gen.into()
 }

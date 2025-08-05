@@ -498,6 +498,17 @@ impl Timestamp {
 
     pub const MIN_NANOSECOND: Self = Self::new_nanosecond(i64::MIN);
     pub const MAX_NANOSECOND: Self = Self::new_nanosecond(i64::MAX);
+
+    /// Checks if a value would overflow for the given time unit.
+    pub fn is_overflow(value: i64, unit: TimeUnit) -> bool {
+        let (min_val, max_val) = match unit {
+            TimeUnit::Second => (Self::MIN_SECOND.value(), Self::MAX_SECOND.value()),
+            TimeUnit::Millisecond => (Self::MIN_MILLISECOND.value(), Self::MAX_MILLISECOND.value()),
+            TimeUnit::Microsecond => (Self::MIN_MICROSECOND.value(), Self::MAX_MICROSECOND.value()),
+            TimeUnit::Nanosecond => (Self::MIN_NANOSECOND.value(), Self::MAX_NANOSECOND.value()),
+        };
+        value < min_val || value > max_val
+    }
 }
 
 /// Converts the naive datetime (which has no specific timezone) to a
@@ -547,7 +558,7 @@ impl fmt::Debug for Timestamp {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TimeUnit {
     Second,
     #[default]
@@ -715,10 +726,10 @@ mod tests {
             TimeUnit::Microsecond,
             TimeUnit::Nanosecond,
         ];
-        let mut rng = rand::thread_rng();
-        let unit_idx: usize = rng.gen_range(0..4);
+        let mut rng = rand::rng();
+        let unit_idx: usize = rng.random_range(0..4);
         let unit = units[unit_idx];
-        let value: i64 = rng.gen();
+        let value: i64 = rng.random();
         Timestamp::new(value, unit)
     }
 
@@ -745,8 +756,8 @@ mod tests {
 
     /// Generate timestamp less than or equal to `threshold`
     fn gen_ts_le(threshold: &Timestamp) -> Timestamp {
-        let mut rng = rand::thread_rng();
-        let timestamp = rng.gen_range(i64::MIN..=threshold.value);
+        let mut rng = rand::rng();
+        let timestamp = rng.random_range(i64::MIN..=threshold.value);
         Timestamp::new(timestamp, threshold.unit)
     }
 

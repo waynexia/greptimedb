@@ -16,7 +16,6 @@
 
 use std::fmt;
 use std::fmt::Display;
-use std::sync::Arc;
 
 use common_query::error::{DowncastVectorSnafu, InvalidFuncArgsSnafu, Result};
 use common_query::prelude::{Signature, Volatility};
@@ -27,7 +26,7 @@ use datatypes::vectors::{BinaryVector, MutableVector, UInt64VectorBuilder, Vecto
 use hyperloglogplus::HyperLogLog;
 use snafu::OptionExt;
 
-use crate::aggr::HllStateType;
+use crate::aggrs::approximate::hll::HllStateType;
 use crate::function::{Function, FunctionContext};
 use crate::function_registry::FunctionRegistry;
 
@@ -44,7 +43,7 @@ pub struct HllCalcFunction;
 
 impl HllCalcFunction {
     pub fn register(registry: &FunctionRegistry) {
-        registry.register(Arc::new(HllCalcFunction));
+        registry.register_scalar(HllCalcFunction);
     }
 }
 
@@ -71,7 +70,7 @@ impl Function for HllCalcFunction {
         )
     }
 
-    fn eval(&self, _func_ctx: FunctionContext, columns: &[VectorRef]) -> Result<VectorRef> {
+    fn eval(&self, _func_ctx: &FunctionContext, columns: &[VectorRef]) -> Result<VectorRef> {
         if columns.len() != 1 {
             return InvalidFuncArgsSnafu {
                 err_msg: format!("hll_count expects 1 argument, got {}", columns.len()),
@@ -117,6 +116,8 @@ impl Function for HllCalcFunction {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use datatypes::vectors::BinaryVector;
 
     use super::*;
@@ -142,7 +143,7 @@ mod tests {
         let serialized_bytes = bincode::serialize(&hll).unwrap();
         let args: Vec<VectorRef> = vec![Arc::new(BinaryVector::from(vec![Some(serialized_bytes)]))];
 
-        let result = function.eval(FunctionContext::default(), &args).unwrap();
+        let result = function.eval(&FunctionContext::default(), &args).unwrap();
         assert_eq!(result.len(), 1);
 
         // Test cardinality estimate
@@ -159,7 +160,7 @@ mod tests {
 
         // Test with invalid number of arguments
         let args: Vec<VectorRef> = vec![];
-        let result = function.eval(FunctionContext::default(), &args);
+        let result = function.eval(&FunctionContext::default(), &args);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -168,7 +169,7 @@ mod tests {
 
         // Test with invalid binary data
         let args: Vec<VectorRef> = vec![Arc::new(BinaryVector::from(vec![Some(vec![1, 2, 3])]))]; // Invalid binary data
-        let result = function.eval(FunctionContext::default(), &args).unwrap();
+        let result = function.eval(&FunctionContext::default(), &args).unwrap();
         assert_eq!(result.len(), 1);
         assert!(matches!(result.get(0), datatypes::value::Value::Null));
     }

@@ -16,11 +16,11 @@ use std::any::Any;
 use std::time::Duration;
 
 use api::v1::meta::MailboxMessage;
-use common_meta::distributed_time_constants::MAILBOX_RTT_SECS;
+use common_meta::distributed_time_constants::REGION_LEASE_SECS;
 use common_meta::instruction::{Instruction, InstructionReply, SimpleReply};
 use common_meta::key::datanode_table::RegionInfo;
 use common_meta::RegionIdent;
-use common_procedure::Status;
+use common_procedure::{Context as ProcedureContext, Status};
 use common_telemetry::{info, warn};
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
@@ -31,7 +31,8 @@ use crate::procedure::region_migration::migration_end::RegionMigrationEnd;
 use crate::procedure::region_migration::{Context, State};
 use crate::service::mailbox::Channel;
 
-const CLOSE_DOWNGRADED_REGION_TIMEOUT: Duration = Duration::from_secs(MAILBOX_RTT_SECS);
+/// Uses lease time of a region as the timeout of closing a downgraded region.
+const CLOSE_DOWNGRADED_REGION_TIMEOUT: Duration = Duration::from_secs(REGION_LEASE_SECS);
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CloseDowngradedRegion;
@@ -39,13 +40,24 @@ pub struct CloseDowngradedRegion;
 #[async_trait::async_trait]
 #[typetag::serde]
 impl State for CloseDowngradedRegion {
-    async fn next(&mut self, ctx: &mut Context) -> Result<(Box<dyn State>, Status)> {
+    async fn next(
+        &mut self,
+        ctx: &mut Context,
+        _procedure_ctx: &ProcedureContext,
+    ) -> Result<(Box<dyn State>, Status)> {
         if let Err(err) = self.close_downgraded_leader_region(ctx).await {
             let downgrade_leader_datanode = &ctx.persistent_ctx.from_peer;
             let region_id = ctx.region_id();
             warn!(err; "Failed to close downgraded leader region: {region_id} on datanode {:?}", downgrade_leader_datanode);
         }
-
+        info!(
+            "Region migration is finished: region_id: {}, from_peer: {}, to_peer: {}, trigger_reason: {}, {}",
+            ctx.region_id(),
+            ctx.persistent_ctx.from_peer,
+            ctx.persistent_ctx.to_peer,
+            ctx.persistent_ctx.trigger_reason,
+            ctx.volatile_ctx.metrics,
+        );
         Ok((Box::new(RegionMigrationEnd), Status::done()))
     }
 
@@ -62,7 +74,6 @@ impl CloseDowngradedRegion {
     async fn build_close_region_instruction(&self, ctx: &mut Context) -> Result<Instruction> {
         let pc = &ctx.persistent_ctx;
         let downgrade_leader_datanode_id = pc.from_peer.id;
-        let cluster_id = pc.cluster_id;
         let table_id = pc.region_id.table_id();
         let region_number = pc.region_id.region_number();
         let datanode_table_value = ctx.get_from_peer_datanode_table_value().await?;
@@ -70,7 +81,6 @@ impl CloseDowngradedRegion {
         let RegionInfo { engine, .. } = datanode_table_value.region_info.clone();
 
         Ok(Instruction::CloseRegion(RegionIdent {
-            cluster_id,
             datanode_id: downgrade_leader_datanode_id,
             table_id,
             region_number,
@@ -86,7 +96,7 @@ impl CloseDowngradedRegion {
         let downgrade_leader_datanode = &pc.from_peer;
         let msg = MailboxMessage::json_message(
             &format!("Close downgraded region: {}", region_id),
-            &format!("Meta@{}", ctx.server_addr()),
+            &format!("Metasrv@{}", ctx.server_addr()),
             &format!(
                 "Datanode-{}@{}",
                 downgrade_leader_datanode.id, downgrade_leader_datanode.addr
@@ -104,7 +114,7 @@ impl CloseDowngradedRegion {
             .send(&ch, msg, CLOSE_DOWNGRADED_REGION_TIMEOUT)
             .await?;
 
-        match receiver.await? {
+        match receiver.await {
             Ok(msg) => {
                 let reply = HeartbeatMailbox::json_reply(&msg)?;
                 info!(

@@ -17,16 +17,18 @@ use std::sync::Arc;
 
 use auth::UserProviderRef;
 use common_base::Plugins;
-use common_config::{Configurable, Mode};
+use common_config::Configurable;
 use servers::error::Error as ServerError;
 use servers::grpc::builder::GrpcServerBuilder;
+use servers::grpc::frontend_grpc_handler::FrontendGrpcHandler;
 use servers::grpc::greptime_handler::GreptimeRequestHandler;
-use servers::grpc::{GrpcOptions, GrpcServer, GrpcServerConfig};
+use servers::grpc::{GrpcOptions, GrpcServer};
 use servers::http::event::LogValidatorRef;
 use servers::http::{HttpServer, HttpServerBuilder};
 use servers::interceptor::LogIngestInterceptorRef;
 use servers::metrics_handler::MetricsHandler;
 use servers::mysql::server::{MysqlServer, MysqlSpawnConfig, MysqlSpawnRef};
+use servers::otel_arrow::OtelArrowServiceHandler;
 use servers::postgres::PostgresServer;
 use servers::query_handler::grpc::ServerGrpcQueryHandlerAdapter;
 use servers::query_handler::sql::ServerSqlQueryHandlerAdapter;
@@ -36,26 +38,24 @@ use snafu::ResultExt;
 
 use crate::error::{self, Result, StartServerSnafu, TomlFormatSnafu};
 use crate::frontend::FrontendOptions;
-use crate::instance::FrontendInstance;
+use crate::instance::Instance;
 
-pub struct Services<T, U>
+pub struct Services<T>
 where
     T: Into<FrontendOptions> + Configurable + Clone,
-    U: FrontendInstance,
 {
     opts: T,
-    instance: Arc<U>,
+    instance: Arc<Instance>,
     grpc_server_builder: Option<GrpcServerBuilder>,
     http_server_builder: Option<HttpServerBuilder>,
     plugins: Plugins,
 }
 
-impl<T, U> Services<T, U>
+impl<T> Services<T>
 where
     T: Into<FrontendOptions> + Configurable + Clone,
-    U: FrontendInstance,
 {
-    pub fn new(opts: T, instance: Arc<U>, plugins: Plugins) -> Self {
+    pub fn new(opts: T, instance: Arc<Instance>, plugins: Plugins) -> Self {
         Self {
             opts,
             instance,
@@ -66,12 +66,7 @@ where
     }
 
     pub fn grpc_server_builder(&self, opts: &GrpcOptions) -> Result<GrpcServerBuilder> {
-        let grpc_config = GrpcServerConfig {
-            max_recv_message_size: opts.max_recv_message_size.as_bytes() as usize,
-            max_send_message_size: opts.max_send_message_size.as_bytes() as usize,
-            tls: opts.tls.clone(),
-        };
-        let builder = GrpcServerBuilder::new(grpc_config, common_runtime::global_runtime())
+        let builder = GrpcServerBuilder::new(opts.as_config(), common_runtime::global_runtime())
             .with_tls_config(opts.tls.clone())
             .context(error::InvalidTlsConfigSnafu)?;
         Ok(builder)
@@ -103,14 +98,16 @@ where
             builder = builder
                 .with_prom_handler(
                     self.instance.clone(),
+                    Some(self.instance.clone()),
                     opts.prom_store.with_metric_engine,
-                    opts.http.is_strict_mode,
+                    opts.http.prom_validation_mode,
                 )
                 .with_prometheus_handler(self.instance.clone());
         }
 
         if opts.otlp.enable {
-            builder = builder.with_otlp_handler(self.instance.clone());
+            builder = builder
+                .with_otlp_handler(self.instance.clone(), opts.prom_store.with_metric_engine);
         }
 
         if opts.jaeger.enable {
@@ -144,28 +141,27 @@ where
         let user_provider = self.plugins.get::<UserProviderRef>();
 
         // Determine whether it is Standalone or Distributed mode based on whether the meta client is configured.
-        let mode = if opts.meta_client.is_none() {
-            Mode::Standalone
+        let runtime = if opts.meta_client.is_none() {
+            Some(builder.runtime().clone())
         } else {
-            Mode::Distributed
-        };
-
-        let runtime = match mode {
-            Mode::Standalone => Some(builder.runtime().clone()),
-            _ => None,
+            None
         };
 
         let greptime_request_handler = GreptimeRequestHandler::new(
             ServerGrpcQueryHandlerAdapter::arc(self.instance.clone()),
             user_provider.clone(),
             runtime,
+            opts.grpc.flight_compression,
         );
 
+        let frontend_grpc_handler =
+            FrontendGrpcHandler::new(self.instance.process_manager().clone());
         let grpc_server = builder
             .database_handler(greptime_request_handler.clone())
             .prometheus_handler(self.instance.clone(), user_provider.clone())
-            .otlp_handler(self.instance.clone(), user_provider)
+            .otel_arrow_handler(OtelArrowServiceHandler::new(self.instance.clone()))
             .flight_handler(Arc::new(greptime_request_handler))
+            .frontend_grpc_handler(frontend_grpc_handler)
             .build();
         Ok(grpc_server)
     }
@@ -185,7 +181,7 @@ where
         Ok(http_server)
     }
 
-    pub async fn build(mut self) -> Result<ServerHandlers> {
+    pub fn build(mut self) -> Result<ServerHandlers> {
         let opts = self.opts.clone();
         let instance = self.instance.clone();
 
@@ -200,7 +196,7 @@ where
             // Always init GRPC server
             let grpc_addr = parse_addr(&opts.grpc.bind_addr)?;
             let grpc_server = self.build_grpc_server(&opts)?;
-            handlers.insert((Box::new(grpc_server), grpc_addr)).await;
+            handlers.insert((Box::new(grpc_server), grpc_addr));
         }
 
         {
@@ -208,7 +204,7 @@ where
             let http_options = &opts.http;
             let http_addr = parse_addr(&http_options.addr)?;
             let http_server = self.build_http_server(&opts, toml)?;
-            handlers.insert((Box::new(http_server), http_addr)).await;
+            handlers.insert((Box::new(http_server), http_addr));
         }
 
         if opts.mysql.enable {
@@ -235,8 +231,9 @@ where
                     opts.keep_alive.as_secs(),
                     opts.reject_no_database.unwrap_or(false),
                 )),
+                Some(instance.process_manager().clone()),
             );
-            handlers.insert((mysql_server, mysql_addr)).await;
+            handlers.insert((mysql_server, mysql_addr));
         }
 
         if opts.postgres.enable {
@@ -257,9 +254,10 @@ where
                 opts.keep_alive.as_secs(),
                 common_runtime::global_runtime(),
                 user_provider.clone(),
+                Some(self.instance.process_manager().clone()),
             )) as Box<dyn Server>;
 
-            handlers.insert((pg_server, pg_addr)).await;
+            handlers.insert((pg_server, pg_addr));
         }
 
         Ok(handlers)

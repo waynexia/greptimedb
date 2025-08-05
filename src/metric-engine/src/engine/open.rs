@@ -14,24 +14,135 @@
 
 //! Open a metric region.
 
-use common_telemetry::info;
+use api::region::RegionResponse;
+use api::v1::SemanticType;
+use common_error::ext::BoxedError;
+use common_telemetry::{error, info, warn};
+use datafusion::common::HashMap;
 use mito2::engine::MITO_ENGINE_NAME;
-use object_store::util::join_dir;
 use snafu::{OptionExt, ResultExt};
-use store_api::codec::PrimaryKeyEncoding;
-use store_api::metric_engine_consts::{DATA_REGION_SUBDIR, METADATA_REGION_SUBDIR};
-use store_api::region_engine::RegionEngine;
-use store_api::region_request::{AffectedRows, RegionOpenRequest, RegionRequest};
+use store_api::region_engine::{BatchResponses, RegionEngine};
+use store_api::region_request::{AffectedRows, PathType, RegionOpenRequest, RegionRequest};
 use store_api::storage::RegionId;
 
-use super::MetricEngineInner;
 use crate::engine::create::region_options_for_metadata_region;
 use crate::engine::options::{set_data_region_options, PhysicalRegionOptions};
-use crate::error::{OpenMitoRegionSnafu, PhysicalRegionNotFoundSnafu, Result};
+use crate::engine::MetricEngineInner;
+use crate::error::{
+    BatchOpenMitoRegionSnafu, NoOpenRegionResultSnafu, OpenMitoRegionSnafu,
+    PhysicalRegionNotFoundSnafu, Result,
+};
 use crate::metrics::{LOGICAL_REGION_COUNT, PHYSICAL_REGION_COUNT};
 use crate::utils;
 
 impl MetricEngineInner {
+    pub async fn handle_batch_open_requests(
+        &self,
+        parallelism: usize,
+        requests: Vec<(RegionId, RegionOpenRequest)>,
+    ) -> Result<BatchResponses> {
+        // We need to open metadata region and data region for each request.
+        let mut all_requests = Vec::with_capacity(requests.len() * 2);
+        let mut physical_region_ids = HashMap::with_capacity(requests.len());
+
+        for (region_id, request) in requests {
+            if !request.is_physical_table() {
+                continue;
+            }
+            let physical_region_options = PhysicalRegionOptions::try_from(&request.options)?;
+            let metadata_region_id = utils::to_metadata_region_id(region_id);
+            let data_region_id = utils::to_data_region_id(region_id);
+            let (open_metadata_region_request, open_data_region_request) =
+                self.transform_open_physical_region_request(request);
+            all_requests.push((metadata_region_id, open_metadata_region_request));
+            all_requests.push((data_region_id, open_data_region_request));
+            physical_region_ids.insert(region_id, physical_region_options);
+        }
+
+        let mut results = self
+            .mito
+            .handle_batch_open_requests(parallelism, all_requests)
+            .await
+            .context(BatchOpenMitoRegionSnafu {})?
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+
+        let mut responses = Vec::with_capacity(physical_region_ids.len());
+        for (physical_region_id, physical_region_options) in physical_region_ids {
+            let metadata_region_id = utils::to_metadata_region_id(physical_region_id);
+            let data_region_id = utils::to_data_region_id(physical_region_id);
+            let metadata_region_result = results.remove(&metadata_region_id);
+            let data_region_result = results.remove(&data_region_id);
+            // Pass the optional `metadata_region_result` and `data_region_result` to
+            // `open_physical_region_with_results`. This function handles errors for each
+            // open physical region request, allowing the process to continue with the
+            // remaining regions even if some requests fail.
+            let response = self
+                .open_physical_region_with_results(
+                    metadata_region_result,
+                    data_region_result,
+                    physical_region_id,
+                    physical_region_options,
+                )
+                .await
+                .map_err(BoxedError::new);
+            responses.push((physical_region_id, response));
+        }
+
+        Ok(responses)
+    }
+
+    // If the metadata region is opened with a stale manifest,
+    // the metric engine may fail to recover logical tables from the metadata region,
+    // as the manifest could reference files that have already been deleted
+    // due to compaction operations performed by the region leader.
+    async fn close_physical_region_on_recovery_failure(&self, physical_region_id: RegionId) {
+        info!(
+            "Closing metadata region {} and data region {} on metadata recovery failure",
+            utils::to_metadata_region_id(physical_region_id),
+            utils::to_data_region_id(physical_region_id)
+        );
+        if let Err(err) = self.close_physical_region(physical_region_id).await {
+            error!(err; "Failed to close physical region {}", physical_region_id);
+        }
+    }
+
+    async fn open_physical_region_with_results(
+        &self,
+        metadata_region_result: Option<std::result::Result<RegionResponse, BoxedError>>,
+        data_region_result: Option<std::result::Result<RegionResponse, BoxedError>>,
+        physical_region_id: RegionId,
+        physical_region_options: PhysicalRegionOptions,
+    ) -> Result<RegionResponse> {
+        let metadata_region_id = utils::to_metadata_region_id(physical_region_id);
+        let data_region_id = utils::to_data_region_id(physical_region_id);
+        let _ = metadata_region_result
+            .context(NoOpenRegionResultSnafu {
+                region_id: metadata_region_id,
+            })?
+            .context(OpenMitoRegionSnafu {
+                region_type: "metadata",
+            })?;
+
+        let data_region_response = data_region_result
+            .context(NoOpenRegionResultSnafu {
+                region_id: data_region_id,
+            })?
+            .context(OpenMitoRegionSnafu {
+                region_type: "data",
+            })?;
+
+        if let Err(err) = self
+            .recover_states(physical_region_id, physical_region_options)
+            .await
+        {
+            self.close_physical_region_on_recovery_failure(physical_region_id)
+                .await;
+            return Err(err);
+        }
+        Ok(data_region_response)
+    }
+
     /// Open a metric region.
     ///
     /// Only open requests to a physical region matter. Those to logical regions are
@@ -47,17 +158,31 @@ impl MetricEngineInner {
         request: RegionOpenRequest,
     ) -> Result<AffectedRows> {
         if request.is_physical_table() {
+            if self
+                .state
+                .read()
+                .unwrap()
+                .physical_region_states()
+                .get(&region_id)
+                .is_some()
+            {
+                warn!(
+                    "The physical region {} is already open, ignore the open request",
+                    region_id
+                );
+                return Ok(0);
+            }
             // open physical region and recover states
             let physical_region_options = PhysicalRegionOptions::try_from(&request.options)?;
             self.open_physical_region(region_id, request).await?;
-            let data_region_id = utils::to_data_region_id(region_id);
-            let primary_key_encoding = self.mito.get_primary_key_encoding(data_region_id).context(
-                PhysicalRegionNotFoundSnafu {
-                    region_id: data_region_id,
-                },
-            )?;
-            self.recover_states(region_id, primary_key_encoding, physical_region_options)
-                .await?;
+            if let Err(err) = self
+                .recover_states(region_id, physical_region_options)
+                .await
+            {
+                self.close_physical_region_on_recovery_failure(region_id)
+                    .await;
+                return Err(err);
+            }
 
             Ok(0)
         } else {
@@ -69,18 +194,19 @@ impl MetricEngineInner {
         }
     }
 
-    /// Invokes mito engine to open physical regions (data and metadata).
-    async fn open_physical_region(
+    /// Transform the open request to open metadata region and data region.
+    ///
+    /// Returns:
+    /// - The open request for metadata region.
+    /// - The open request for data region.
+    fn transform_open_physical_region_request(
         &self,
-        region_id: RegionId,
         request: RegionOpenRequest,
-    ) -> Result<AffectedRows> {
-        let metadata_region_dir = join_dir(&request.region_dir, METADATA_REGION_SUBDIR);
-        let data_region_dir = join_dir(&request.region_dir, DATA_REGION_SUBDIR);
-
-        let metadata_region_options = region_options_for_metadata_region(request.options.clone());
+    ) -> (RegionOpenRequest, RegionOpenRequest) {
+        let metadata_region_options = region_options_for_metadata_region(&request.options);
         let open_metadata_region_request = RegionOpenRequest {
-            region_dir: metadata_region_dir,
+            table_dir: request.table_dir.clone(),
+            path_type: PathType::Metadata,
             options: metadata_region_options,
             engine: MITO_ENGINE_NAME.to_string(),
             skip_wal_replay: request.skip_wal_replay,
@@ -92,14 +218,26 @@ impl MetricEngineInner {
             self.config.experimental_sparse_primary_key_encoding,
         );
         let open_data_region_request = RegionOpenRequest {
-            region_dir: data_region_dir,
+            table_dir: request.table_dir.clone(),
+            path_type: PathType::Data,
             options: data_region_options,
             engine: MITO_ENGINE_NAME.to_string(),
             skip_wal_replay: request.skip_wal_replay,
         };
 
+        (open_metadata_region_request, open_data_region_request)
+    }
+
+    /// Invokes mito engine to open physical regions (data and metadata).
+    async fn open_physical_region(
+        &self,
+        region_id: RegionId,
+        request: RegionOpenRequest,
+    ) -> Result<AffectedRows> {
         let metadata_region_id = utils::to_metadata_region_id(region_id);
         let data_region_id = utils::to_data_region_id(region_id);
+        let (open_metadata_region_request, open_data_region_request) =
+            self.transform_open_physical_region_request(request);
 
         self.mito
             .handle_request(
@@ -132,12 +270,13 @@ impl MetricEngineInner {
     /// Includes:
     /// - Record physical region's column names
     /// - Record the mapping between logical region id and physical region id
+    ///
+    /// Returns new opened logical region ids.
     pub(crate) async fn recover_states(
         &self,
         physical_region_id: RegionId,
-        primary_key_encoding: PrimaryKeyEncoding,
         physical_region_options: PhysicalRegionOptions,
-    ) -> Result<()> {
+    ) -> Result<Vec<RegionId>> {
         // load logical regions and physical column names
         let logical_regions = self
             .metadata_region
@@ -147,11 +286,31 @@ impl MetricEngineInner {
             .data_region
             .physical_columns(physical_region_id)
             .await?;
-        let logical_region_num = logical_regions.len();
+        let primary_key_encoding = self
+            .mito
+            .get_primary_key_encoding(physical_region_id)
+            .context(PhysicalRegionNotFoundSnafu {
+                region_id: physical_region_id,
+            })?;
 
         {
             let mut state = self.state.write().unwrap();
             // recover physical column names
+            // Safety: The physical columns are loaded from the data region, which always
+            // has a time index.
+            let time_index_unit = physical_columns
+                .iter()
+                .find_map(|col| {
+                    if col.semantic_type == SemanticType::Timestamp {
+                        col.column_schema
+                            .data_type
+                            .as_timestamp()
+                            .map(|data_type| data_type.unit())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
             let physical_columns = physical_columns
                 .into_iter()
                 .map(|col| (col.column_schema.name, col.column_id))
@@ -161,6 +320,7 @@ impl MetricEngineInner {
                 physical_columns,
                 primary_key_encoding,
                 physical_region_options,
+                time_index_unit,
             );
             // recover logical regions
             for logical_region_id in &logical_regions {
@@ -168,15 +328,22 @@ impl MetricEngineInner {
             }
         }
 
+        let mut opened_logical_region_ids = Vec::new();
+        // The `recover_states` may be called multiple times, we only count the logical regions
+        // that are opened for the first time.
         for logical_region_id in logical_regions {
-            self.metadata_region
+            if self
+                .metadata_region
                 .open_logical_region(logical_region_id)
-                .await;
+                .await
+            {
+                opened_logical_region_ids.push(logical_region_id);
+            }
         }
 
-        LOGICAL_REGION_COUNT.add(logical_region_num as i64);
+        LOGICAL_REGION_COUNT.add(opened_logical_region_ids.len() as i64);
 
-        Ok(())
+        Ok(opened_logical_region_ids)
     }
 }
 

@@ -25,24 +25,28 @@ use store_api::storage::RegionId;
 use strum::IntoStaticStr;
 use tokio::sync::{mpsc, watch};
 
-use crate::access_layer::{AccessLayerRef, OperationType, SstWriteRequest};
+use crate::access_layer::{AccessLayerRef, Metrics, OperationType, SstWriteRequest, WriteType};
 use crate::cache::CacheManagerRef;
 use crate::config::MitoConfig;
 use crate::error::{
     Error, FlushRegionSnafu, RegionClosedSnafu, RegionDroppedSnafu, RegionTruncatedSnafu, Result,
 };
 use crate::manifest::action::{RegionEdit, RegionMetaAction, RegionMetaActionList};
+use crate::memtable::MemtableRanges;
 use crate::metrics::{
-    FLUSH_BYTES_TOTAL, FLUSH_ELAPSED, FLUSH_ERRORS_TOTAL, FLUSH_REQUESTS_TOTAL,
+    FLUSH_BYTES_TOTAL, FLUSH_ELAPSED, FLUSH_FAILURE_TOTAL, FLUSH_REQUESTS_TOTAL,
     INFLIGHT_FLUSH_COUNT,
 };
+use crate::read::dedup::{DedupReader, LastNonNull, LastRow};
+use crate::read::merge::MergeReaderBuilder;
+use crate::read::scan_region::PredicateGroup;
 use crate::read::Source;
-use crate::region::options::IndexOptions;
+use crate::region::options::{IndexOptions, MergeMode};
 use crate::region::version::{VersionControlData, VersionControlRef};
 use crate::region::{ManifestContextRef, RegionLeaderState};
 use crate::request::{
-    BackgroundNotify, FlushFailed, FlushFinished, OptionOutputTx, OutputTx, SenderDdlRequest,
-    SenderWriteRequest, WorkerRequest,
+    BackgroundNotify, FlushFailed, FlushFinished, OptionOutputTx, OutputTx, SenderBulkRequest,
+    SenderDdlRequest, SenderWriteRequest, WorkerRequest, WorkerRequestWithTime,
 };
 use crate::schedule::scheduler::{Job, SchedulerRef};
 use crate::sst::file::FileMeta;
@@ -223,7 +227,7 @@ pub(crate) struct RegionFlushTask {
     /// Flush result senders.
     pub(crate) senders: Vec<OutputTx>,
     /// Request sender to notify the worker.
-    pub(crate) request_sender: mpsc::Sender<WorkerRequest>,
+    pub(crate) request_sender: mpsc::Sender<WorkerRequestWithTime>,
 
     pub(crate) access_layer: AccessLayerRef,
     pub(crate) listener: WorkerListener,
@@ -340,15 +344,47 @@ impl RegionFlushTask {
         let memtables = version.memtables.immutables();
         let mut file_metas = Vec::with_capacity(memtables.len());
         let mut flushed_bytes = 0;
+        let mut series_count = 0;
+        let mut flush_metrics = Metrics::new(WriteType::Flush);
         for mem in memtables {
             if mem.is_empty() {
                 // Skip empty memtables.
                 continue;
             }
 
-            let max_sequence = mem.stats().max_sequence();
-            let iter = mem.iter(None, None, None)?;
-            let source = Source::Iter(iter);
+            let MemtableRanges { ranges, stats } =
+                mem.ranges(None, PredicateGroup::default(), None)?;
+
+            let max_sequence = stats.max_sequence();
+            series_count += stats.series_count();
+
+            let source = if ranges.len() == 1 {
+                let only_range = ranges.into_values().next().unwrap();
+                let iter = only_range.build_iter()?;
+                Source::Iter(iter)
+            } else {
+                // todo(hl): a workaround since sync version of MergeReader is wip.
+                let sources = ranges
+                    .into_values()
+                    .map(|r| r.build_iter().map(Source::Iter))
+                    .collect::<Result<Vec<_>>>()?;
+                let merge_reader = MergeReaderBuilder::from_sources(sources).build().await?;
+                let maybe_dedup = if version.options.append_mode {
+                    // no dedup in append mode
+                    Box::new(merge_reader) as _
+                } else {
+                    // dedup according to merge mode
+                    match version.options.merge_mode.unwrap_or(MergeMode::LastRow) {
+                        MergeMode::LastRow => {
+                            Box::new(DedupReader::new(merge_reader, LastRow::new(false))) as _
+                        }
+                        MergeMode::LastNonNull => {
+                            Box::new(DedupReader::new(merge_reader, LastNonNull::new(false))) as _
+                        }
+                    }
+                };
+                Source::Reader(maybe_dedup)
+            };
 
             // Flush to level 0.
             let write_request = SstWriteRequest {
@@ -364,14 +400,15 @@ impl RegionFlushTask {
                 bloom_filter_index_config: self.engine_config.bloom_filter_index.clone(),
             };
 
-            let ssts_written = self
+            let (ssts_written, metrics) = self
                 .access_layer
-                .write_sst(write_request, &write_opts)
+                .write_sst(write_request, &write_opts, WriteType::Flush)
                 .await?;
             if ssts_written.is_empty() {
                 // No data written.
                 continue;
             }
+            flush_metrics = flush_metrics.merge(metrics);
 
             file_metas.extend(ssts_written.into_iter().map(|sst_info| {
                 flushed_bytes += sst_info.file_size;
@@ -396,12 +433,15 @@ impl RegionFlushTask {
 
         let file_ids: Vec<_> = file_metas.iter().map(|f| f.file_id).collect();
         info!(
-            "Successfully flush memtables, region: {}, reason: {}, files: {:?}, cost: {:?}s",
+            "Successfully flush memtables, region: {}, reason: {}, files: {:?}, series count: {}, cost: {:?}, metrics: {:?}",
             self.region_id,
             self.reason.as_str(),
             file_ids,
+            series_count,
             timer.stop_and_record(),
+            flush_metrics,
         );
+        flush_metrics.observe();
 
         let edit = RegionEdit {
             files_to_add: file_metas,
@@ -437,7 +477,11 @@ impl RegionFlushTask {
 
     /// Notify flush job status.
     async fn send_worker_request(&self, request: WorkerRequest) {
-        if let Err(e) = self.request_sender.send(request).await {
+        if let Err(e) = self
+            .request_sender
+            .send(WorkerRequestWithTime::new(request))
+            .await
+        {
             error!(
                 "Failed to notify flush job status for region {}, request: {:?}",
                 self.region_id, e.0
@@ -547,7 +591,11 @@ impl FlushScheduler {
     pub(crate) fn on_flush_success(
         &mut self,
         region_id: RegionId,
-    ) -> Option<(Vec<SenderDdlRequest>, Vec<SenderWriteRequest>)> {
+    ) -> Option<(
+        Vec<SenderDdlRequest>,
+        Vec<SenderWriteRequest>,
+        Vec<SenderBulkRequest>,
+    )> {
         let flush_status = self.region_status.get_mut(&region_id)?;
 
         // This region doesn't have running flush job.
@@ -557,7 +605,11 @@ impl FlushScheduler {
             // The region doesn't have any pending flush task.
             // Safety: The flush status must exist.
             let flush_status = self.region_status.remove(&region_id).unwrap();
-            Some((flush_status.pending_ddls, flush_status.pending_writes))
+            Some((
+                flush_status.pending_ddls,
+                flush_status.pending_writes,
+                flush_status.pending_bulk_writes,
+            ))
         } else {
             let version_data = flush_status.version_control.current();
             if version_data.version.memtables.is_empty() {
@@ -570,7 +622,11 @@ impl FlushScheduler {
                 // it from the status to avoid leaking pending requests.
                 // Safety: The flush status must exist.
                 let flush_status = self.region_status.remove(&region_id).unwrap();
-                Some((flush_status.pending_ddls, flush_status.pending_writes))
+                Some((
+                    flush_status.pending_ddls,
+                    flush_status.pending_writes,
+                    flush_status.pending_bulk_writes,
+                ))
             } else {
                 // We can flush the region again, keep it in the region status.
                 None
@@ -589,7 +645,7 @@ impl FlushScheduler {
     pub(crate) fn on_flush_failed(&mut self, region_id: RegionId, err: Arc<Error>) {
         error!(err; "Region {} failed to flush, cancel all pending tasks", region_id);
 
-        FLUSH_ERRORS_TOTAL.inc();
+        FLUSH_FAILURE_TOTAL.inc();
 
         // Remove this region.
         let Some(flush_status) = self.region_status.remove(&region_id) else {
@@ -657,6 +713,15 @@ impl FlushScheduler {
         status.pending_writes.push(request);
     }
 
+    /// Add bulk write request to pending queue.
+    ///
+    /// # Panics
+    /// Panics if region didn't request flush.
+    pub(crate) fn add_bulk_request_to_pending(&mut self, request: SenderBulkRequest) {
+        let status = self.region_status.get_mut(&request.region_id).unwrap();
+        status.pending_bulk_writes.push(request);
+    }
+
     /// Returns true if the region has pending DDLs.
     pub(crate) fn has_pending_ddls(&self, region_id: RegionId) -> bool {
         self.region_status
@@ -717,6 +782,8 @@ struct FlushStatus {
     pending_ddls: Vec<SenderDdlRequest>,
     /// Requests waiting to write after altering the region.
     pending_writes: Vec<SenderWriteRequest>,
+    /// Bulk requests waiting to write after altering the region.
+    pending_bulk_writes: Vec<SenderBulkRequest>,
 }
 
 impl FlushStatus {
@@ -728,6 +795,7 @@ impl FlushStatus {
             pending_task: None,
             pending_ddls: Vec::new(),
             pending_writes: Vec::new(),
+            pending_bulk_writes: Vec::new(),
         }
     }
 

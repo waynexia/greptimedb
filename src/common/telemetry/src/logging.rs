@@ -14,12 +14,13 @@
 
 //! logging stuffs, inspired by databend
 use std::env;
+use std::io::IsTerminal;
 use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 
 use once_cell::sync::{Lazy, OnceCell};
 use opentelemetry::{global, KeyValue};
-use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_otlp::{Protocol, SpanExporterBuilder, WithExportConfig};
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::Sampler;
 use opentelemetry_semantic_conventions::resource;
@@ -35,7 +36,14 @@ use tracing_subscriber::{filter, EnvFilter, Registry};
 
 use crate::tracing_sampler::{create_sampler, TracingSampleOptions};
 
-pub const DEFAULT_OTLP_ENDPOINT: &str = "http://localhost:4317";
+/// The default endpoint when use gRPC exporter protocol.
+pub const DEFAULT_OTLP_GRPC_ENDPOINT: &str = "http://localhost:4317";
+
+/// The default endpoint when use HTTP exporter protocol.
+pub const DEFAULT_OTLP_HTTP_ENDPOINT: &str = "http://localhost:4318";
+
+/// The default logs directory.
+pub const DEFAULT_LOGGING_DIR: &str = "logs";
 
 // Handle for reloading log level
 pub static RELOAD_HANDLE: OnceCell<tracing_subscriber::reload::Handle<Targets, Registry>> =
@@ -63,22 +71,35 @@ pub struct LoggingOptions {
     /// Whether to enable tracing with OTLP. Default is false.
     pub enable_otlp_tracing: bool,
 
-    /// The endpoint of OTLP. Default is "http://localhost:4317".
+    /// The endpoint of OTLP. Default is "http://localhost:4318".
     pub otlp_endpoint: Option<String>,
 
     /// The tracing sample ratio.
     pub tracing_sample_ratio: Option<TracingSampleOptions>,
 
-    /// The logging options of slow query.
-    pub slow_query: SlowQueryOptions,
+    /// The protocol of OTLP export.
+    pub otlp_export_protocol: Option<OtlpExportProtocol>,
+}
+
+/// The protocol of OTLP export.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum OtlpExportProtocol {
+    /// GRPC protocol.
+    Grpc,
+
+    /// HTTP protocol with binary protobuf.
+    Http,
 }
 
 /// The options of slow query.
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
-#[serde(default)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SlowQueryOptions {
     /// Whether to enable slow query log.
     pub enable: bool,
+
+    /// The record type of slow queries.
+    pub record_type: SlowQueriesRecordType,
 
     /// The threshold of slow queries.
     #[serde(with = "humantime_serde")]
@@ -86,6 +107,29 @@ pub struct SlowQueryOptions {
 
     /// The sample ratio of slow queries.
     pub sample_ratio: Option<f64>,
+
+    /// The table TTL of `slow_queries` system table. Default is "30d".
+    /// It's used when `record_type` is `SystemTable`.
+    pub ttl: Option<String>,
+}
+
+impl Default for SlowQueryOptions {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            record_type: SlowQueriesRecordType::SystemTable,
+            threshold: Some(Duration::from_secs(30)),
+            sample_ratio: Some(1.0),
+            ttl: Some("30d".to_string()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Copy, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum SlowQueriesRecordType {
+    SystemTable,
+    Log,
 }
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,16 +155,17 @@ impl Eq for LoggingOptions {}
 impl Default for LoggingOptions {
     fn default() -> Self {
         Self {
-            dir: "/tmp/greptimedb/logs".to_string(),
+            // The directory path will be configured at application startup, typically using the data home directory as a base.
+            dir: "".to_string(),
             level: None,
             log_format: LogFormat::Text,
             enable_otlp_tracing: false,
             otlp_endpoint: None,
             tracing_sample_ratio: None,
             append_stdout: true,
-            slow_query: SlowQueryOptions::default(),
             // Rotation hourly, 24 files per day, keeps info log files of 30 days
             max_log_files: 720,
+            otlp_export_protocol: None,
         }
     }
 }
@@ -158,7 +203,8 @@ pub fn init_default_ut_logging() {
             "unittest",
             &opts,
             &TracingOptions::default(),
-            None
+            None,
+            None,
         ));
 
         crate::info!("logs dir = {}", dir);
@@ -176,6 +222,7 @@ pub fn init_global_logging(
     opts: &LoggingOptions,
     tracing_opts: &TracingOptions,
     node_id: Option<String>,
+    slow_query_opts: Option<&SlowQueryOptions>,
 ) -> Vec<WorkerGuard> {
     static START: Once = Once::new();
     let mut guards = vec![];
@@ -194,14 +241,14 @@ pub fn init_global_logging(
                     Layer::new()
                         .json()
                         .with_writer(writer)
-                        .with_ansi(atty::is(atty::Stream::Stdout))
+                        .with_ansi(std::io::stdout().is_terminal())
                         .boxed(),
                 )
             } else {
                 Some(
                     Layer::new()
                         .with_writer(writer)
-                        .with_ansi(atty::is(atty::Stream::Stdout))
+                        .with_ansi(std::io::stdout().is_terminal())
                         .boxed(),
                 )
             }
@@ -278,50 +325,7 @@ pub fn init_global_logging(
             None
         };
 
-        let slow_query_logging_layer = if !opts.dir.is_empty() && opts.slow_query.enable {
-            let rolling_appender = RollingFileAppender::builder()
-                .rotation(Rotation::HOURLY)
-                .filename_prefix("greptimedb-slow-queries")
-                .max_log_files(opts.max_log_files)
-                .build(&opts.dir)
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "initializing rolling file appender at {} failed: {}",
-                        &opts.dir, e
-                    )
-                });
-            let (writer, guard) = tracing_appender::non_blocking(rolling_appender);
-            guards.push(guard);
-
-            // Only logs if the field contains "slow".
-            let slow_query_filter = FilterFn::new(|metadata| {
-                metadata
-                    .fields()
-                    .iter()
-                    .any(|field| field.name().contains("slow"))
-            });
-
-            if opts.log_format == LogFormat::Json {
-                Some(
-                    Layer::new()
-                        .json()
-                        .with_writer(writer)
-                        .with_ansi(false)
-                        .with_filter(slow_query_filter)
-                        .boxed(),
-                )
-            } else {
-                Some(
-                    Layer::new()
-                        .with_writer(writer)
-                        .with_ansi(false)
-                        .with_filter(slow_query_filter)
-                        .boxed(),
-                )
-            }
-        } else {
-            None
-        };
+        let slow_query_logging_layer = build_slow_query_logger(opts, slow_query_opts, &mut guards);
 
         // resolve log level settings from:
         // - options from command line or config files
@@ -399,26 +403,13 @@ pub fn init_global_logging(
                         resource::SERVICE_INSTANCE_ID,
                         node_id.unwrap_or("none".to_string()),
                     ),
-                    KeyValue::new(resource::SERVICE_VERSION, env!("CARGO_PKG_VERSION")),
+                    KeyValue::new(resource::SERVICE_VERSION, common_version::version()),
                     KeyValue::new(resource::PROCESS_PID, std::process::id().to_string()),
                 ]));
 
-            let exporter = opentelemetry_otlp::new_exporter().tonic().with_endpoint(
-                opts.otlp_endpoint
-                    .as_ref()
-                    .map(|e| {
-                        if e.starts_with("http") {
-                            e.to_string()
-                        } else {
-                            format!("http://{}", e)
-                        }
-                    })
-                    .unwrap_or(DEFAULT_OTLP_ENDPOINT.to_string()),
-            );
-
             let tracer = opentelemetry_otlp::new_pipeline()
                 .tracing()
-                .with_exporter(exporter)
+                .with_exporter(build_otlp_exporter(opts))
                 .with_trace_config(trace_config)
                 .install_batch(opentelemetry_sdk::runtime::Tokio)
                 .expect("otlp tracer install failed");
@@ -434,4 +425,104 @@ pub fn init_global_logging(
     });
 
     guards
+}
+
+fn build_otlp_exporter(opts: &LoggingOptions) -> SpanExporterBuilder {
+    let protocol = opts
+        .otlp_export_protocol
+        .clone()
+        .unwrap_or(OtlpExportProtocol::Http);
+
+    let endpoint = opts
+        .otlp_endpoint
+        .as_ref()
+        .map(|e| {
+            if e.starts_with("http") {
+                e.to_string()
+            } else {
+                format!("http://{}", e)
+            }
+        })
+        .unwrap_or_else(|| match protocol {
+            OtlpExportProtocol::Grpc => DEFAULT_OTLP_GRPC_ENDPOINT.to_string(),
+            OtlpExportProtocol::Http => DEFAULT_OTLP_HTTP_ENDPOINT.to_string(),
+        });
+
+    match protocol {
+        OtlpExportProtocol::Grpc => SpanExporterBuilder::Tonic(
+            opentelemetry_otlp::new_exporter()
+                .tonic()
+                .with_endpoint(endpoint),
+        ),
+        OtlpExportProtocol::Http => SpanExporterBuilder::Http(
+            opentelemetry_otlp::new_exporter()
+                .http()
+                .with_endpoint(endpoint)
+                .with_protocol(Protocol::HttpBinary),
+        ),
+    }
+}
+
+fn build_slow_query_logger<S>(
+    opts: &LoggingOptions,
+    slow_query_opts: Option<&SlowQueryOptions>,
+    guards: &mut Vec<WorkerGuard>,
+) -> Option<Box<dyn tracing_subscriber::Layer<S> + Send + Sync + 'static>>
+where
+    S: tracing::Subscriber
+        + Send
+        + 'static
+        + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
+{
+    if let Some(slow_query_opts) = slow_query_opts {
+        if !opts.dir.is_empty()
+            && slow_query_opts.enable
+            && slow_query_opts.record_type == SlowQueriesRecordType::Log
+        {
+            let rolling_appender = RollingFileAppender::builder()
+                .rotation(Rotation::HOURLY)
+                .filename_prefix("greptimedb-slow-queries")
+                .max_log_files(opts.max_log_files)
+                .build(&opts.dir)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "initializing rolling file appender at {} failed: {}",
+                        &opts.dir, e
+                    )
+                });
+            let (writer, guard) = tracing_appender::non_blocking(rolling_appender);
+            guards.push(guard);
+
+            // Only logs if the field contains "slow".
+            let slow_query_filter = FilterFn::new(|metadata| {
+                metadata
+                    .fields()
+                    .iter()
+                    .any(|field| field.name().contains("slow"))
+            });
+
+            if opts.log_format == LogFormat::Json {
+                Some(
+                    Layer::new()
+                        .json()
+                        .with_writer(writer)
+                        .with_ansi(false)
+                        .with_filter(slow_query_filter)
+                        .boxed(),
+                )
+            } else {
+                Some(
+                    Layer::new()
+                        .with_writer(writer)
+                        .with_ansi(false)
+                        .with_filter(slow_query_filter)
+                        .boxed(),
+                )
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    }
 }

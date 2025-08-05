@@ -96,6 +96,18 @@ pub enum Error {
     },
 
     #[snafu(display(
+        "Not allowed to remove partition column {} from table {}",
+        column_name,
+        table_name
+    ))]
+    RemovePartitionColumn {
+        column_name: String,
+        table_name: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display(
         "Failed to build column descriptor for table: {}, column: {}",
         table_name,
         column_name,
@@ -172,6 +184,24 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+
+    #[snafu(display("Invalid table name: '{s}'"))]
+    InvalidTableName { s: String },
+
+    #[snafu(display("Failed to cast default value, reason: {}", reason))]
+    CastDefaultValue {
+        reason: String,
+        source: datatypes::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Sql common error"))]
+    SqlCommon {
+        source: common_sql::error::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 impl ErrorExt for Error {
@@ -182,10 +212,13 @@ impl ErrorExt for Error {
                 StatusCode::EngineExecuteQuery
             }
             Error::RemoveColumnInIndex { .. }
+            | Error::RemovePartitionColumn { .. }
             | Error::BuildColumnDescriptor { .. }
             | Error::InvalidAlterRequest { .. } => StatusCode::InvalidArguments,
+            Error::CastDefaultValue { source, .. } => source.status_code(),
             Error::TablesRecordBatch { .. } => StatusCode::Unexpected,
             Error::ColumnExists { .. } => StatusCode::TableColumnExists,
+            Error::SqlCommon { source, .. } => source.status_code(),
             Error::SchemaBuild { source, .. } | Error::SetFulltextOptions { source, .. } => {
                 source.status_code()
             }
@@ -197,7 +230,8 @@ impl ErrorExt for Error {
             Error::MissingTimeIndexColumn { .. } => StatusCode::IllegalState,
             Error::InvalidTableOptionValue { .. }
             | Error::SetSkippingOptions { .. }
-            | Error::UnsetSkippingOptions { .. } => StatusCode::InvalidArguments,
+            | Error::UnsetSkippingOptions { .. }
+            | Error::InvalidTableName { .. } => StatusCode::InvalidArguments,
         }
     }
 

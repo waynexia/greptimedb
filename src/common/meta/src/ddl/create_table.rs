@@ -21,33 +21,36 @@ use common_error::ext::BoxedError;
 use common_procedure::error::{
     ExternalSnafu, FromJsonSnafu, Result as ProcedureResult, ToJsonSnafu,
 };
-use common_procedure::{Context as ProcedureContext, LockKey, Procedure, Status};
-use common_telemetry::info;
+use common_procedure::{Context as ProcedureContext, LockKey, Procedure, ProcedureId, Status};
 use common_telemetry::tracing_context::TracingContext;
+use common_telemetry::{info, warn};
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use snafu::{ensure, OptionExt, ResultExt};
+use store_api::metadata::ColumnMetadata;
+use store_api::metric_engine_consts::TABLE_COLUMN_METADATA_EXTENSION_KEY;
 use store_api::storage::{RegionId, RegionNumber};
 use strum::AsRefStr;
 use table::metadata::{RawTableInfo, TableId};
 use table::table_reference::TableReference;
 
 use crate::ddl::create_table_template::{build_template, CreateRequestBuilder};
+use crate::ddl::utils::raw_table_info::update_table_info_column_ids;
 use crate::ddl::utils::{
-    add_peer_context_if_needed, convert_region_routes_to_detecting_regions, handle_retry_error,
-    region_storage_path,
+    add_peer_context_if_needed, convert_region_routes_to_detecting_regions,
+    extract_column_metadatas, map_to_procedure_error, region_storage_path,
 };
-use crate::ddl::{DdlContext, TableMetadata, TableMetadataAllocatorContext};
+use crate::ddl::{DdlContext, TableMetadata};
 use crate::error::{self, Result};
 use crate::key::table_name::TableNameKey;
 use crate::key::table_route::{PhysicalTableRouteValue, TableRouteValue};
 use crate::lock_key::{CatalogLock, SchemaLock, TableNameLock};
+use crate::metrics;
 use crate::region_keeper::OperatingRegionGuard;
 use crate::rpc::ddl::CreateTableTask;
 use crate::rpc::router::{
     find_leader_regions, find_leaders, operating_leader_regions, RegionRoute,
 };
-use crate::{metrics, ClusterId};
 pub struct CreateTableProcedure {
     pub context: DdlContext,
     pub creator: TableCreator,
@@ -56,10 +59,10 @@ pub struct CreateTableProcedure {
 impl CreateTableProcedure {
     pub const TYPE_NAME: &'static str = "metasrv-procedure::CreateTable";
 
-    pub fn new(cluster_id: ClusterId, task: CreateTableTask, context: DdlContext) -> Self {
+    pub fn new(task: CreateTableTask, context: DdlContext) -> Self {
         Self {
             context,
-            creator: TableCreator::new(cluster_id, task),
+            creator: TableCreator::new(task),
         }
     }
 
@@ -154,12 +157,7 @@ impl CreateTableProcedure {
         } = self
             .context
             .table_metadata_allocator
-            .create(
-                &TableMetadataAllocatorContext {
-                    cluster_id: self.creator.data.cluster_id,
-                },
-                &self.creator.data.task,
-            )
+            .create(&self.creator.data.task)
             .await?;
         self.creator
             .set_allocated_metadata(table_id, table_route, region_wal_options);
@@ -223,11 +221,8 @@ impl CreateTableProcedure {
             let mut requests = Vec::with_capacity(regions.len());
             for region_number in regions {
                 let region_id = RegionId::new(self.table_id(), region_number);
-                let create_region_request = request_builder.build_one(
-                    region_id,
-                    storage_path.clone(),
-                    region_wal_options,
-                )?;
+                let create_region_request =
+                    request_builder.build_one(region_id, storage_path.clone(), region_wal_options);
                 requests.push(PbRegionRequest::Create(create_region_request));
             }
 
@@ -251,14 +246,20 @@ impl CreateTableProcedure {
             }
         }
 
-        join_all(create_region_tasks)
+        let mut results = join_all(create_region_tasks)
             .await
             .into_iter()
             .collect::<Result<Vec<_>>>()?;
 
-        self.creator.data.state = CreateTableState::CreateMetadata;
+        if let Some(column_metadatas) =
+            extract_column_metadatas(&mut results, TABLE_COLUMN_METADATA_EXTENSION_KEY)?
+        {
+            self.creator.data.column_metadatas = column_metadatas;
+        } else {
+            warn!("creating table result doesn't contains extension key `{TABLE_COLUMN_METADATA_EXTENSION_KEY}`,leaving the table's column metadata unchanged");
+        }
 
-        // TODO(weny): Add more tests.
+        self.creator.data.state = CreateTableState::CreateMetadata;
         Ok(Status::executing(true))
     }
 
@@ -266,20 +267,21 @@ impl CreateTableProcedure {
     ///
     /// Abort(not-retry):
     /// - Failed to create table metadata.
-    async fn on_create_metadata(&mut self) -> Result<Status> {
+    async fn on_create_metadata(&mut self, pid: ProcedureId) -> Result<Status> {
         let table_id = self.table_id();
-        let cluster_id = self.creator.data.cluster_id;
+        let table_ref = self.creator.data.table_ref();
         let manager = &self.context.table_metadata_manager;
 
-        let raw_table_info = self.table_info().clone();
+        let mut raw_table_info = self.table_info().clone();
+        if !self.creator.data.column_metadatas.is_empty() {
+            update_table_info_column_ids(&mut raw_table_info, &self.creator.data.column_metadatas);
+        }
         // Safety: the region_wal_options must be allocated.
         let region_wal_options = self.region_wal_options()?.clone();
         // Safety: the table_route must be allocated.
         let physical_table_route = self.table_route()?.clone();
-        let detecting_regions = convert_region_routes_to_detecting_regions(
-            cluster_id,
-            &physical_table_route.region_routes,
-        );
+        let detecting_regions =
+            convert_region_routes_to_detecting_regions(&physical_table_route.region_routes);
         let table_route = TableRouteValue::Physical(physical_table_route);
         manager
             .create_table_metadata(raw_table_info, table_route, region_wal_options)
@@ -287,7 +289,10 @@ impl CreateTableProcedure {
         self.context
             .register_failure_detectors(detecting_regions)
             .await;
-        info!("Created table metadata for table {table_id}");
+        info!(
+            "Successfully created table: {}, table_id: {}, procedure_id: {}",
+            table_ref, table_id, pid
+        );
 
         self.creator.opening_regions.clear();
         Ok(Status::done_with_output(table_id))
@@ -307,13 +312,15 @@ impl Procedure for CreateTableProcedure {
                 .creator
                 .register_opening_regions(&self.context, &x.region_routes)
                 .map_err(BoxedError::new)
-                .context(ExternalSnafu)?;
+                .context(ExternalSnafu {
+                    clean_poisons: false,
+                })?;
         }
 
         Ok(())
     }
 
-    async fn execute(&mut self, _ctx: &ProcedureContext) -> ProcedureResult<Status> {
+    async fn execute(&mut self, ctx: &ProcedureContext) -> ProcedureResult<Status> {
         let state = &self.creator.data.state;
 
         let _timer = metrics::METRIC_META_PROCEDURE_CREATE_TABLE
@@ -323,9 +330,9 @@ impl Procedure for CreateTableProcedure {
         match state {
             CreateTableState::Prepare => self.on_prepare().await,
             CreateTableState::DatanodeCreateRegions => self.on_datanode_create_regions().await,
-            CreateTableState::CreateMetadata => self.on_create_metadata().await,
+            CreateTableState::CreateMetadata => self.on_create_metadata(ctx.procedure_id).await,
         }
-        .map_err(handle_retry_error)
+        .map_err(map_to_procedure_error)
     }
 
     fn dump(&self) -> ProcedureResult<String> {
@@ -351,11 +358,11 @@ pub struct TableCreator {
 }
 
 impl TableCreator {
-    pub fn new(cluster_id: ClusterId, task: CreateTableTask) -> Self {
+    pub fn new(task: CreateTableTask) -> Self {
         Self {
             data: CreateTableData {
                 state: CreateTableState::Prepare,
-                cluster_id,
+                column_metadatas: vec![],
                 task,
                 table_route: None,
                 region_wal_options: None,
@@ -417,11 +424,12 @@ pub enum CreateTableState {
 pub struct CreateTableData {
     pub state: CreateTableState,
     pub task: CreateTableTask,
+    #[serde(default)]
+    pub column_metadatas: Vec<ColumnMetadata>,
     /// None stands for not allocated yet.
     table_route: Option<PhysicalTableRouteValue>,
     /// None stands for not allocated yet.
     pub region_wal_options: Option<HashMap<RegionNumber, String>>,
-    pub cluster_id: ClusterId,
 }
 
 impl CreateTableData {

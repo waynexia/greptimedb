@@ -20,33 +20,49 @@ mod log_handler;
 mod logs;
 mod opentsdb;
 mod otlp;
-mod prom_store;
+pub mod prom_store;
 mod promql;
 mod region_query;
 pub mod standalone;
 
+use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
+use async_stream::stream;
 use async_trait::async_trait;
 use auth::{PermissionChecker, PermissionCheckerRef, PermissionReq};
+use catalog::process_manager::ProcessManagerRef;
 use catalog::CatalogManagerRef;
 use client::OutputData;
+use common_base::cancellation::CancellableFuture;
 use common_base::Plugins;
 use common_config::KvBackendConfig;
 use common_error::ext::{BoxedError, ErrorExt};
+use common_meta::cache_invalidator::CacheInvalidatorRef;
+use common_meta::key::runtime_switch::RuntimeSwitchManager;
+use common_meta::key::table_name::TableNameKey;
 use common_meta::key::TableMetadataManagerRef;
 use common_meta::kv_backend::KvBackendRef;
+use common_meta::node_manager::NodeManagerRef;
+use common_meta::procedure_executor::ProcedureExecutorRef;
 use common_meta::state_store::KvStateStore;
 use common_procedure::local::{LocalManager, ManagerConfig};
 use common_procedure::options::ProcedureConfig;
 use common_procedure::ProcedureManagerRef;
 use common_query::Output;
+use common_recordbatch::error::StreamTimeoutSnafu;
+use common_recordbatch::RecordBatchStreamWrapper;
 use common_telemetry::{debug, error, info, tracing};
+use dashmap::DashMap;
 use datafusion_expr::LogicalPlan;
+use futures::{Stream, StreamExt};
+use lazy_static::lazy_static;
 use log_store::raft_engine::RaftEngineBackend;
 use operator::delete::DeleterRef;
 use operator::insert::InserterRef;
-use operator::statement::StatementExecutor;
+use operator::statement::{StatementExecutor, StatementExecutorRef};
+use partition::manager::PartitionRuleManagerRef;
 use pipeline::pipeline_operator::PipelineOperator;
 use prometheus::HistogramTimer;
 use promql_parser::label::Matcher;
@@ -54,79 +70,64 @@ use query::metrics::OnDone;
 use query::parser::{PromQuery, QueryLanguageParser, QueryStatement};
 use query::query_engine::options::{validate_catalog_and_schema, QueryOptions};
 use query::query_engine::DescribeResult;
-use query::stats::StatementStatistics;
 use query::QueryEngineRef;
-use servers::error as server_error;
-use servers::error::{AuthSnafu, ExecuteQuerySnafu, ParsePromQLSnafu};
-use servers::export_metrics::ExportMetricsTask;
+use servers::error::{
+    self as server_error, AuthSnafu, CommonMetaSnafu, ExecuteQuerySnafu,
+    OtlpMetricModeIncompatibleSnafu, ParsePromQLSnafu,
+};
 use servers::interceptor::{
     PromQueryInterceptor, PromQueryInterceptorRef, SqlQueryInterceptor, SqlQueryInterceptorRef,
 };
+use servers::otlp::metrics::legacy_normalize_otlp_name;
 use servers::prometheus_handler::PrometheusHandler;
-use servers::query_handler::grpc::GrpcQueryHandler;
 use servers::query_handler::sql::SqlQueryHandler;
-use servers::query_handler::{
-    InfluxdbLineProtocolHandler, JaegerQueryHandler, LogQueryHandler, OpenTelemetryProtocolHandler,
-    OpentsdbProtocolHandler, PipelineHandler, PromStoreProtocolHandler,
-};
-use servers::server::ServerHandlers;
-use session::context::QueryContextRef;
+use session::context::{Channel, QueryContextRef};
 use session::table_name::table_idents_to_full_name;
 use snafu::prelude::*;
 use sql::dialect::Dialect;
 use sql::parser::{ParseOptions, ParserContext};
 use sql::statements::copy::{CopyDatabase, CopyTable};
 use sql::statements::statement::Statement;
+use sql::statements::tql::Tql;
 use sqlparser::ast::ObjectName;
 pub use standalone::StandaloneDatanodeManager;
+use table::requests::{OTLP_METRIC_COMPAT_KEY, OTLP_METRIC_COMPAT_PROM};
 
-use self::prom_store::ExportMetricHandler;
 use crate::error::{
     self, Error, ExecLogicalPlanSnafu, ExecutePromqlSnafu, ExternalSnafu, InvalidSqlSnafu,
     ParseSqlSnafu, PermissionSnafu, PlanStatementSnafu, Result, SqlExecInterceptedSnafu,
-    StartServerSnafu, TableOperationSnafu,
+    StatementTimeoutSnafu, TableOperationSnafu,
 };
-use crate::frontend::FrontendOptions;
-use crate::heartbeat::HeartbeatTask;
 use crate::limiter::LimiterRef;
+use crate::slow_query_recorder::SlowQueryRecorder;
+use crate::stream_wrapper::CancellableStreamWrapper;
 
-#[async_trait]
-pub trait FrontendInstance:
-    GrpcQueryHandler<Error = Error>
-    + SqlQueryHandler<Error = Error>
-    + OpentsdbProtocolHandler
-    + InfluxdbLineProtocolHandler
-    + PromStoreProtocolHandler
-    + OpenTelemetryProtocolHandler
-    + PrometheusHandler
-    + PipelineHandler
-    + LogQueryHandler
-    + JaegerQueryHandler
-    + Send
-    + Sync
-    + 'static
-{
-    async fn start(&self) -> Result<()>;
+lazy_static! {
+    static ref OTLP_LEGACY_DEFAULT_VALUE: String = "legacy".to_string();
 }
 
-pub type FrontendInstanceRef = Arc<dyn FrontendInstance>;
-
+/// The frontend instance contains necessary components, and implements many
+/// traits, like [`servers::query_handler::grpc::GrpcQueryHandler`],
+/// [`servers::query_handler::sql::SqlQueryHandler`], etc.
 #[derive(Clone)]
 pub struct Instance {
-    options: FrontendOptions,
     catalog_manager: CatalogManagerRef,
     pipeline_operator: Arc<PipelineOperator>,
     statement_executor: Arc<StatementExecutor>,
     query_engine: QueryEngineRef,
     plugins: Plugins,
-    servers: ServerHandlers,
-    heartbeat_task: Option<HeartbeatTask>,
     inserter: InserterRef,
     deleter: DeleterRef,
-    export_metrics_task: Option<ExportMetricsTask>,
     table_metadata_manager: TableMetadataManagerRef,
-    stats: StatementStatistics,
+    slow_query_recorder: Option<SlowQueryRecorder>,
     limiter: Option<LimiterRef>,
+    process_manager: ProcessManagerRef,
+
+    // cache for otlp metrics
+    // first layer key: db-string
+    // key: direct input metric name
+    // value: if runs in legacy mode
+    otlp_metrics_table_legacy_cache: DashMap<String, DashMap<String, bool>>,
 }
 
 impl Instance {
@@ -144,25 +145,23 @@ impl Instance {
             .context(error::OpenRaftEngineBackendSnafu)?;
 
         let kv_backend = Arc::new(kv_backend);
-        let state_store = Arc::new(KvStateStore::new(kv_backend.clone()));
+        let kv_state_store = Arc::new(KvStateStore::new(kv_backend.clone()));
 
         let manager_config = ManagerConfig {
             max_retry_times: procedure_config.max_retry_times,
             retry_delay: procedure_config.retry_delay,
+            max_running_procedures: procedure_config.max_running_procedures,
             ..Default::default()
         };
-        let procedure_manager = Arc::new(LocalManager::new(manager_config, state_store));
+        let runtime_switch_manager = Arc::new(RuntimeSwitchManager::new(kv_backend.clone()));
+        let procedure_manager = Arc::new(LocalManager::new(
+            manager_config,
+            kv_state_store.clone(),
+            kv_state_store,
+            Some(runtime_switch_manager),
+        ));
 
         Ok((kv_backend, procedure_manager))
-    }
-
-    pub fn build_servers(&mut self, servers: ServerHandlers) -> Result<()> {
-        self.export_metrics_task =
-            ExportMetricsTask::try_new(&self.options.export_metrics, Some(&self.plugins))
-                .context(StartServerSnafu)?;
-
-        self.servers = servers;
-        Ok(())
     }
 
     pub fn catalog_manager(&self) -> &CatalogManagerRef {
@@ -173,50 +172,40 @@ impl Instance {
         &self.query_engine
     }
 
-    pub fn plugins(&self) -> Plugins {
-        self.plugins.clone()
+    pub fn plugins(&self) -> &Plugins {
+        &self.plugins
     }
 
-    pub async fn shutdown(&self) -> Result<()> {
-        self.servers
-            .shutdown_all()
-            .await
-            .context(error::ShutdownServerSnafu)
-    }
-
-    pub fn server_handlers(&self) -> &ServerHandlers {
-        &self.servers
-    }
-
-    pub fn statement_executor(&self) -> Arc<StatementExecutor> {
-        self.statement_executor.clone()
+    pub fn statement_executor(&self) -> &StatementExecutorRef {
+        &self.statement_executor
     }
 
     pub fn table_metadata_manager(&self) -> &TableMetadataManagerRef {
         &self.table_metadata_manager
     }
-}
 
-#[async_trait]
-impl FrontendInstance for Instance {
-    async fn start(&self) -> Result<()> {
-        if let Some(heartbeat_task) = &self.heartbeat_task {
-            heartbeat_task.start().await?;
-        }
+    pub fn inserter(&self) -> &InserterRef {
+        &self.inserter
+    }
 
-        if let Some(t) = self.export_metrics_task.as_ref() {
-            if t.send_by_handler {
-                let handler = ExportMetricHandler::new_handler(
-                    self.inserter.clone(),
-                    self.statement_executor.clone(),
-                );
-                t.start(Some(handler)).context(StartServerSnafu)?
-            } else {
-                t.start(None).context(StartServerSnafu)?;
-            }
-        }
+    pub fn process_manager(&self) -> &ProcessManagerRef {
+        &self.process_manager
+    }
 
-        self.servers.start_all().await.context(StartServerSnafu)
+    pub fn node_manager(&self) -> &NodeManagerRef {
+        self.inserter.node_manager()
+    }
+
+    pub fn partition_manager(&self) -> &PartitionRuleManagerRef {
+        self.inserter.partition_manager()
+    }
+
+    pub fn cache_invalidator(&self) -> &CacheInvalidatorRef {
+        self.statement_executor.cache_invalidator()
+    }
+
+    pub fn procedure_executor(&self) -> &ProcedureExecutorRef {
+        self.statement_executor.procedure_executor()
     }
 }
 
@@ -231,11 +220,72 @@ impl Instance {
         let query_interceptor = self.plugins.get::<SqlQueryInterceptorRef<Error>>();
         let query_interceptor = query_interceptor.as_ref();
 
-        let _slow_query_timer = self
-            .stats
-            .start_slow_query_timer(QueryStatement::Sql(stmt.clone()));
+        let _slow_query_timer = if let Some(recorder) = &self.slow_query_recorder {
+            recorder.start(QueryStatement::Sql(stmt.clone()), query_ctx.clone())
+        } else {
+            None
+        };
 
-        let output = match stmt {
+        let ticket = self.process_manager.register_query(
+            query_ctx.current_catalog().to_string(),
+            vec![query_ctx.current_schema()],
+            stmt.to_string(),
+            query_ctx.conn_info().to_string(),
+            Some(query_ctx.process_id()),
+        );
+
+        let query_fut = self.exec_statement_with_timeout(stmt, query_ctx, query_interceptor);
+
+        CancellableFuture::new(query_fut, ticket.cancellation_handle.clone())
+            .await
+            .map_err(|_| error::CancelledSnafu.build())?
+            .map(|output| {
+                let Output { meta, data } = output;
+
+                let data = match data {
+                    OutputData::Stream(stream) => {
+                        OutputData::Stream(Box::pin(CancellableStreamWrapper::new(stream, ticket)))
+                    }
+                    other => other,
+                };
+                Output { data, meta }
+            })
+    }
+
+    async fn exec_statement_with_timeout(
+        &self,
+        stmt: Statement,
+        query_ctx: QueryContextRef,
+        query_interceptor: Option<&SqlQueryInterceptorRef<Error>>,
+    ) -> Result<Output> {
+        let timeout = derive_timeout(&stmt, &query_ctx);
+        match timeout {
+            Some(timeout) => {
+                let start = tokio::time::Instant::now();
+                let output = tokio::time::timeout(
+                    timeout,
+                    self.exec_statement(stmt, query_ctx, query_interceptor),
+                )
+                .await
+                .map_err(|_| StatementTimeoutSnafu.build())??;
+                // compute remaining timeout
+                let remaining_timeout = timeout.checked_sub(start.elapsed()).unwrap_or_default();
+                attach_timeout(output, remaining_timeout)
+            }
+            None => {
+                self.exec_statement(stmt, query_ctx, query_interceptor)
+                    .await
+            }
+        }
+    }
+
+    async fn exec_statement(
+        &self,
+        stmt: Statement,
+        query_ctx: QueryContextRef,
+        query_interceptor: Option<&SqlQueryInterceptorRef<Error>>,
+    ) -> Result<Output> {
+        match stmt {
             Statement::Query(_) | Statement::Explain(_) | Statement::Delete(_) => {
                 // TODO: remove this when format is supported in datafusion
                 if let Statement::Explain(explain) = &stmt {
@@ -244,41 +294,216 @@ impl Instance {
                     }
                 }
 
-                let stmt = QueryStatement::Sql(stmt);
-                let plan = self
-                    .statement_executor
-                    .plan(&stmt, query_ctx.clone())
-                    .await?;
-
-                let QueryStatement::Sql(stmt) = stmt else {
-                    unreachable!()
-                };
-                query_interceptor.pre_execute(&stmt, Some(&plan), query_ctx.clone())?;
-
-                self.statement_executor.exec_plan(plan, query_ctx).await
+                self.plan_and_exec_sql(stmt, &query_ctx, query_interceptor)
+                    .await
             }
             Statement::Tql(tql) => {
-                let plan = self
-                    .statement_executor
-                    .plan_tql(tql.clone(), &query_ctx)
-                    .await?;
-
-                query_interceptor.pre_execute(
-                    &Statement::Tql(tql),
-                    Some(&plan),
-                    query_ctx.clone(),
-                )?;
-
-                self.statement_executor.exec_plan(plan, query_ctx).await
+                self.plan_and_exec_tql(&query_ctx, query_interceptor, tql)
+                    .await
             }
             _ => {
                 query_interceptor.pre_execute(&stmt, None, query_ctx.clone())?;
-
-                self.statement_executor.execute_sql(stmt, query_ctx).await
+                self.statement_executor
+                    .execute_sql(stmt, query_ctx)
+                    .await
+                    .context(TableOperationSnafu)
             }
-        };
-        output.context(TableOperationSnafu)
+        }
     }
+
+    async fn plan_and_exec_sql(
+        &self,
+        stmt: Statement,
+        query_ctx: &QueryContextRef,
+        query_interceptor: Option<&SqlQueryInterceptorRef<Error>>,
+    ) -> Result<Output> {
+        let stmt = QueryStatement::Sql(stmt);
+        let plan = self
+            .statement_executor
+            .plan(&stmt, query_ctx.clone())
+            .await?;
+        let QueryStatement::Sql(stmt) = stmt else {
+            unreachable!()
+        };
+        query_interceptor.pre_execute(&stmt, Some(&plan), query_ctx.clone())?;
+        self.statement_executor
+            .exec_plan(plan, query_ctx.clone())
+            .await
+            .context(TableOperationSnafu)
+    }
+
+    async fn plan_and_exec_tql(
+        &self,
+        query_ctx: &QueryContextRef,
+        query_interceptor: Option<&SqlQueryInterceptorRef<Error>>,
+        tql: Tql,
+    ) -> Result<Output> {
+        let plan = self
+            .statement_executor
+            .plan_tql(tql.clone(), query_ctx)
+            .await?;
+        query_interceptor.pre_execute(&Statement::Tql(tql), Some(&plan), query_ctx.clone())?;
+        self.statement_executor
+            .exec_plan(plan, query_ctx.clone())
+            .await
+            .context(TableOperationSnafu)
+    }
+
+    async fn check_otlp_legacy(
+        &self,
+        names: &[&String],
+        ctx: QueryContextRef,
+    ) -> server_error::Result<bool> {
+        let db_string = ctx.get_db_string();
+        let cache = self
+            .otlp_metrics_table_legacy_cache
+            .entry(db_string)
+            .or_default();
+
+        // check cache
+        let hit_cache = names
+            .iter()
+            .filter_map(|name| cache.get(*name))
+            .collect::<Vec<_>>();
+        if !hit_cache.is_empty() {
+            let hit_legacy = hit_cache.iter().any(|en| *en.value());
+            let hit_prom = hit_cache.iter().any(|en| !*en.value());
+
+            // hit but have true and false, means both legacy and new mode are used
+            // we cannot handle this case, so return error
+            // add doc links in err msg later
+            ensure!(!(hit_legacy && hit_prom), OtlpMetricModeIncompatibleSnafu);
+
+            let flag = hit_legacy;
+            // set cache for all names
+            names.iter().for_each(|name| {
+                if !cache.contains_key(*name) {
+                    cache.insert(name.to_string(), flag);
+                }
+            });
+            return Ok(flag);
+        }
+
+        let catalog = ctx.current_catalog();
+        let schema = ctx.current_schema();
+
+        // query legacy table names
+        let normalized_names = names
+            .iter()
+            .map(|n| legacy_normalize_otlp_name(n))
+            .collect::<Vec<_>>();
+        let table_names = normalized_names
+            .iter()
+            .map(|n| TableNameKey::new(catalog, &schema, n))
+            .collect::<Vec<_>>();
+        let table_values = self
+            .table_metadata_manager()
+            .table_name_manager()
+            .batch_get(table_names)
+            .await
+            .context(CommonMetaSnafu)?;
+        let table_ids = table_values
+            .into_iter()
+            .filter_map(|v| v.map(|vi| vi.table_id()))
+            .collect::<Vec<_>>();
+
+        // means no existing table is found, use new mode
+        if table_ids.is_empty() {
+            // set cache
+            names.iter().for_each(|name| {
+                cache.insert(name.to_string(), false);
+            });
+            return Ok(false);
+        }
+
+        // has existing table, check table options
+        let table_infos = self
+            .table_metadata_manager()
+            .table_info_manager()
+            .batch_get(&table_ids)
+            .await
+            .context(CommonMetaSnafu)?;
+        let options = table_infos
+            .values()
+            .map(|info| {
+                info.table_info
+                    .meta
+                    .options
+                    .extra_options
+                    .get(OTLP_METRIC_COMPAT_KEY)
+                    .unwrap_or(&OTLP_LEGACY_DEFAULT_VALUE)
+            })
+            .collect::<Vec<_>>();
+        if !options.is_empty() {
+            // check value consistency
+            let has_prom = options.iter().any(|opt| *opt == OTLP_METRIC_COMPAT_PROM);
+            let has_legacy = options
+                .iter()
+                .any(|opt| *opt == OTLP_LEGACY_DEFAULT_VALUE.as_str());
+            ensure!(!(has_prom && has_legacy), OtlpMetricModeIncompatibleSnafu);
+            let flag = has_legacy;
+            names.iter().for_each(|name| {
+                cache.insert(name.to_string(), flag);
+            });
+            Ok(flag)
+        } else {
+            // no table info, use new mode
+            names.iter().for_each(|name| {
+                cache.insert(name.to_string(), false);
+            });
+            Ok(false)
+        }
+    }
+}
+
+/// If the relevant variables are set, the timeout is enforced for all PostgreSQL statements.
+/// For MySQL, it applies only to read-only statements.
+fn derive_timeout(stmt: &Statement, query_ctx: &QueryContextRef) -> Option<Duration> {
+    let query_timeout = query_ctx.query_timeout()?;
+    if query_timeout.is_zero() {
+        return None;
+    }
+    match query_ctx.channel() {
+        Channel::Mysql if stmt.is_readonly() => Some(query_timeout),
+        Channel::Postgres => Some(query_timeout),
+        _ => None,
+    }
+}
+
+fn attach_timeout(output: Output, mut timeout: Duration) -> Result<Output> {
+    if timeout.is_zero() {
+        return StatementTimeoutSnafu.fail();
+    }
+
+    let output = match output.data {
+        OutputData::AffectedRows(_) | OutputData::RecordBatches(_) => output,
+        OutputData::Stream(mut stream) => {
+            let schema = stream.schema();
+            let s = Box::pin(stream! {
+                let mut start = tokio::time::Instant::now();
+                while let Some(item) = tokio::time::timeout(timeout, stream.next()).await.map_err(|_| StreamTimeoutSnafu.build())? {
+                    yield item;
+
+                    let now = tokio::time::Instant::now();
+                    timeout = timeout.checked_sub(now - start).unwrap_or(Duration::ZERO);
+                    start = now;
+                    // tokio::time::timeout may not return an error immediately when timeout is 0.
+                    if timeout.is_zero() {
+                        StreamTimeoutSnafu.fail()?;
+                    }
+                }
+            }) as Pin<Box<dyn Stream<Item = _> + Send>>;
+            let stream = RecordBatchStreamWrapper {
+                schema,
+                stream: s,
+                output_ordering: None,
+                metrics: Default::default(),
+            };
+            Output::new(OutputData::Stream(Box::pin(stream)), output.meta)
+        }
+    };
+
+    Ok(output)
 }
 
 #[async_trait]
@@ -301,6 +526,13 @@ impl SqlQueryHandler for Instance {
             .and_then(|stmts| query_interceptor.post_parsing(stmts, query_ctx.clone()))
         {
             Ok(stmts) => {
+                if stmts.is_empty() {
+                    return vec![InvalidSqlSnafu {
+                        err_msg: "empty statements",
+                    }
+                    .fail()];
+                }
+
                 let mut results = Vec::with_capacity(stmts.len());
                 for stmt in stmts {
                     if let Err(e) = checker
@@ -343,7 +575,7 @@ impl SqlQueryHandler for Instance {
         // plan should be prepared before exec
         // we'll do check there
         self.query_engine
-            .execute(plan, query_ctx)
+            .execute(plan.clone(), query_ctx)
             .await
             .context(ExecLogicalPlanSnafu)
     }
@@ -439,7 +671,11 @@ impl PrometheusHandler for Instance {
             }
         })?;
 
-        let _slow_query_timer = self.stats.start_slow_query_timer(stmt.clone());
+        let _slow_query_timer = if let Some(recorder) = &self.slow_query_recorder {
+            recorder.start(stmt.clone(), query_ctx.clone())
+        } else {
+            None
+        };
 
         let plan = self
             .statement_executor
@@ -466,6 +702,21 @@ impl PrometheusHandler for Instance {
         ctx: &QueryContextRef,
     ) -> server_error::Result<Vec<String>> {
         self.handle_query_metric_names(matchers, ctx)
+            .await
+            .map_err(BoxedError::new)
+            .context(ExecuteQuerySnafu)
+    }
+
+    async fn query_label_values(
+        &self,
+        metric: String,
+        label_name: String,
+        matchers: Vec<Matcher>,
+        start: SystemTime,
+        end: SystemTime,
+        ctx: &QueryContextRef,
+    ) -> server_error::Result<Vec<String>> {
+        self.handle_query_label_values(metric, label_name, matchers, start, end, ctx)
             .await
             .map_err(BoxedError::new)
             .context(ExecuteQuerySnafu)
@@ -519,6 +770,8 @@ pub fn check_permission(
         | Statement::AlterDatabase(_)
         | Statement::DropFlow(_)
         | Statement::Use(_) => {}
+        #[cfg(feature = "enterprise")]
+        Statement::DropTrigger(_) => {}
         Statement::ShowCreateDatabase(stmt) => {
             validate_database(&stmt.database_name, query_ctx)?;
         }
@@ -538,19 +791,26 @@ pub fn check_permission(
             // TODO: should also validate source table name here?
             validate_param(&stmt.sink_table_name, query_ctx)?;
         }
+        #[cfg(feature = "enterprise")]
+        Statement::CreateTrigger(stmt) => {
+            validate_param(&stmt.trigger_name, query_ctx)?;
+        }
         Statement::CreateView(stmt) => {
             validate_param(&stmt.name, query_ctx)?;
         }
         Statement::AlterTable(stmt) => {
             validate_param(stmt.table_name(), query_ctx)?;
         }
+        #[cfg(feature = "enterprise")]
+        Statement::AlterTrigger(_) => {}
         // set/show variable now only alter/show variable in session
         Statement::SetVariables(_) | Statement::ShowVariables(_) => {}
         // show charset and show collation won't be checked
         Statement::ShowCharset(_) | Statement::ShowCollation(_) => {}
 
         Statement::Insert(insert) => {
-            validate_param(insert.table_name(), query_ctx)?;
+            let name = insert.table_name().context(ParseSqlSnafu)?;
+            validate_param(name, query_ctx)?;
         }
         Statement::CreateTable(stmt) => {
             validate_param(&stmt.name, query_ctx)?;
@@ -579,11 +839,19 @@ pub fn check_permission(
         Statement::ShowIndex(stmt) => {
             validate_db_permission!(stmt, query_ctx);
         }
+        Statement::ShowRegion(stmt) => {
+            validate_db_permission!(stmt, query_ctx);
+        }
         Statement::ShowViews(stmt) => {
             validate_db_permission!(stmt, query_ctx);
         }
         Statement::ShowFlows(stmt) => {
             validate_db_permission!(stmt, query_ctx);
+        }
+        #[cfg(feature = "enterprise")]
+        Statement::ShowTriggers(_stmt) => {
+            // The trigger is organized based on the catalog dimension, so there
+            // is no need to check the permission of the database(schema).
         }
         Statement::ShowStatus(_stmt) => {}
         Statement::ShowSearchPath(_stmt) => {}
@@ -607,6 +875,10 @@ pub fn check_permission(
         }
         // cursor operations are always allowed once it's created
         Statement::FetchCursor(_) | Statement::CloseCursor(_) => {}
+        // User can only kill process in their own catalog.
+        Statement::Kill(_) => {}
+        // SHOW PROCESSLIST
+        Statement::ShowProcesslist(_) => {}
     }
     Ok(())
 }

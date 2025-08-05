@@ -28,14 +28,18 @@ pub struct FunctionState {
 
 impl FunctionState {
     /// Create a mock [`FunctionState`] for test.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub fn mock() -> Self {
         use std::sync::Arc;
 
-        use api::v1::meta::ProcedureStatus;
+        use api::v1::meta::{ProcedureStatus, ReconcileRequest};
         use async_trait::async_trait;
+        use catalog::CatalogManagerRef;
         use common_base::AffectedRows;
-        use common_meta::rpc::procedure::{MigrateRegionRequest, ProcedureStateResponse};
+        use common_meta::rpc::procedure::{
+            AddRegionFollowerRequest, MigrateRegionRequest, ProcedureStateResponse,
+            RemoveRegionFollowerRequest,
+        };
         use common_query::error::Result;
         use common_query::Output;
         use session::context::QueryContextRef;
@@ -59,12 +63,31 @@ impl FunctionState {
                 Ok(Some("test_pid".to_string()))
             }
 
+            async fn reconcile(&self, _request: ReconcileRequest) -> Result<Option<String>> {
+                Ok(Some("test_pid".to_string()))
+            }
+
             async fn query_procedure_state(&self, _pid: &str) -> Result<ProcedureStateResponse> {
                 Ok(ProcedureStateResponse {
                     status: ProcedureStatus::Done.into(),
                     error: "OK".to_string(),
                     ..Default::default()
                 })
+            }
+
+            async fn add_region_follower(&self, _request: AddRegionFollowerRequest) -> Result<()> {
+                Ok(())
+            }
+
+            async fn remove_region_follower(
+                &self,
+                _request: RemoveRegionFollowerRequest,
+            ) -> Result<()> {
+                Ok(())
+            }
+
+            fn catalog_manager(&self) -> &CatalogManagerRef {
+                unimplemented!()
             }
         }
 

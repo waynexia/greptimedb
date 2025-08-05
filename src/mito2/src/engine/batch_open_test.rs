@@ -22,7 +22,7 @@ use common_wal::options::{KafkaWalOptions, WalOptions, WAL_OPTIONS_KEY};
 use rstest::rstest;
 use rstest_reuse::apply;
 use store_api::region_engine::RegionEngine;
-use store_api::region_request::{RegionOpenRequest, RegionRequest};
+use store_api::region_request::{PathType, RegionOpenRequest, RegionRequest};
 use store_api::storage::{RegionId, ScanRequest};
 
 use super::MitoEngine;
@@ -39,13 +39,14 @@ async fn test_batch_open(factory: Option<LogStoreFactory>) {
     let Some(factory) = factory else {
         return;
     };
-    let mut env =
-        TestEnv::with_prefix("open-batch-regions").with_log_store_factory(factory.clone());
+    let mut env = TestEnv::with_prefix("open-batch-regions")
+        .await
+        .with_log_store_factory(factory.clone());
     let engine = env.create_engine(MitoConfig::default()).await;
     let topic = prepare_test_for_kafka_log_store(&factory).await;
 
     let num_regions = 3u32;
-    let region_dir = |region_id| format!("test/{region_id}");
+    let table_dir_fn = |region_id| format!("test/{region_id}");
     let mut region_schema = HashMap::new();
 
     for id in 1..=num_regions {
@@ -53,7 +54,7 @@ async fn test_batch_open(factory: Option<LogStoreFactory>) {
         let topic = topic.clone();
         let region_id = RegionId::new(1, id);
         let request = CreateRequestBuilder::new()
-            .region_dir(&region_dir(region_id))
+            .table_dir(&table_dir_fn(region_id))
             .kafka_topic(topic.clone())
             .build();
         let column_schemas = rows_schema(&request);
@@ -120,9 +121,10 @@ async fn test_batch_open(factory: Option<LogStoreFactory>) {
                 region_id,
                 RegionOpenRequest {
                     engine: String::new(),
-                    region_dir: region_dir(region_id),
+                    table_dir: table_dir_fn(region_id),
                     options: options.clone(),
                     skip_wal_replay: false,
+                    path_type: PathType::Bare,
                 },
             )
         })
@@ -131,9 +133,10 @@ async fn test_batch_open(factory: Option<LogStoreFactory>) {
         RegionId::new(1, 4),
         RegionOpenRequest {
             engine: String::new(),
-            region_dir: "no-exists".to_string(),
+            table_dir: "no-exists".to_string(),
             options: options.clone(),
             skip_wal_replay: false,
+            path_type: PathType::Bare,
         },
     ));
 
@@ -160,8 +163,9 @@ async fn test_batch_open_err(factory: Option<LogStoreFactory>) {
     let Some(factory) = factory else {
         return;
     };
-    let mut env =
-        TestEnv::with_prefix("open-batch-regions-err").with_log_store_factory(factory.clone());
+    let mut env = TestEnv::with_prefix("open-batch-regions-err")
+        .await
+        .with_log_store_factory(factory.clone());
     let engine = env.create_engine(MitoConfig::default()).await;
     let topic = prepare_test_for_kafka_log_store(&factory).await;
     let mut options = HashMap::new();
@@ -175,16 +179,17 @@ async fn test_batch_open_err(factory: Option<LogStoreFactory>) {
         );
     };
     let num_regions = 3u32;
-    let region_dir = "test".to_string();
+    let table_dir = "test".to_string();
     let requests = (1..=num_regions)
         .map(|id| {
             (
                 RegionId::new(1, id),
                 RegionOpenRequest {
                     engine: String::new(),
-                    region_dir: region_dir.to_string(),
+                    table_dir: table_dir.to_string(),
                     options: options.clone(),
                     skip_wal_replay: false,
+                    path_type: PathType::Bare,
                 },
             )
         })

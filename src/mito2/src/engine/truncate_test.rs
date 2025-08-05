@@ -20,7 +20,7 @@ use common_recordbatch::RecordBatches;
 use common_telemetry::{info, init_default_ut_logging};
 use store_api::region_engine::RegionEngine;
 use store_api::region_request::{
-    RegionFlushRequest, RegionOpenRequest, RegionRequest, RegionTruncateRequest,
+    PathType, RegionFlushRequest, RegionOpenRequest, RegionRequest, RegionTruncateRequest,
 };
 use store_api::storage::RegionId;
 
@@ -33,7 +33,7 @@ use crate::test_util::{
 
 #[tokio::test]
 async fn test_engine_truncate_region_basic() {
-    let mut env = TestEnv::with_prefix("truncate-basic");
+    let mut env = TestEnv::with_prefix("truncate-basic").await;
     let engine = env.create_engine(MitoConfig::default()).await;
 
     // Create the region.
@@ -69,7 +69,10 @@ async fn test_engine_truncate_region_basic() {
 
     // Truncate the region.
     engine
-        .handle_request(region_id, RegionRequest::Truncate(RegionTruncateRequest {}))
+        .handle_request(
+            region_id,
+            RegionRequest::Truncate(RegionTruncateRequest::All),
+        )
         .await
         .unwrap();
 
@@ -83,7 +86,7 @@ async fn test_engine_truncate_region_basic() {
 
 #[tokio::test]
 async fn test_engine_put_data_after_truncate() {
-    let mut env = TestEnv::with_prefix("truncate-put");
+    let mut env = TestEnv::with_prefix("truncate-put").await;
     let engine = env.create_engine(MitoConfig::default()).await;
 
     // Create the region.
@@ -118,7 +121,10 @@ async fn test_engine_put_data_after_truncate() {
 
     // Truncate the region.
     engine
-        .handle_request(region_id, RegionRequest::Truncate(RegionTruncateRequest {}))
+        .handle_request(
+            region_id,
+            RegionRequest::Truncate(RegionTruncateRequest::All),
+        )
         .await
         .unwrap();
 
@@ -146,7 +152,7 @@ async fn test_engine_put_data_after_truncate() {
 
 #[tokio::test]
 async fn test_engine_truncate_after_flush() {
-    let mut env = TestEnv::with_prefix("truncate-flush");
+    let mut env = TestEnv::with_prefix("truncate-flush").await;
     let engine = env.create_engine(MitoConfig::default()).await;
 
     // Create the region.
@@ -189,12 +195,15 @@ async fn test_engine_truncate_after_flush() {
         .unwrap();
 
     let request = ScanRequest::default();
-    let scanner = engine.scanner(region_id, request.clone()).unwrap();
+    let scanner = engine.scanner(region_id, request.clone()).await.unwrap();
     assert_eq!(1, scanner.num_files());
 
     // Truncate the region.
     engine
-        .handle_request(region_id, RegionRequest::Truncate(RegionTruncateRequest {}))
+        .handle_request(
+            region_id,
+            RegionRequest::Truncate(RegionTruncateRequest::All),
+        )
         .await
         .unwrap();
 
@@ -206,7 +215,7 @@ async fn test_engine_truncate_after_flush() {
     put_rows(&engine, region_id, rows).await;
 
     // Scan the region.
-    let scanner = engine.scanner(region_id, request).unwrap();
+    let scanner = engine.scanner(region_id, request).await.unwrap();
     assert_eq!(0, scanner.num_files());
     let stream = scanner.scan().await.unwrap();
     let batches = RecordBatches::try_collect(stream).await.unwrap();
@@ -223,13 +232,13 @@ async fn test_engine_truncate_after_flush() {
 
 #[tokio::test]
 async fn test_engine_truncate_reopen() {
-    let mut env = TestEnv::with_prefix("truncate-reopen");
+    let mut env = TestEnv::with_prefix("truncate-reopen").await;
     let engine = env.create_engine(MitoConfig::default()).await;
 
     // Create the region.
     let region_id = RegionId::new(1, 1);
     let request = CreateRequestBuilder::new().build();
-    let region_dir = request.region_dir.clone();
+    let table_dir = request.table_dir.clone();
 
     let column_schemas = rows_schema(&request);
     engine
@@ -249,7 +258,10 @@ async fn test_engine_truncate_reopen() {
 
     // Truncate the region
     engine
-        .handle_request(region_id, RegionRequest::Truncate(RegionTruncateRequest {}))
+        .handle_request(
+            region_id,
+            RegionRequest::Truncate(RegionTruncateRequest::All),
+        )
         .await
         .unwrap();
 
@@ -260,7 +272,8 @@ async fn test_engine_truncate_reopen() {
             region_id,
             RegionRequest::Open(RegionOpenRequest {
                 engine: String::new(),
-                region_dir,
+                table_dir,
+                path_type: PathType::Bare,
                 options: HashMap::default(),
                 skip_wal_replay: false,
             }),
@@ -282,7 +295,7 @@ async fn test_engine_truncate_reopen() {
 #[tokio::test]
 async fn test_engine_truncate_during_flush() {
     init_default_ut_logging();
-    let mut env = TestEnv::with_prefix("truncate-during-flush");
+    let mut env = TestEnv::with_prefix("truncate-during-flush").await;
     let write_buffer_manager = Arc::new(MockWriteBufferManager::default());
     let listener = Arc::new(FlushTruncateListener::default());
     let engine = env
@@ -296,7 +309,7 @@ async fn test_engine_truncate_during_flush() {
     // Create the region.
     let region_id = RegionId::new(1, 1);
     let request = CreateRequestBuilder::new().build();
-    let region_dir = request.region_dir.clone();
+    let table_dir = request.table_dir.clone();
 
     let column_schemas = rows_schema(&request);
     engine
@@ -336,7 +349,10 @@ async fn test_engine_truncate_during_flush() {
 
     // Truncate the region.
     engine
-        .handle_request(region_id, RegionRequest::Truncate(RegionTruncateRequest {}))
+        .handle_request(
+            region_id,
+            RegionRequest::Truncate(RegionTruncateRequest::All),
+        )
         .await
         .unwrap();
 
@@ -352,7 +368,7 @@ async fn test_engine_truncate_during_flush() {
     let truncated_sequence = version_data.version.flushed_sequence;
 
     let request = ScanRequest::default();
-    let scanner = engine.scanner(region_id, request.clone()).unwrap();
+    let scanner = engine.scanner(region_id, request.clone()).await.unwrap();
     assert_eq!(0, scanner.num_files());
     assert_eq!(Some(entry_id), truncated_entry_id);
     assert_eq!(sequence, truncated_sequence);
@@ -364,7 +380,8 @@ async fn test_engine_truncate_during_flush() {
             region_id,
             RegionRequest::Open(RegionOpenRequest {
                 engine: String::new(),
-                region_dir,
+                table_dir,
+                path_type: PathType::Bare,
                 options: HashMap::default(),
                 skip_wal_replay: false,
             }),

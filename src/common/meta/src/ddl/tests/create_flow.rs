@@ -25,11 +25,11 @@ use crate::ddl::create_flow::CreateFlowProcedure;
 use crate::ddl::test_util::create_table::test_create_table_task;
 use crate::ddl::test_util::flownode_handler::NaiveFlownodeHandler;
 use crate::ddl::DdlContext;
+use crate::error;
 use crate::key::table_route::TableRouteValue;
 use crate::key::FlowId;
 use crate::rpc::ddl::CreateFlowTask;
 use crate::test_util::{new_ddl_context, MockFlownodeManager};
-use crate::{error, ClusterId};
 
 pub(crate) fn test_create_flow_task(
     name: &str,
@@ -46,14 +46,13 @@ pub(crate) fn test_create_flow_task(
         create_if_not_exists,
         expire_after: Some(300),
         comment: "".to_string(),
-        sql: "raw_sql".to_string(),
+        sql: "select 1".to_string(),
         flow_options: Default::default(),
     }
 }
 
 #[tokio::test]
 async fn test_create_flow_source_table_not_found() {
-    let cluster_id = 1;
     let source_table_names = vec![TableName::new(
         DEFAULT_CATALOG_NAME,
         DEFAULT_SCHEMA_NAME,
@@ -65,14 +64,13 @@ async fn test_create_flow_source_table_not_found() {
     let node_manager = Arc::new(MockFlownodeManager::new(NaiveFlownodeHandler));
     let ddl_context = new_ddl_context(node_manager);
     let query_ctx = QueryContext::arc().into();
-    let mut procedure = CreateFlowProcedure::new(cluster_id, task, query_ctx, ddl_context);
+    let mut procedure = CreateFlowProcedure::new(task, query_ctx, ddl_context);
     let err = procedure.on_prepare().await.unwrap_err();
     assert_matches!(err, error::Error::TableNotFound { .. });
 }
 
 pub(crate) async fn create_test_flow(
     ddl_context: &DdlContext,
-    cluster_id: ClusterId,
     flow_name: &str,
     source_table_names: Vec<TableName>,
     sink_table_name: TableName,
@@ -84,8 +82,7 @@ pub(crate) async fn create_test_flow(
         false,
     );
     let query_ctx = QueryContext::arc().into();
-    let mut procedure =
-        CreateFlowProcedure::new(cluster_id, task.clone(), query_ctx, ddl_context.clone());
+    let mut procedure = CreateFlowProcedure::new(task.clone(), query_ctx, ddl_context.clone());
     let output = execute_procedure_until_done(&mut procedure).await.unwrap();
     let flow_id = output.downcast_ref::<FlowId>().unwrap();
 
@@ -94,7 +91,6 @@ pub(crate) async fn create_test_flow(
 
 #[tokio::test]
 async fn test_create_flow() {
-    let cluster_id = 1;
     let table_id = 1024;
     let source_table_names = vec![TableName::new(
         DEFAULT_CATALOG_NAME,
@@ -118,7 +114,6 @@ async fn test_create_flow() {
         .unwrap();
     let flow_id = create_test_flow(
         &ddl_context,
-        cluster_id,
         "my_flow",
         source_table_names.clone(),
         sink_table_name.clone(),
@@ -134,8 +129,7 @@ async fn test_create_flow() {
         true,
     );
     let query_ctx = QueryContext::arc().into();
-    let mut procedure =
-        CreateFlowProcedure::new(cluster_id, task.clone(), query_ctx, ddl_context.clone());
+    let mut procedure = CreateFlowProcedure::new(task.clone(), query_ctx, ddl_context.clone());
     let output = execute_procedure_until_done(&mut procedure).await.unwrap();
     let flow_id = output.downcast_ref::<FlowId>().unwrap();
     assert_eq!(*flow_id, 1024);
@@ -143,7 +137,45 @@ async fn test_create_flow() {
     // Creates again
     let task = test_create_flow_task("my_flow", source_table_names, sink_table_name, false);
     let query_ctx = QueryContext::arc().into();
-    let mut procedure = CreateFlowProcedure::new(cluster_id, task.clone(), query_ctx, ddl_context);
+    let mut procedure = CreateFlowProcedure::new(task.clone(), query_ctx, ddl_context);
     let err = procedure.on_prepare().await.unwrap_err();
     assert_matches!(err, error::Error::FlowAlreadyExists { .. });
+}
+
+#[tokio::test]
+async fn test_create_flow_same_source_and_sink_table() {
+    let table_id = 1024;
+    let table_name = TableName::new(DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, "same_table");
+
+    // Use the same table for both source and sink
+    let source_table_names = vec![table_name.clone()];
+    let sink_table_name = table_name.clone();
+
+    let node_manager = Arc::new(MockFlownodeManager::new(NaiveFlownodeHandler));
+    let ddl_context = new_ddl_context(node_manager);
+
+    // Create the table first so it exists
+    let task = test_create_table_task("same_table", table_id);
+    ddl_context
+        .table_metadata_manager
+        .create_table_metadata(
+            task.table_info.clone(),
+            TableRouteValue::physical(vec![]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+    // Try to create a flow with same source and sink table - should fail
+    let task = test_create_flow_task("my_flow", source_table_names, sink_table_name, false);
+    let query_ctx = QueryContext::arc().into();
+    let mut procedure = CreateFlowProcedure::new(task, query_ctx, ddl_context);
+    let err = procedure.on_prepare().await.unwrap_err();
+    assert_matches!(err, error::Error::Unsupported { .. });
+
+    // Verify the error message contains information about the same table
+    if let error::Error::Unsupported { operation, .. } = &err {
+        assert!(operation.contains("source and sink table being the same"));
+        assert!(operation.contains("same_table"));
+    }
 }

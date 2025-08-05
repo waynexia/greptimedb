@@ -15,6 +15,7 @@
 //! Structs and utilities for writing regions.
 
 mod handle_alter;
+mod handle_bulk_insert;
 mod handle_catchup;
 mod handle_close;
 mod handle_compaction;
@@ -25,6 +26,7 @@ mod handle_manifest;
 mod handle_open;
 mod handle_truncate;
 mod handle_write;
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,11 +39,13 @@ use common_runtime::JoinHandle;
 use common_telemetry::{error, info, warn};
 use futures::future::try_join_all;
 use object_store::manager::ObjectStoreManagerRef;
-use prometheus::IntGauge;
-use rand::{thread_rng, Rng};
+use prometheus::{Histogram, IntGauge};
+use rand::{rng, Rng};
 use snafu::{ensure, ResultExt};
 use store_api::logstore::LogStore;
-use store_api::region_engine::{SetRegionRoleStateResponse, SettableRegionRoleState};
+use store_api::region_engine::{
+    SetRegionRoleStateResponse, SetRegionRoleStateSuccess, SettableRegionRoleState,
+};
 use store_api::storage::RegionId;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
@@ -50,13 +54,15 @@ use crate::cache::write_cache::{WriteCache, WriteCacheRef};
 use crate::cache::{CacheManager, CacheManagerRef};
 use crate::compaction::CompactionScheduler;
 use crate::config::MitoConfig;
+use crate::error;
 use crate::error::{CreateDirSnafu, JoinSnafu, Result, WorkerStoppedSnafu};
 use crate::flush::{FlushScheduler, WriteBufferManagerImpl, WriteBufferManagerRef};
 use crate::memtable::MemtableBuilderProvider;
-use crate::metrics::{REGION_COUNT, WRITE_STALL_TOTAL};
+use crate::metrics::{REGION_COUNT, REQUEST_WAIT_TIME, WRITE_STALLING};
 use crate::region::{MitoRegionRef, OpeningRegions, OpeningRegionsRef, RegionMap, RegionMapRef};
 use crate::request::{
-    BackgroundNotify, DdlRequest, SenderDdlRequest, SenderWriteRequest, WorkerRequest,
+    BackgroundNotify, DdlRequest, SenderBulkRequest, SenderDdlRequest, SenderWriteRequest,
+    WorkerRequest, WorkerRequestWithTime,
 };
 use crate::schedule::scheduler::{LocalScheduler, SchedulerRef};
 use crate::sst::file::FileId;
@@ -171,6 +177,7 @@ impl WorkerGroup {
                 .index_metadata_size(config.index.metadata_cache_size.as_bytes())
                 .index_content_size(config.index.content_cache_size.as_bytes())
                 .index_content_page_size(config.index.content_cache_page_size.as_bytes())
+                .index_result_cache_size(config.index.result_cache_size.as_bytes())
                 .puffin_metadata_size(config.index.metadata_cache_size.as_bytes())
                 .write_cache(write_cache)
                 .build(),
@@ -390,7 +397,7 @@ async fn write_cache_from_config(
 
 /// Computes a initial check delay for a worker.
 pub(crate) fn worker_init_check_delay() -> Duration {
-    let init_check_delay = thread_rng().gen_range(0..MAX_INITIAL_CHECK_DELAY_SECS);
+    let init_check_delay = rng().random_range(0..MAX_INITIAL_CHECK_DELAY_SECS);
     Duration::from_secs(init_check_delay)
 }
 
@@ -462,8 +469,9 @@ impl<S: LogStore> WorkerStarter<S> {
             last_periodical_check_millis: now,
             flush_sender: self.flush_sender,
             flush_receiver: self.flush_receiver,
-            stalled_count: WRITE_STALL_TOTAL.with_label_values(&[&id_string]),
+            stalling_count: WRITE_STALLING.with_label_values(&[&id_string]),
             region_count: REGION_COUNT.with_label_values(&[&id_string]),
+            request_wait_time: REQUEST_WAIT_TIME.with_label_values(&[&id_string]),
             region_edit_queues: RegionEditQueues::default(),
             schema_metadata_manager: self.schema_metadata_manager,
         };
@@ -491,7 +499,7 @@ pub(crate) struct RegionWorker {
     /// The opening regions.
     opening_regions: OpeningRegionsRef,
     /// Request sender.
-    sender: Sender<WorkerRequest>,
+    sender: Sender<WorkerRequestWithTime>,
     /// Handle to the worker thread.
     handle: Mutex<Option<JoinHandle<()>>>,
     /// Whether to run the worker thread.
@@ -502,7 +510,8 @@ impl RegionWorker {
     /// Submits request to background worker thread.
     async fn submit_request(&self, request: WorkerRequest) -> Result<()> {
         ensure!(self.is_running(), WorkerStoppedSnafu { id: self.id });
-        if self.sender.send(request).await.is_err() {
+        let request_with_time = WorkerRequestWithTime::new(request);
+        if self.sender.send(request_with_time).await.is_err() {
             warn!(
                 "Worker {} is already exited but the running flag is still true",
                 self.id
@@ -524,7 +533,12 @@ impl RegionWorker {
             info!("Stop region worker {}", self.id);
 
             self.set_running(false);
-            if self.sender.send(WorkerRequest::Stop).await.is_err() {
+            if self
+                .sender
+                .send(WorkerRequestWithTime::new(WorkerRequest::Stop))
+                .await
+                .is_err()
+            {
                 warn!("Worker {} is already exited before stop", self.id);
             }
 
@@ -583,25 +597,44 @@ type RequestBuffer = Vec<WorkerRequest>;
 #[derive(Default)]
 pub(crate) struct StalledRequests {
     /// Stalled requests.
+    /// Remember to use `StalledRequests::stalled_count()` to get the total number of stalled requests
+    /// instead of `StalledRequests::requests.len()`.
     ///
     /// Key: RegionId
     /// Value: (estimated size, stalled requests)
-    pub(crate) requests: HashMap<RegionId, (usize, Vec<SenderWriteRequest>)>,
+    pub(crate) requests:
+        HashMap<RegionId, (usize, Vec<SenderWriteRequest>, Vec<SenderBulkRequest>)>,
     /// Estimated size of all stalled requests.
     pub(crate) estimated_size: usize,
 }
 
 impl StalledRequests {
     /// Appends stalled requests.
-    pub(crate) fn append(&mut self, requests: &mut Vec<SenderWriteRequest>) {
+    pub(crate) fn append(
+        &mut self,
+        requests: &mut Vec<SenderWriteRequest>,
+        bulk_requests: &mut Vec<SenderBulkRequest>,
+    ) {
         for req in requests.drain(..) {
             self.push(req);
+        }
+        for req in bulk_requests.drain(..) {
+            self.push_bulk(req);
         }
     }
 
     /// Pushes a stalled request to the buffer.
     pub(crate) fn push(&mut self, req: SenderWriteRequest) {
-        let (size, requests) = self.requests.entry(req.request.region_id).or_default();
+        let (size, requests, _) = self.requests.entry(req.request.region_id).or_default();
+        let req_size = req.request.estimated_size();
+        *size += req_size;
+        self.estimated_size += req_size;
+        requests.push(req);
+    }
+
+    pub(crate) fn push_bulk(&mut self, req: SenderBulkRequest) {
+        let region_id = req.region_id;
+        let (size, _, requests) = self.requests.entry(region_id).or_default();
         let req_size = req.request.estimated_size();
         *size += req_size;
         self.estimated_size += req_size;
@@ -609,13 +642,24 @@ impl StalledRequests {
     }
 
     /// Removes stalled requests of specific region.
-    pub(crate) fn remove(&mut self, region_id: &RegionId) -> Vec<SenderWriteRequest> {
-        if let Some((size, requests)) = self.requests.remove(region_id) {
+    pub(crate) fn remove(
+        &mut self,
+        region_id: &RegionId,
+    ) -> (Vec<SenderWriteRequest>, Vec<SenderBulkRequest>) {
+        if let Some((size, write_reqs, bulk_reqs)) = self.requests.remove(region_id) {
             self.estimated_size -= size;
-            requests
+            (write_reqs, bulk_reqs)
         } else {
-            vec![]
+            (vec![], vec![])
         }
+    }
+
+    /// Returns the total number of all stalled requests.
+    pub(crate) fn stalled_count(&self) -> usize {
+        self.requests
+            .values()
+            .map(|(_, reqs, bulk_reqs)| reqs.len() + bulk_reqs.len())
+            .sum()
     }
 }
 
@@ -632,9 +676,9 @@ struct RegionWorkerLoop<S> {
     /// Regions that are opening.
     opening_regions: OpeningRegionsRef,
     /// Request sender.
-    sender: Sender<WorkerRequest>,
+    sender: Sender<WorkerRequestWithTime>,
     /// Request receiver.
-    receiver: Receiver<WorkerRequest>,
+    receiver: Receiver<WorkerRequestWithTime>,
     /// WAL of the engine.
     wal: Wal<S>,
     /// Manages object stores for manifest and SSTs.
@@ -669,10 +713,12 @@ struct RegionWorkerLoop<S> {
     flush_sender: watch::Sender<()>,
     /// Watch channel receiver to wait for background flush job.
     flush_receiver: watch::Receiver<()>,
-    /// Gauge of stalled request count.
-    stalled_count: IntGauge,
+    /// Gauge of stalling request count.
+    stalling_count: IntGauge,
     /// Gauge of regions in the worker.
     region_count: IntGauge,
+    /// Histogram of request wait time for this worker.
+    request_wait_time: Histogram,
     /// Queues for region edit requests.
     region_edit_queues: RegionEditQueues,
     /// Database level metadata manager.
@@ -692,6 +738,8 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         // Buffer to retrieve requests from receiver.
         let mut write_req_buffer: Vec<SenderWriteRequest> =
             Vec::with_capacity(self.config.worker_request_batch_size);
+        let mut bulk_req_buffer: Vec<SenderBulkRequest> =
+            Vec::with_capacity(self.config.worker_request_batch_size);
         let mut ddl_req_buffer: Vec<SenderDdlRequest> =
             Vec::with_capacity(self.config.worker_request_batch_size);
         let mut general_req_buffer: Vec<WorkerRequest> =
@@ -710,10 +758,16 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             tokio::select! {
                 request_opt = self.receiver.recv() => {
                     match request_opt {
-                        Some(request) => match request {
-                            WorkerRequest::Write(sender_req) => write_req_buffer.push(sender_req),
-                            WorkerRequest::Ddl(sender_req) => ddl_req_buffer.push(sender_req),
-                            _ => general_req_buffer.push(request),
+                        Some(request_with_time) => {
+                            // Observe the wait time
+                            let wait_time = request_with_time.created_at.elapsed();
+                            self.request_wait_time.observe(wait_time.as_secs_f64());
+
+                            match request_with_time.request {
+                                WorkerRequest::Write(sender_req) => write_req_buffer.push(sender_req),
+                                WorkerRequest::Ddl(sender_req) => ddl_req_buffer.push(sender_req),
+                                req => general_req_buffer.push(req),
+                            }
                         },
                         // The channel is disconnected.
                         None => break,
@@ -752,11 +806,17 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             for _ in 1..self.config.worker_request_batch_size {
                 // We have received one request so we start from 1.
                 match self.receiver.try_recv() {
-                    Ok(req) => match req {
-                        WorkerRequest::Write(sender_req) => write_req_buffer.push(sender_req),
-                        WorkerRequest::Ddl(sender_req) => ddl_req_buffer.push(sender_req),
-                        _ => general_req_buffer.push(req),
-                    },
+                    Ok(request_with_time) => {
+                        // Observe the wait time
+                        let wait_time = request_with_time.created_at.elapsed();
+                        self.request_wait_time.observe(wait_time.as_secs_f64());
+
+                        match request_with_time.request {
+                            WorkerRequest::Write(sender_req) => write_req_buffer.push(sender_req),
+                            WorkerRequest::Ddl(sender_req) => ddl_req_buffer.push(sender_req),
+                            req => general_req_buffer.push(req),
+                        }
+                    }
                     // We still need to handle remaining requests.
                     Err(_) => break,
                 }
@@ -770,6 +830,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                 &mut write_req_buffer,
                 &mut ddl_req_buffer,
                 &mut general_req_buffer,
+                &mut bulk_req_buffer,
             )
             .await;
 
@@ -789,6 +850,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         write_requests: &mut Vec<SenderWriteRequest>,
         ddl_requests: &mut Vec<SenderDdlRequest>,
         general_requests: &mut Vec<WorkerRequest>,
+        bulk_requests: &mut Vec<SenderBulkRequest>,
     ) {
         for worker_req in general_requests.drain(..) {
             match worker_req {
@@ -811,18 +873,42 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                 WorkerRequest::EditRegion(request) => {
                     self.handle_region_edit(request).await;
                 }
-                // We receive a stop signal, but we still want to process remaining
-                // requests. The worker thread will then check the running flag and
-                // then exit.
                 WorkerRequest::Stop => {
                     debug_assert!(!self.running.load(Ordering::Relaxed));
+                }
+                WorkerRequest::SyncRegion(req) => {
+                    self.handle_region_sync(req).await;
+                }
+                WorkerRequest::BulkInserts {
+                    metadata,
+                    request,
+                    sender,
+                } => {
+                    if let Some(region_metadata) = metadata {
+                        self.handle_bulk_insert_batch(
+                            region_metadata,
+                            request,
+                            bulk_requests,
+                            sender,
+                        )
+                        .await;
+                    } else {
+                        error!("Cannot find region metadata for {}", request.region_id);
+                        sender.send(
+                            error::RegionNotFoundSnafu {
+                                region_id: request.region_id,
+                            }
+                            .fail(),
+                        );
+                    }
                 }
             }
         }
 
         // Handles all write requests first. So we can alter regions without
         // considering existing write requests.
-        self.handle_write_requests(write_requests, true).await;
+        self.handle_write_requests(write_requests, bulk_requests, true)
+            .await;
 
         self.handle_ddl_requests(ddl_requests).await;
     }
@@ -858,8 +944,8 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                         .await;
                     continue;
                 }
-                DdlRequest::Truncate(_) => {
-                    self.handle_truncate_request(ddl.region_id, ddl.sender)
+                DdlRequest::Truncate(req) => {
+                    self.handle_truncate_request(ddl.region_id, req, ddl.sender)
                         .await;
                     continue;
                 }
@@ -920,7 +1006,9 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                 region.set_role_state_gracefully(region_role_state).await;
 
                 let last_entry_id = region.version_control.current().last_entry_id;
-                let _ = sender.send(SetRegionRoleStateResponse::success(Some(last_entry_id)));
+                let _ = sender.send(SetRegionRoleStateResponse::success(
+                    SetRegionRoleStateSuccess::mito(last_entry_id),
+                ));
             });
         } else {
             let _ = sender.send(SetRegionRoleStateResponse::NotFound);
@@ -1075,7 +1163,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_worker_group_start_stop() {
-        let env = TestEnv::with_prefix("group-stop");
+        let env = TestEnv::with_prefix("group-stop").await;
         let group = env
             .create_worker_group(MitoConfig {
                 num_workers: 4,

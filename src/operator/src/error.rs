@@ -23,7 +23,6 @@ use datafusion::parquet;
 use datatypes::arrow::error::ArrowError;
 use snafu::{Location, Snafu};
 use table::metadata::TableType;
-use tokio::time::error::Elapsed;
 
 #[derive(Snafu)]
 #[snafu(visibility(pub))]
@@ -420,13 +419,6 @@ pub enum Error {
         source: datatypes::error::Error,
     },
 
-    #[snafu(display("Failed to deserialize partition in meta to partition def"))]
-    DeserializePartition {
-        #[snafu(implicit)]
-        location: Location,
-        source: partition::error::Error,
-    },
-
     #[snafu(display("Failed to describe schema for given statement"))]
     DescribeStatement {
         #[snafu(implicit)]
@@ -512,14 +504,6 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
         source: common_datasource::error::Error,
-    },
-
-    #[snafu(display("Failed to build csv config"))]
-    BuildCsvConfig {
-        #[snafu(source)]
-        error: common_datasource::file_format::csv::CsvConfigBuilderError,
-        #[snafu(implicit)]
-        location: Location,
     },
 
     #[snafu(display("Failed to write stream to path: {}", path))]
@@ -711,6 +695,14 @@ pub enum Error {
         location: Location,
     },
 
+    #[cfg(feature = "enterprise")]
+    #[snafu(display("Invalid trigger name: {name}"))]
+    InvalidTriggerName {
+        name: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("Empty {} expr", name))]
     EmptyDdlExpr {
         name: String,
@@ -786,19 +778,79 @@ pub enum Error {
         json: String,
     },
 
-    #[snafu(display("Canceling statement due to statement timeout"))]
-    StatementTimeout {
-        #[snafu(implicit)]
-        location: Location,
-        #[snafu(source)]
-        error: Elapsed,
-    },
-
     #[snafu(display("Cursor {name} is not found"))]
     CursorNotFound { name: String },
 
     #[snafu(display("A cursor named {name} already exists"))]
     CursorExists { name: String },
+
+    #[snafu(display("Column options error"))]
+    ColumnOptions {
+        #[snafu(source)]
+        source: api::error::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Failed to create partition rules"))]
+    CreatePartitionRules {
+        #[snafu(source)]
+        source: sql::error::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Failed to decode arrow flight data"))]
+    DecodeFlightData {
+        source: common_grpc::error::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Failed to perform arrow compute"))]
+    ComputeArrow {
+        #[snafu(source)]
+        error: ArrowError,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Path not found: {path}"))]
+    PathNotFound {
+        path: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Invalid time index type: {}", ty))]
+    InvalidTimeIndexType {
+        ty: arrow::datatypes::DataType,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Invalid process id: {}", id))]
+    InvalidProcessId { id: String },
+
+    #[snafu(display("ProcessManager is not present, this can be caused by misconfiguration."))]
+    ProcessManagerMissing {
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Sql common error"))]
+    SqlCommon {
+        source: common_sql::error::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Failed to convert partition expression to protobuf"))]
+    PartitionExprToPb {
+        source: partition::error::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -817,7 +869,6 @@ impl ErrorExt for Error {
             | Error::ColumnNotFound { .. }
             | Error::BuildRegex { .. }
             | Error::InvalidSchema { .. }
-            | Error::BuildCsvConfig { .. }
             | Error::ProjectSchema { .. }
             | Error::UnsupportedFormat { .. }
             | Error::ColumnNoneDefaultValue { .. }
@@ -840,116 +891,95 @@ impl ErrorExt for Error {
             | Error::InvalidPartition { .. }
             | Error::PhysicalExpr { .. }
             | Error::InvalidJsonFormat { .. }
+            | Error::PartitionExprToPb { .. }
             | Error::CursorNotFound { .. }
-            | Error::CursorExists { .. } => StatusCode::InvalidArguments,
-
+            | Error::CursorExists { .. }
+            | Error::CreatePartitionRules { .. } => StatusCode::InvalidArguments,
+            #[cfg(feature = "enterprise")]
+            Error::InvalidTriggerName { .. } => StatusCode::InvalidArguments,
             Error::TableAlreadyExists { .. } | Error::ViewAlreadyExists { .. } => {
                 StatusCode::TableAlreadyExists
             }
-
             Error::NotSupported { .. }
             | Error::ShowCreateTableBaseOnly { .. }
             | Error::SchemaReadOnly { .. } => StatusCode::Unsupported,
-
             Error::TableMetadataManager { source, .. } => source.status_code(),
-
             Error::ParseSql { source, .. } => source.status_code(),
-
             Error::InvalidateTableCache { source, .. } => source.status_code(),
-
             Error::ParseFileFormat { source, .. } | Error::InferSchema { source, .. } => {
                 source.status_code()
             }
-
             Error::Table { source, .. } | Error::Insert { source, .. } => source.status_code(),
-
             Error::ConvertColumnDefaultConstraint { source, .. }
             | Error::CreateTableInfo { source, .. }
             | Error::IntoVectors { source, .. } => source.status_code(),
-
             Error::RequestInserts { source, .. } | Error::FindViewInfo { source, .. } => {
                 source.status_code()
             }
             Error::RequestRegion { source, .. } => source.status_code(),
             Error::RequestDeletes { source, .. } => source.status_code(),
             Error::SubstraitCodec { source, .. } => source.status_code(),
-
             Error::ColumnDataType { source, .. } | Error::InvalidColumnDef { source, .. } => {
                 source.status_code()
             }
-
             Error::MissingTimeIndexColumn { source, .. } => source.status_code(),
-
             Error::BuildDfLogicalPlan { .. }
             | Error::BuildTableMeta { .. }
             | Error::MissingInsertBody { .. } => StatusCode::Internal,
-
             Error::EncodeJson { .. } => StatusCode::Unexpected,
-
             Error::ViewNotFound { .. }
             | Error::ViewInfoNotFound { .. }
             | Error::TableNotFound { .. } => StatusCode::TableNotFound,
-
             Error::FlowNotFound { .. } => StatusCode::FlowNotFound,
-
             Error::JoinTask { .. } => StatusCode::Internal,
-
             Error::BuildParquetRecordBatchStream { .. }
             | Error::BuildFileStream { .. }
             | Error::WriteStreamToFile { .. }
             | Error::ReadDfRecordBatch { .. }
             | Error::Unexpected { .. } => StatusCode::Unexpected,
-
             Error::Catalog { source, .. } => source.status_code(),
-
             Error::BuildCreateExprOnInsertion { source, .. }
             | Error::FindNewColumnsOnInsertion { source, .. } => source.status_code(),
-
             Error::ExecuteStatement { source, .. }
             | Error::ExtractTableNames { source, .. }
             | Error::PlanStatement { source, .. }
             | Error::ParseQuery { source, .. }
             | Error::ExecLogicalPlan { source, .. }
             | Error::DescribeStatement { source, .. } => source.status_code(),
-
             Error::AlterExprToRequest { source, .. } => source.status_code(),
-
             Error::External { source, .. } => source.status_code(),
-            Error::DeserializePartition { source, .. }
-            | Error::FindTablePartitionRule { source, .. }
+            Error::FindTablePartitionRule { source, .. }
             | Error::SplitInsert { source, .. }
             | Error::SplitDelete { source, .. }
             | Error::FindRegionLeader { source, .. } => source.status_code(),
-
             Error::UnrecognizedTableOption { .. } => StatusCode::InvalidArguments,
-
             Error::ReadObject { .. }
             | Error::ReadParquetMetadata { .. }
             | Error::ReadOrc { .. } => StatusCode::StorageUnavailable,
-
             Error::ListObjects { source, .. }
             | Error::ParseUrl { source, .. }
             | Error::BuildBackend { source, .. } => source.status_code(),
-
             Error::ExecuteDdl { source, .. } => source.status_code(),
             Error::InvalidCopyParameter { .. } | Error::InvalidCopyDatabasePath { .. } => {
                 StatusCode::InvalidArguments
             }
-
             Error::ColumnDefaultValue { source, .. } => source.status_code(),
-
             Error::EmptyDdlExpr { .. }
             | Error::InvalidPartitionRule { .. }
             | Error::ParseSqlValue { .. }
             | Error::InvalidTimestampRange { .. } => StatusCode::InvalidArguments,
-
             Error::CreateLogicalTables { .. } => StatusCode::Unexpected,
-
             Error::ExecuteAdminFunction { source, .. } => source.status_code(),
             Error::BuildRecordBatch { source, .. } => source.status_code(),
-
             Error::UpgradeCatalogManagerRef { .. } => StatusCode::Internal,
-            Error::StatementTimeout { .. } => StatusCode::Cancelled,
+            Error::ColumnOptions { source, .. } => source.status_code(),
+            Error::DecodeFlightData { source, .. } => source.status_code(),
+            Error::ComputeArrow { .. } => StatusCode::Internal,
+            Error::InvalidTimeIndexType { .. } => StatusCode::InvalidArguments,
+            Error::InvalidProcessId { .. } => StatusCode::InvalidArguments,
+            Error::ProcessManagerMissing { .. } => StatusCode::Unexpected,
+            Error::PathNotFound { .. } => StatusCode::InvalidArguments,
+            Error::SqlCommon { source, .. } => source.status_code(),
         }
     }
 

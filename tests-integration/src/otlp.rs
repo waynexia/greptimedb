@@ -37,7 +37,7 @@ mod test {
         let standalone = GreptimeDbStandaloneBuilder::new("test_standalone_otlp")
             .build()
             .await;
-        let instance = &standalone.instance;
+        let instance = standalone.fe_instance();
 
         test_otlp(instance).await;
     }
@@ -69,7 +69,7 @@ mod test {
 
         let mut output = instance
             .do_query(
-                "SELECT * FROM my_test_metric ORDER BY greptime_timestamp",
+                "SELECT * FROM my_test_metric_my_ignored_unit ORDER BY greptime_timestamp",
                 ctx.clone(),
             )
             .await;
@@ -81,17 +81,17 @@ mod test {
         assert_eq!(
             recordbatches.pretty_print().unwrap(),
             "\
-+------------+-------+--------------------+------------+-------------------------------+----------------+
-| resource   | scope | telemetry_sdk_name | host       | greptime_timestamp            | greptime_value |
-+------------+-------+--------------------+------------+-------------------------------+----------------+
-| greptimedb | otel  | java               | testsevrer | 1970-01-01T00:00:00.000000100 | 100.0          |
-| greptimedb | otel  | java               | testserver | 1970-01-01T00:00:00.000000105 | 105.0          |
-+------------+-------+--------------------+------------+-------------------------------+----------------+",
++----------------+---------------------+----------------+
+| container_name | greptime_timestamp  | greptime_value |
++----------------+---------------------+----------------+
+| testserver     | 1970-01-01T00:00:00 | 105.0          |
+| testsevrer     | 1970-01-01T00:00:00 | 100.0          |
++----------------+---------------------+----------------+",
         );
 
         let mut output = instance
             .do_query(
-                "SELECT le, greptime_value FROM my_test_histo_bucket order by le",
+                "SELECT le, greptime_value FROM my_test_histo_my_ignored_unit_bucket order by le",
                 ctx.clone(),
             )
             .await;
@@ -113,7 +113,10 @@ mod test {
         );
 
         let mut output = instance
-            .do_query("SELECT * FROM my_test_histo_sum", ctx.clone())
+            .do_query(
+                "SELECT * FROM my_test_histo_my_ignored_unit_sum",
+                ctx.clone(),
+            )
             .await;
         let output = output.remove(0).unwrap();
         let OutputData::Stream(stream) = output.data else {
@@ -123,15 +126,18 @@ mod test {
         assert_eq!(
             recordbatches.pretty_print().unwrap(),
             "\
-+------------+-------+--------------------+------------+-------------------------------+----------------+
-| resource   | scope | telemetry_sdk_name | host       | greptime_timestamp            | greptime_value |
-+------------+-------+--------------------+------------+-------------------------------+----------------+
-| greptimedb | otel  | java               | testserver | 1970-01-01T00:00:00.000000100 | 51.0           |
-+------------+-------+--------------------+------------+-------------------------------+----------------+",
++------------+---------------------+----------------+
+| host       | greptime_timestamp  | greptime_value |
++------------+---------------------+----------------+
+| testserver | 1970-01-01T00:00:00 | 51.0           |
++------------+---------------------+----------------+",
         );
 
         let mut output = instance
-            .do_query("SELECT * FROM my_test_histo_count", ctx.clone())
+            .do_query(
+                "SELECT * FROM my_test_histo_my_ignored_unit_count",
+                ctx.clone(),
+            )
             .await;
         let output = output.remove(0).unwrap();
         let OutputData::Stream(stream) = output.data else {
@@ -141,24 +147,24 @@ mod test {
         assert_eq!(
             recordbatches.pretty_print().unwrap(),
             "\
-+------------+-------+--------------------+------------+-------------------------------+----------------+
-| resource   | scope | telemetry_sdk_name | host       | greptime_timestamp            | greptime_value |
-+------------+-------+--------------------+------------+-------------------------------+----------------+
-| greptimedb | otel  | java               | testserver | 1970-01-01T00:00:00.000000100 | 4.0            |
-+------------+-------+--------------------+------------+-------------------------------+----------------+"
++------------+---------------------+----------------+
+| host       | greptime_timestamp  | greptime_value |
++------------+---------------------+----------------+
+| testserver | 1970-01-01T00:00:00 | 4.0            |
++------------+---------------------+----------------+",
         );
     }
 
     fn build_request() -> ExportMetricsServiceRequest {
         let data_points = vec![
             NumberDataPoint {
-                attributes: vec![keyvalue("host", "testsevrer")],
+                attributes: vec![keyvalue("container.name", "testsevrer")],
                 time_unix_nano: 100,
                 value: Some(Value::AsInt(100)),
                 ..Default::default()
             },
             NumberDataPoint {
-                attributes: vec![keyvalue("host", "testserver")],
+                attributes: vec![keyvalue("container.name", "testserver")],
                 time_unix_nano: 105,
                 value: Some(Value::AsInt(105)),
                 ..Default::default()

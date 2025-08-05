@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 use snafu::{ensure, ResultExt};
 use strum::AsRefStr;
 
-use super::utils::handle_retry_error;
 use crate::cache_invalidator::Context;
+use crate::ddl::utils::map_to_procedure_error;
 use crate::ddl::DdlContext;
 use crate::error::{Result, SchemaNotFoundSnafu};
 use crate::instruction::CacheIdent;
@@ -30,7 +30,6 @@ use crate::key::DeserializedValueWithBytes;
 use crate::lock_key::{CatalogLock, SchemaLock};
 use crate::rpc::ddl::UnsetDatabaseOption::{self};
 use crate::rpc::ddl::{AlterDatabaseKind, AlterDatabaseTask, SetDatabaseOption};
-use crate::ClusterId;
 
 pub struct AlterDatabaseProcedure {
     pub context: DdlContext,
@@ -65,14 +64,10 @@ fn build_new_schema_value(
 impl AlterDatabaseProcedure {
     pub const TYPE_NAME: &'static str = "metasrv-procedure::AlterDatabase";
 
-    pub fn new(
-        cluster_id: ClusterId,
-        task: AlterDatabaseTask,
-        context: DdlContext,
-    ) -> Result<Self> {
+    pub fn new(task: AlterDatabaseTask, context: DdlContext) -> Result<Self> {
         Ok(Self {
             context,
-            data: AlterDatabaseData::new(task, cluster_id)?,
+            data: AlterDatabaseData::new(task)?,
         })
     }
 
@@ -153,7 +148,7 @@ impl Procedure for AlterDatabaseProcedure {
             AlterDatabaseState::UpdateMetadata => self.on_update_metadata().await,
             AlterDatabaseState::InvalidateSchemaCache => self.on_invalidate_schema_cache().await,
         }
-        .map_err(handle_retry_error)
+        .map_err(map_to_procedure_error)
     }
 
     fn dump(&self) -> ProcedureResult<String> {
@@ -183,7 +178,6 @@ enum AlterDatabaseState {
 /// The data of alter database procedure.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AlterDatabaseData {
-    cluster_id: ClusterId,
     state: AlterDatabaseState,
     kind: AlterDatabaseKind,
     catalog_name: String,
@@ -192,9 +186,8 @@ pub struct AlterDatabaseData {
 }
 
 impl AlterDatabaseData {
-    pub fn new(task: AlterDatabaseTask, cluster_id: ClusterId) -> Result<Self> {
+    pub fn new(task: AlterDatabaseTask) -> Result<Self> {
         Ok(Self {
-            cluster_id,
             state: AlterDatabaseState::Prepare,
             kind: AlterDatabaseKind::try_from(task.alter_expr.kind.unwrap())?,
             catalog_name: task.alter_expr.catalog_name,

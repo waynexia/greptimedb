@@ -12,48 +12,47 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use cache::{build_fundamental_cache_registry, with_default_composite_cache_registry};
 use catalog::information_extension::DistributedInformationExtension;
-use catalog::kvbackend::{CachedKvBackendBuilder, KvBackendCatalogManager, MetaKvBackend};
+use catalog::kvbackend::{CachedKvBackendBuilder, KvBackendCatalogManagerBuilder, MetaKvBackend};
+use catalog::process_manager::ProcessManager;
 use clap::Parser;
 use client::client_manager::NodeClients;
 use common_base::Plugins;
-use common_config::Configurable;
+use common_config::{Configurable, DEFAULT_DATA_HOME};
 use common_grpc::channel_manager::ChannelConfig;
 use common_meta::cache::{CacheRegistryBuilder, LayeredCacheRegistryBuilder};
 use common_meta::heartbeat::handler::invalidate_table_cache::InvalidateCacheHandler;
 use common_meta::heartbeat::handler::parse_mailbox_message::ParseMailboxMessageHandler;
 use common_meta::heartbeat::handler::HandlerGroupExecutor;
 use common_telemetry::info;
-use common_telemetry::logging::TracingOptions;
+use common_telemetry::logging::{TracingOptions, DEFAULT_LOGGING_DIR};
 use common_time::timezone::set_default_timezone;
-use common_version::{short_version, version};
+use common_version::{short_version, verbose_version};
+use frontend::frontend::Frontend;
 use frontend::heartbeat::HeartbeatTask;
 use frontend::instance::builder::FrontendBuilder;
-use frontend::instance::{FrontendInstance, Instance as FeInstance};
 use frontend::server::Services;
 use meta_client::{MetaClientOptions, MetaClientType};
-use query::stats::StatementStatistics;
+use servers::addrs;
+use servers::export_metrics::ExportMetricsTask;
 use servers::tls::{TlsMode, TlsOption};
 use snafu::{OptionExt, ResultExt};
 use tracing_appender::non_blocking::WorkerGuard;
 
-use crate::error::{
-    self, InitTimezoneSnafu, LoadLayeredConfigSnafu, MetaClientInitSnafu, MissingConfigSnafu,
-    Result, StartFrontendSnafu,
-};
+use crate::error::{self, Result};
 use crate::options::{GlobalOptions, GreptimeOptions};
-use crate::{log_versions, App};
+use crate::{create_resource_limit_metrics, log_versions, maybe_activate_heap_profile, App};
 
 type FrontendOptions = GreptimeOptions<frontend::frontend::FrontendOptions>;
 
 pub struct Instance {
-    frontend: FeInstance,
-
+    frontend: Frontend,
     // Keep the logging guard to prevent the worker from being dropped.
     _guard: Vec<WorkerGuard>,
 }
@@ -61,19 +60,16 @@ pub struct Instance {
 pub const APP_NAME: &str = "greptime-frontend";
 
 impl Instance {
-    pub fn new(frontend: FeInstance, guard: Vec<WorkerGuard>) -> Self {
-        Self {
-            frontend,
-            _guard: guard,
-        }
+    pub fn new(frontend: Frontend, _guard: Vec<WorkerGuard>) -> Self {
+        Self { frontend, _guard }
     }
 
-    pub fn mut_inner(&mut self) -> &mut FeInstance {
-        &mut self.frontend
-    }
-
-    pub fn inner(&self) -> &FeInstance {
+    pub fn inner(&self) -> &Frontend {
         &self.frontend
+    }
+
+    pub fn mut_inner(&mut self) -> &mut Frontend {
+        &mut self.frontend
     }
 }
 
@@ -84,14 +80,18 @@ impl App for Instance {
     }
 
     async fn start(&mut self) -> Result<()> {
-        plugins::start_frontend_plugins(self.frontend.plugins().clone())
+        let plugins = self.frontend.instance.plugins().clone();
+        plugins::start_frontend_plugins(plugins)
             .await
-            .context(StartFrontendSnafu)?;
+            .context(error::StartFrontendSnafu)?;
 
-        self.frontend.start().await.context(StartFrontendSnafu)
+        self.frontend
+            .start()
+            .await
+            .context(error::StartFrontendSnafu)
     }
 
-    async fn stop(&self) -> Result<()> {
+    async fn stop(&mut self) -> Result<()> {
         self.frontend
             .shutdown()
             .await
@@ -102,7 +102,7 @@ impl App for Instance {
 #[derive(Parser)]
 pub struct Command {
     #[clap(subcommand)]
-    subcmd: SubCommand,
+    pub subcmd: SubCommand,
 }
 
 impl Command {
@@ -116,7 +116,7 @@ impl Command {
 }
 
 #[derive(Parser)]
-enum SubCommand {
+pub enum SubCommand {
     Start(StartCommand),
 }
 
@@ -153,7 +153,7 @@ pub struct StartCommand {
     #[clap(long)]
     postgres_addr: Option<String>,
     #[clap(short, long)]
-    config_file: Option<String>,
+    pub config_file: Option<String>,
     #[clap(short, long)]
     influxdb_enable: Option<bool>,
     #[clap(long, value_delimiter = ',', num_args = 1..)]
@@ -169,7 +169,7 @@ pub struct StartCommand {
     #[clap(long)]
     disable_dashboard: Option<bool>,
     #[clap(long, default_value = "GREPTIMEDB_FRONTEND")]
-    env_prefix: String,
+    pub env_prefix: String,
 }
 
 impl StartCommand {
@@ -178,7 +178,7 @@ impl StartCommand {
             self.config_file.as_deref(),
             self.env_prefix.as_ref(),
         )
-        .context(LoadLayeredConfigSnafu)?;
+        .context(error::LoadLayeredConfigSnafu)?;
 
         self.merge_with_cli_options(global_options, &mut opts)?;
 
@@ -195,6 +195,14 @@ impl StartCommand {
 
         if let Some(dir) = &global_options.log_dir {
             opts.logging.dir.clone_from(dir);
+        }
+
+        // If the logging dir is not set, use the default logs dir in the data home.
+        if opts.logging.dir.is_empty() {
+            opts.logging.dir = Path::new(DEFAULT_DATA_HOME)
+                .join(DEFAULT_LOGGING_DIR)
+                .to_string_lossy()
+                .to_string();
         }
 
         if global_options.log_level.is_some() {
@@ -271,8 +279,12 @@ impl StartCommand {
             &opts.component.logging,
             &opts.component.tracing,
             opts.component.node_id.clone(),
+            opts.component.slow_query.as_ref(),
         );
-        log_versions(version(), short_version(), APP_NAME);
+
+        log_versions(verbose_version(), short_version(), APP_NAME);
+        maybe_activate_heap_profile(&opts.component.memory);
+        create_resource_limit_metrics(APP_NAME);
 
         info!("Frontend start command: {:#?}", self);
         info!("Frontend options: {:#?}", opts);
@@ -283,26 +295,29 @@ impl StartCommand {
         let mut plugins = Plugins::new();
         plugins::setup_frontend_plugins(&mut plugins, &plugin_opts, &opts)
             .await
-            .context(StartFrontendSnafu)?;
+            .context(error::StartFrontendSnafu)?;
 
-        set_default_timezone(opts.default_timezone.as_deref()).context(InitTimezoneSnafu)?;
+        set_default_timezone(opts.default_timezone.as_deref()).context(error::InitTimezoneSnafu)?;
 
-        let meta_client_options = opts.meta_client.as_ref().context(MissingConfigSnafu {
-            msg: "'meta_client'",
-        })?;
+        let meta_client_options = opts
+            .meta_client
+            .as_ref()
+            .context(error::MissingConfigSnafu {
+                msg: "'meta_client'",
+            })?;
 
         let cache_max_capacity = meta_client_options.metadata_cache_max_capacity;
         let cache_ttl = meta_client_options.metadata_cache_ttl;
         let cache_tti = meta_client_options.metadata_cache_tti;
 
-        let cluster_id = 0; // (TODO: jeremy): It is currently a reserved field and has not been enabled.
         let meta_client = meta_client::create_meta_client(
-            cluster_id,
             MetaClientType::Frontend,
             meta_client_options,
+            Some(&plugins),
+            None,
         )
         .await
-        .context(MetaClientInitSnafu)?;
+        .context(error::MetaClientInitSnafu)?;
 
         // TODO(discord9): add helper function to ease the creation of cache registry&such
         let cached_meta_backend =
@@ -331,12 +346,25 @@ impl StartCommand {
 
         let information_extension =
             Arc::new(DistributedInformationExtension::new(meta_client.clone()));
-        let catalog_manager = KvBackendCatalogManager::new(
+
+        let process_manager = Arc::new(ProcessManager::new(
+            addrs::resolve_addr(&opts.grpc.bind_addr, Some(&opts.grpc.server_addr)),
+            Some(meta_client.clone()),
+        ));
+
+        let builder = KvBackendCatalogManagerBuilder::new(
             information_extension,
             cached_meta_backend.clone(),
             layered_cache_registry.clone(),
-            None,
-        );
+        )
+        .with_process_manager(process_manager.clone());
+        #[cfg(feature = "enterprise")]
+        let builder = if let Some(factories) = plugins.get() {
+            builder.with_extra_information_table_factories(factories)
+        } else {
+            builder
+        };
+        let catalog_manager = builder.build();
 
         let executor = HandlerGroupExecutor::new(vec![
             Arc::new(ParseMailboxMessageHandler),
@@ -349,42 +377,53 @@ impl StartCommand {
             opts.heartbeat.clone(),
             Arc::new(executor),
         );
+        let heartbeat_task = Some(heartbeat_task);
 
         // frontend to datanode need not timeout.
         // Some queries are expected to take long time.
-        let channel_config = ChannelConfig {
+        let mut channel_config = ChannelConfig {
             timeout: None,
             tcp_nodelay: opts.datanode.client.tcp_nodelay,
             connect_timeout: Some(opts.datanode.client.connect_timeout),
             ..Default::default()
         };
+        if opts.grpc.flight_compression.transport_compression() {
+            channel_config.accept_compression = true;
+            channel_config.send_compression = true;
+        }
         let client = NodeClients::new(channel_config);
 
-        let mut instance = FrontendBuilder::new(
+        let instance = FrontendBuilder::new(
             opts.clone(),
             cached_meta_backend.clone(),
             layered_cache_registry.clone(),
             catalog_manager,
             Arc::new(client),
             meta_client,
-            StatementStatistics::new(opts.logging.slow_query.clone()),
+            process_manager,
         )
         .with_plugin(plugins.clone())
         .with_local_cache_invalidator(layered_cache_registry)
-        .with_heartbeat_task(heartbeat_task)
         .try_build()
         .await
-        .context(StartFrontendSnafu)?;
+        .context(error::StartFrontendSnafu)?;
+        let instance = Arc::new(instance);
 
-        let servers = Services::new(opts, Arc::new(instance.clone()), plugins)
+        let export_metrics_task = ExportMetricsTask::try_new(&opts.export_metrics, Some(&plugins))
+            .context(error::ServersSnafu)?;
+
+        let servers = Services::new(opts, instance.clone(), plugins)
             .build()
-            .await
-            .context(StartFrontendSnafu)?;
-        instance
-            .build_servers(servers)
-            .context(StartFrontendSnafu)?;
+            .context(error::StartFrontendSnafu)?;
 
-        Ok(Instance::new(instance, guard))
+        let frontend = Frontend {
+            instance,
+            servers,
+            heartbeat_task,
+            export_metrics_task,
+        };
+
+        Ok(Instance::new(frontend, guard))
     }
 }
 
@@ -440,11 +479,9 @@ mod tests {
     fn test_read_from_config_file() {
         let mut file = create_named_temp_file();
         let toml_str = r#"
-            mode = "distributed"
-
             [http]
             addr = "127.0.0.1:4000"
-            timeout = "30s"
+            timeout = "0s"
             body_limit = "2GB"
 
             [opentsdb]
@@ -452,7 +489,7 @@ mod tests {
 
             [logging]
             level = "debug"
-            dir = "/tmp/greptimedb/test/logs"
+            dir = "./greptimedb_data/test/logs"
         "#;
         write!(file, "{}", toml_str).unwrap();
 
@@ -465,12 +502,15 @@ mod tests {
         let fe_opts = command.load_options(&Default::default()).unwrap().component;
 
         assert_eq!("127.0.0.1:4000".to_string(), fe_opts.http.addr);
-        assert_eq!(Duration::from_secs(30), fe_opts.http.timeout);
+        assert_eq!(Duration::from_secs(0), fe_opts.http.timeout);
 
         assert_eq!(ReadableSize::gb(2), fe_opts.http.body_limit);
 
         assert_eq!("debug", fe_opts.logging.level.as_ref().unwrap());
-        assert_eq!("/tmp/greptimedb/test/logs".to_string(), fe_opts.logging.dir);
+        assert_eq!(
+            "./greptimedb_data/test/logs".to_string(),
+            fe_opts.logging.dir
+        );
         assert!(!fe_opts.opentsdb.enable);
     }
 
@@ -509,7 +549,7 @@ mod tests {
 
         let options = cmd
             .load_options(&GlobalOptions {
-                log_dir: Some("/tmp/greptimedb/test/logs".to_string()),
+                log_dir: Some("./greptimedb_data/test/logs".to_string()),
                 log_level: Some("debug".to_string()),
 
                 #[cfg(feature = "tokio-console")]
@@ -519,7 +559,7 @@ mod tests {
             .component;
 
         let logging_opt = options.logging;
-        assert_eq!("/tmp/greptimedb/test/logs", logging_opt.dir);
+        assert_eq!("./greptimedb_data/test/logs", logging_opt.dir);
         assert_eq!("debug", logging_opt.level.as_ref().unwrap());
     }
 
@@ -527,8 +567,6 @@ mod tests {
     fn test_config_precedence_order() {
         let mut file = create_named_temp_file();
         let toml_str = r#"
-            mode = "distributed"
-
             [http]
             addr = "127.0.0.1:4000"
 

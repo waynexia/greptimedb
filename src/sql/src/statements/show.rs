@@ -46,6 +46,9 @@ macro_rules! format_kind {
     };
 }
 
+#[cfg(feature = "enterprise")]
+pub mod trigger;
+
 /// SQL structure for `SHOW DATABASES`.
 #[derive(Debug, Clone, PartialEq, Eq, Visit, VisitMut, Serialize)]
 pub struct ShowDatabases {
@@ -93,6 +96,25 @@ impl Display for ShowIndex {
         }
         format_kind!(self, f);
 
+        Ok(())
+    }
+}
+
+/// The SQL `SHOW REGION` statement
+#[derive(Debug, Clone, PartialEq, Eq, Visit, VisitMut, Serialize)]
+pub struct ShowRegion {
+    pub kind: ShowKind,
+    pub table: String,
+    pub database: Option<String>,
+}
+
+impl Display for ShowRegion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SHOW REGION IN {}", &self.table)?;
+        if let Some(database) = &self.database {
+            write!(f, " IN {database}")?;
+        }
+        format_kind!(self, f);
         Ok(())
     }
 }
@@ -299,6 +321,23 @@ impl Display for ShowSearchPath {
     }
 }
 
+/// SQL structure for `SHOW PROCESSLIST`.
+#[derive(Debug, Clone, PartialEq, Eq, Visit, VisitMut, Serialize)]
+pub struct ShowProcessList {
+    pub full: bool,
+}
+impl Display for ShowProcessList {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.full {
+            write!(f, "SHOW FULL PROCESSLIST")?;
+        } else {
+            write!(f, "SHOW PROCESSLIST")?;
+        }
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::assert_matches::assert_matches;
@@ -315,13 +354,7 @@ mod tests {
         assert_eq!("", format!("{}", ShowKind::All));
         assert_eq!(
             "LIKE test",
-            format!(
-                "{}",
-                ShowKind::Like(Ident {
-                    value: "test".to_string(),
-                    quote_style: None,
-                })
-            )
+            format!("{}", ShowKind::Like(Ident::new("test")),)
         );
         assert_eq!(
             "WHERE NOT a",
@@ -329,10 +362,7 @@ mod tests {
                 "{}",
                 ShowKind::Where(Expr::UnaryOp {
                     op: UnaryOperator::Not,
-                    expr: Box::new(Expr::Identifier(Ident {
-                        value: "a".to_string(),
-                        quote_style: None,
-                    })),
+                    expr: Box::new(Expr::Identifier(Ident::new("a"))),
                 })
             )
         );

@@ -15,43 +15,16 @@
 use std::collections::HashSet;
 
 use api::v1::alter_table_expr::Kind;
-use api::v1::region::region_request::Body;
 use api::v1::region::{
-    alter_request, AddColumn, AddColumns, AlterRequest, DropColumn, DropColumns, RegionColumnDef,
-    RegionRequest, RegionRequestHeader,
+    alter_request, AddColumn, AddColumns, DropColumn, DropColumns, RegionColumnDef,
 };
-use common_telemetry::tracing_context::TracingContext;
 use snafu::OptionExt;
-use store_api::storage::RegionId;
 use table::metadata::RawTableInfo;
 
 use crate::ddl::alter_table::AlterTableProcedure;
 use crate::error::{InvalidProtoMsgSnafu, Result};
 
 impl AlterTableProcedure {
-    /// Makes alter region request from existing an alter kind.
-    /// Region alter request always add columns if not exist.
-    pub(crate) fn make_alter_region_request(
-        &self,
-        region_id: RegionId,
-        kind: Option<alter_request::Kind>,
-    ) -> Result<RegionRequest> {
-        // Safety: checked
-        let table_info = self.data.table_info().unwrap();
-
-        Ok(RegionRequest {
-            header: Some(RegionRequestHeader {
-                tracing_context: TracingContext::from_current_span().to_w3c(),
-                ..Default::default()
-            }),
-            body: Some(Body::Alter(AlterRequest {
-                region_id: region_id.as_u64(),
-                schema_version: table_info.ident.version,
-                kind,
-            })),
-        })
-    }
-
     /// Makes alter kind proto that all regions can reuse.
     /// Region alter request always add columns if not exist.
     pub(crate) fn make_region_alter_kind(&self) -> Result<Option<alter_request::Kind>> {
@@ -135,6 +108,10 @@ fn create_proto_alter_kind(
         Kind::UnsetTableOptions(v) => Ok(Some(alter_request::Kind::UnsetTableOptions(v.clone()))),
         Kind::SetIndex(v) => Ok(Some(alter_request::Kind::SetIndex(v.clone()))),
         Kind::UnsetIndex(v) => Ok(Some(alter_request::Kind::UnsetIndex(v.clone()))),
+        Kind::SetIndexes(v) => Ok(Some(alter_request::Kind::SetIndexes(v.clone()))),
+        Kind::UnsetIndexes(v) => Ok(Some(alter_request::Kind::UnsetIndexes(v.clone()))),
+        Kind::DropDefaults(v) => Ok(Some(alter_request::Kind::DropDefaults(v.clone()))),
+        Kind::SetDefaults(v) => Ok(Some(alter_request::Kind::SetDefaults(v.clone()))),
     }
 }
 
@@ -154,6 +131,7 @@ mod tests {
     use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
     use store_api::storage::{RegionId, TableId};
 
+    use crate::ddl::alter_table::executor::make_alter_region_request;
     use crate::ddl::alter_table::AlterTableProcedure;
     use crate::ddl::test_util::columns::TestColumnDefBuilder;
     use crate::ddl::test_util::create_table::{
@@ -167,10 +145,9 @@ mod tests {
     use crate::test_util::{new_ddl_context, MockDatanodeManager};
 
     /// Prepares a region with schema `[ts: Timestamp, host: Tag, cpu: Field]`.
-    async fn prepare_ddl_context() -> (DdlContext, u64, TableId, RegionId, String) {
+    async fn prepare_ddl_context() -> (DdlContext, TableId, RegionId, String) {
         let datanode_manager = Arc::new(MockDatanodeManager::new(()));
         let ddl_context = new_ddl_context(datanode_manager);
-        let cluster_id = 1;
         let table_id = 1024;
         let region_id = RegionId::new(table_id, 1);
         let table_name = "foo";
@@ -225,19 +202,12 @@ mod tests {
             )
             .await
             .unwrap();
-        (
-            ddl_context,
-            cluster_id,
-            table_id,
-            region_id,
-            table_name.to_string(),
-        )
+        (ddl_context, table_id, region_id, table_name.to_string())
     }
 
     #[tokio::test]
     async fn test_make_alter_region_request() {
-        let (ddl_context, cluster_id, table_id, region_id, table_name) =
-            prepare_ddl_context().await;
+        let (ddl_context, table_id, region_id, table_name) = prepare_ddl_context().await;
 
         let task = AlterTableTask {
             alter_table: AlterTableExpr {
@@ -265,19 +235,16 @@ mod tests {
             },
         };
 
-        let mut procedure =
-            AlterTableProcedure::new(cluster_id, table_id, task, ddl_context).unwrap();
+        let mut procedure = AlterTableProcedure::new(table_id, task, ddl_context).unwrap();
         procedure.on_prepare().await.unwrap();
         let alter_kind = procedure.make_region_alter_kind().unwrap();
-        let Some(Body::Alter(alter_region_request)) = procedure
-            .make_alter_region_request(region_id, alter_kind)
-            .unwrap()
-            .body
+        let Some(Body::Alter(alter_region_request)) =
+            make_alter_region_request(region_id, alter_kind).body
         else {
             unreachable!()
         };
         assert_eq!(alter_region_request.region_id, region_id.as_u64());
-        assert_eq!(alter_region_request.schema_version, 1);
+        assert_eq!(alter_region_request.schema_version, 0);
         assert_eq!(
             alter_region_request.kind,
             Some(region::alter_request::Kind::AddColumns(
@@ -307,8 +274,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_make_alter_column_type_region_request() {
-        let (ddl_context, cluster_id, table_id, region_id, table_name) =
-            prepare_ddl_context().await;
+        let (ddl_context, table_id, region_id, table_name) = prepare_ddl_context().await;
 
         let task = AlterTableTask {
             alter_table: AlterTableExpr {
@@ -325,19 +291,16 @@ mod tests {
             },
         };
 
-        let mut procedure =
-            AlterTableProcedure::new(cluster_id, table_id, task, ddl_context).unwrap();
+        let mut procedure = AlterTableProcedure::new(table_id, task, ddl_context).unwrap();
         procedure.on_prepare().await.unwrap();
         let alter_kind = procedure.make_region_alter_kind().unwrap();
-        let Some(Body::Alter(alter_region_request)) = procedure
-            .make_alter_region_request(region_id, alter_kind)
-            .unwrap()
-            .body
+        let Some(Body::Alter(alter_region_request)) =
+            make_alter_region_request(region_id, alter_kind).body
         else {
             unreachable!()
         };
         assert_eq!(alter_region_request.region_id, region_id.as_u64());
-        assert_eq!(alter_region_request.schema_version, 1);
+        assert_eq!(alter_region_request.schema_version, 0);
         assert_eq!(
             alter_region_request.kind,
             Some(region::alter_request::Kind::ModifyColumnTypes(

@@ -13,6 +13,8 @@
 // limitations under the License.
 
 pub mod context;
+pub mod hints;
+pub mod protocol_ctx;
 pub mod session_config;
 pub mod table_name;
 
@@ -25,6 +27,7 @@ use auth::UserInfoRef;
 use common_catalog::build_db_string;
 use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
 use common_recordbatch::cursor::RecordBatchStreamCursor;
+pub use common_session::ReadPreference;
 use common_time::timezone::get_timezone;
 use common_time::Timezone;
 use context::{ConfigurationVariables, QueryContextBuilder};
@@ -39,6 +42,8 @@ pub struct Session {
     mutable_inner: Arc<RwLock<MutableInner>>,
     conn_info: ConnInfo,
     configuration_variables: Arc<ConfigurationVariables>,
+    // the process id to use when killing the query
+    process_id: u32,
 }
 
 pub type SessionRef = Arc<Session>;
@@ -50,6 +55,7 @@ pub(crate) struct MutableInner {
     user_info: UserInfoRef,
     timezone: Timezone,
     query_timeout: Option<Duration>,
+    read_preference: ReadPreference,
     #[debug(skip)]
     pub(crate) cursors: HashMap<String, Arc<RecordBatchStreamCursor>>,
 }
@@ -61,6 +67,7 @@ impl Default for MutableInner {
             user_info: auth::userinfo_by_name(None),
             timezone: get_timezone(None).clone(),
             query_timeout: None,
+            read_preference: ReadPreference::Leader,
             cursors: HashMap::with_capacity(0),
         }
     }
@@ -71,12 +78,14 @@ impl Session {
         addr: Option<SocketAddr>,
         channel: Channel,
         configuration_variables: ConfigurationVariables,
+        process_id: u32,
     ) -> Self {
         Session {
             catalog: RwLock::new(DEFAULT_CATALOG_NAME.into()),
             conn_info: ConnInfo::new(addr, channel),
             configuration_variables: Arc::new(configuration_variables),
             mutable_inner: Arc::new(RwLock::new(MutableInner::default())),
+            process_id,
         }
     }
 
@@ -89,6 +98,8 @@ impl Session {
             .sql_dialect(self.conn_info.channel.dialect())
             .configuration_parameter(self.configuration_variables.clone())
             .channel(self.conn_info.channel)
+            .process_id(self.process_id)
+            .conn_info(self.conn_info.clone())
             .build()
             .into()
     }
@@ -101,9 +112,17 @@ impl Session {
         self.mutable_inner.read().unwrap().timezone.clone()
     }
 
+    pub fn read_preference(&self) -> ReadPreference {
+        self.mutable_inner.read().unwrap().read_preference
+    }
+
     pub fn set_timezone(&self, tz: Timezone) {
         let mut inner = self.mutable_inner.write().unwrap();
         inner.timezone = tz;
+    }
+
+    pub fn set_read_preference(&self, read_preference: ReadPreference) {
+        self.mutable_inner.write().unwrap().read_preference = read_preference;
     }
 
     pub fn user_info(&self) -> UserInfoRef {
@@ -132,5 +151,9 @@ impl Session {
 
     pub fn get_db_string(&self) -> String {
         build_db_string(&self.catalog(), &self.schema())
+    }
+
+    pub fn process_id(&self) -> u32 {
+        self.process_id
     }
 }

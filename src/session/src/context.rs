@@ -19,6 +19,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use api::v1::region::RegionRequestHeader;
+use api::v1::ExplainOptions;
 use arc_swap::ArcSwap;
 use auth::UserInfoRef;
 use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
@@ -30,8 +31,9 @@ use common_time::Timezone;
 use derive_builder::Builder;
 use sql::dialect::{Dialect, GenericDialect, GreptimeDbDialect, MySqlDialect, PostgreSqlDialect};
 
+use crate::protocol_ctx::ProtocolCtx;
 use crate::session_config::{PGByteaOutputValue, PGDateOrder, PGDateTimeStyle};
-use crate::MutableInner;
+use crate::{MutableInner, ReadPreference};
 
 pub type QueryContextRef = Arc<QueryContext>;
 pub type ConnInfoRef = Arc<ConnInfo>;
@@ -47,6 +49,8 @@ pub struct QueryContext {
     /// container data that was committed before(and include) the given sequence number
     /// this field will only be filled if extensions contains a pair of "snapshot_read" and "true"
     snapshot_seqs: Arc<RwLock<HashMap<u64, u64>>>,
+    /// Mappings of the RegionId to the minimal sequence of SST file to scan.
+    sst_min_sequences: Arc<RwLock<HashMap<u64, u64>>>,
     // we use Arc<RwLock>> for modifiable fields
     #[builder(default)]
     mutable_session_data: Arc<RwLock<MutableInner>>,
@@ -55,12 +59,21 @@ pub struct QueryContext {
     sql_dialect: Arc<dyn Dialect + Send + Sync>,
     #[builder(default)]
     extensions: HashMap<String, String>,
-    // The configuration parameter are used to store the parameters that are set by the user
+    /// The configuration parameter are used to store the parameters that are set by the user
     #[builder(default)]
     configuration_parameter: Arc<ConfigurationVariables>,
-    // Track which protocol the query comes from.
+    /// Track which protocol the query comes from.
     #[builder(default)]
     channel: Channel,
+    /// Process id for managing on-going queries
+    #[builder(default)]
+    process_id: u32,
+    /// Connection information
+    #[builder(default)]
+    conn_info: ConnInfo,
+    /// Protocol specific context
+    #[builder(default)]
+    protocol_ctx: ProtocolCtx,
 }
 
 /// This fields hold data that is only valid to current query context
@@ -69,6 +82,8 @@ pub struct QueryContextMutableFields {
     warning: Option<String>,
     // TODO: remove this when format is supported in datafusion
     explain_format: Option<String>,
+    /// Explain options to control the verbose analyze output.
+    explain_options: Option<ExplainOptions>,
 }
 
 impl Display for QueryContext {
@@ -111,28 +126,39 @@ impl QueryContextBuilder {
             .timezone = timezone;
         self
     }
+
+    pub fn explain_options(mut self, explain_options: Option<ExplainOptions>) -> Self {
+        self.mutable_query_context_data
+            .get_or_insert_default()
+            .write()
+            .unwrap()
+            .explain_options = explain_options;
+        self
+    }
+
+    pub fn read_preference(mut self, read_preference: ReadPreference) -> Self {
+        self.mutable_session_data
+            .get_or_insert_default()
+            .write()
+            .unwrap()
+            .read_preference = read_preference;
+        self
+    }
 }
 
 impl From<&RegionRequestHeader> for QueryContext {
     fn from(value: &RegionRequestHeader) -> Self {
-        let mut builder = QueryContextBuilder::default();
         if let Some(ctx) = &value.query_context {
-            builder = builder
-                .current_catalog(ctx.current_catalog.clone())
-                .current_schema(ctx.current_schema.clone())
-                .timezone(parse_timezone(Some(&ctx.timezone)))
-                .extensions(ctx.extensions.clone())
-                .channel(ctx.channel.into())
-                .snapshot_seqs(Arc::new(RwLock::new(
-                    ctx.snapshot_seqs.clone().unwrap_or_default().snapshot_seqs,
-                )));
+            ctx.clone().into()
+        } else {
+            QueryContextBuilder::default().build()
         }
-        builder.build()
     }
 }
 
 impl From<api::v1::QueryContext> for QueryContext {
     fn from(ctx: api::v1::QueryContext) -> Self {
+        let sequences = ctx.snapshot_seqs.as_ref();
         QueryContextBuilder::default()
             .current_catalog(ctx.current_catalog)
             .current_schema(ctx.current_schema)
@@ -140,8 +166,16 @@ impl From<api::v1::QueryContext> for QueryContext {
             .extensions(ctx.extensions)
             .channel(ctx.channel.into())
             .snapshot_seqs(Arc::new(RwLock::new(
-                ctx.snapshot_seqs.clone().unwrap_or_default().snapshot_seqs,
+                sequences
+                    .map(|x| x.snapshot_seqs.clone())
+                    .unwrap_or_default(),
             )))
+            .sst_min_sequences(Arc::new(RwLock::new(
+                sequences
+                    .map(|x| x.sst_min_sequences.clone())
+                    .unwrap_or_default(),
+            )))
+            .explain_options(ctx.explain)
             .build()
     }
 }
@@ -154,9 +188,12 @@ impl From<QueryContext> for api::v1::QueryContext {
             extensions,
             channel,
             snapshot_seqs,
+            sst_min_sequences,
+            mutable_query_context_data,
             ..
         }: QueryContext,
     ) -> Self {
+        let explain = mutable_query_context_data.read().unwrap().explain_options;
         let mutable_inner = mutable_inner.read().unwrap();
         api::v1::QueryContext {
             current_catalog,
@@ -166,7 +203,9 @@ impl From<QueryContext> for api::v1::QueryContext {
             channel: channel as u32,
             snapshot_seqs: Some(api::v1::SnapshotSequences {
                 snapshot_seqs: snapshot_seqs.read().unwrap().clone(),
+                sst_min_sequences: sst_min_sequences.read().unwrap().clone(),
             }),
+            explain,
         }
     }
 }
@@ -249,6 +288,14 @@ impl QueryContext {
         self.mutable_session_data.write().unwrap().timezone = timezone;
     }
 
+    pub fn read_preference(&self) -> ReadPreference {
+        self.mutable_session_data.read().unwrap().read_preference
+    }
+
+    pub fn set_read_preference(&self, read_preference: ReadPreference) {
+        self.mutable_session_data.write().unwrap().read_preference = read_preference;
+    }
+
     pub fn current_user(&self) -> UserInfoRef {
         self.mutable_session_data.read().unwrap().user_info.clone()
     }
@@ -319,6 +366,24 @@ impl QueryContext {
             .explain_format = Some(format);
     }
 
+    pub fn explain_verbose(&self) -> bool {
+        self.mutable_query_context_data
+            .read()
+            .unwrap()
+            .explain_options
+            .map(|opts| opts.verbose)
+            .unwrap_or(false)
+    }
+
+    pub fn set_explain_verbose(&self, verbose: bool) {
+        self.mutable_query_context_data
+            .write()
+            .unwrap()
+            .explain_options
+            .get_or_insert_default()
+            .verbose = verbose;
+    }
+
     pub fn query_timeout(&self) -> Option<Duration> {
         self.mutable_session_data.read().unwrap().query_timeout
     }
@@ -363,6 +428,37 @@ impl QueryContext {
     pub fn get_snapshot(&self, region_id: u64) -> Option<u64> {
         self.snapshot_seqs.read().unwrap().get(&region_id).cloned()
     }
+
+    /// Returns `true` if the session can cast strings to numbers in MySQL style.
+    pub fn auto_string_to_numeric(&self) -> bool {
+        matches!(self.channel, Channel::Mysql)
+    }
+
+    /// Finds the minimal sequence of SST files to scan of a Region.
+    pub fn sst_min_sequence(&self, region_id: u64) -> Option<u64> {
+        self.sst_min_sequences
+            .read()
+            .unwrap()
+            .get(&region_id)
+            .copied()
+    }
+
+    pub fn process_id(&self) -> u32 {
+        self.process_id
+    }
+
+    /// Get client information
+    pub fn conn_info(&self) -> &ConnInfo {
+        &self.conn_info
+    }
+
+    pub fn protocol_ctx(&self) -> &ProtocolCtx {
+        &self.protocol_ctx
+    }
+
+    pub fn set_protocol_ctx(&mut self, protocol_ctx: ProtocolCtx) {
+        self.protocol_ctx = protocol_ctx;
+    }
 }
 
 impl QueryContextBuilder {
@@ -373,6 +469,7 @@ impl QueryContextBuilder {
                 .current_catalog
                 .unwrap_or_else(|| DEFAULT_CATALOG_NAME.to_string()),
             snapshot_seqs: self.snapshot_seqs.unwrap_or_default(),
+            sst_min_sequences: self.sst_min_sequences.unwrap_or_default(),
             mutable_session_data: self.mutable_session_data.unwrap_or_default(),
             mutable_query_context_data: self.mutable_query_context_data.unwrap_or_default(),
             sql_dialect: self
@@ -383,6 +480,9 @@ impl QueryContextBuilder {
                 .configuration_parameter
                 .unwrap_or_else(|| Arc::new(ConfigurationVariables::default())),
             channel,
+            process_id: self.process_id.unwrap_or_default(),
+            conn_info: self.conn_info.unwrap_or_default(),
+            protocol_ctx: self.protocol_ctx.unwrap_or_default(),
         }
     }
 
@@ -394,7 +494,7 @@ impl QueryContextBuilder {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Default)]
 pub struct ConnInfo {
     pub client_addr: Option<SocketAddr>,
     pub channel: Channel,
@@ -431,7 +531,7 @@ pub enum Channel {
 
     Mysql = 1,
     Postgres = 2,
-    Http = 3,
+    HttpSql = 3,
     Prometheus = 4,
     Otlp = 5,
     Grpc = 6,
@@ -440,6 +540,8 @@ pub enum Channel {
     Loki = 9,
     Elasticsearch = 10,
     Jaeger = 11,
+    Log = 12,
+    Promql = 13,
 }
 
 impl From<u32> for Channel {
@@ -447,7 +549,7 @@ impl From<u32> for Channel {
         match value {
             1 => Self::Mysql,
             2 => Self::Postgres,
-            3 => Self::Http,
+            3 => Self::HttpSql,
             4 => Self::Prometheus,
             5 => Self::Otlp,
             6 => Self::Grpc,
@@ -456,6 +558,8 @@ impl From<u32> for Channel {
             9 => Self::Loki,
             10 => Self::Elasticsearch,
             11 => Self::Jaeger,
+            12 => Self::Log,
+            13 => Self::Promql,
             _ => Self::Unknown,
         }
     }
@@ -473,19 +577,27 @@ impl Channel {
 
 impl Display for Channel {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        write!(f, "{}", self.as_ref())
+    }
+}
+
+impl AsRef<str> for Channel {
+    fn as_ref(&self) -> &str {
         match self {
-            Channel::Mysql => write!(f, "mysql"),
-            Channel::Postgres => write!(f, "postgres"),
-            Channel::Http => write!(f, "http"),
-            Channel::Prometheus => write!(f, "prometheus"),
-            Channel::Otlp => write!(f, "otlp"),
-            Channel::Grpc => write!(f, "grpc"),
-            Channel::Influx => write!(f, "influx"),
-            Channel::Opentsdb => write!(f, "opentsdb"),
-            Channel::Loki => write!(f, "loki"),
-            Channel::Elasticsearch => write!(f, "elasticsearch"),
-            Channel::Jaeger => write!(f, "jaeger"),
-            Channel::Unknown => write!(f, "unknown"),
+            Channel::Mysql => "mysql",
+            Channel::Postgres => "postgres",
+            Channel::HttpSql => "httpsql",
+            Channel::Prometheus => "prometheus",
+            Channel::Otlp => "otlp",
+            Channel::Grpc => "grpc",
+            Channel::Influx => "influx",
+            Channel::Opentsdb => "opentsdb",
+            Channel::Loki => "loki",
+            Channel::Elasticsearch => "elasticsearch",
+            Channel::Jaeger => "jaeger",
+            Channel::Log => "log",
+            Channel::Promql => "promql",
+            Channel::Unknown => "unknown",
         }
     }
 }
@@ -494,6 +606,7 @@ impl Display for Channel {
 pub struct ConfigurationVariables {
     postgres_bytea_output: ArcSwap<PGByteaOutputValue>,
     pg_datestyle_format: ArcSwap<(PGDateTimeStyle, PGDateOrder)>,
+    allow_query_fallback: ArcSwap<bool>,
 }
 
 impl Clone for ConfigurationVariables {
@@ -501,6 +614,7 @@ impl Clone for ConfigurationVariables {
         Self {
             postgres_bytea_output: ArcSwap::new(self.postgres_bytea_output.load().clone()),
             pg_datestyle_format: ArcSwap::new(self.pg_datestyle_format.load().clone()),
+            allow_query_fallback: ArcSwap::new(self.allow_query_fallback.load().clone()),
         }
     }
 }
@@ -525,6 +639,14 @@ impl ConfigurationVariables {
     pub fn set_pg_datetime_style(&self, style: PGDateTimeStyle, order: PGDateOrder) {
         self.pg_datestyle_format.swap(Arc::new((style, order)));
     }
+
+    pub fn allow_query_fallback(&self) -> bool {
+        **self.allow_query_fallback.load()
+    }
+
+    pub fn set_allow_query_fallback(&self, allow: bool) {
+        self.allow_query_fallback.swap(Arc::new(allow));
+    }
 }
 
 #[cfg(test)]
@@ -541,6 +663,7 @@ mod test {
             Some("127.0.0.1:9000".parse().unwrap()),
             Channel::Mysql,
             Default::default(),
+            100,
         );
         // test user_info
         assert_eq!(session.user_info().username(), "greptime");
@@ -552,6 +675,7 @@ mod test {
         assert_eq!(client_addr.port(), 9000);
 
         assert_eq!("mysql[127.0.0.1:9000]", session.conn_info().to_string());
+        assert_eq!(100, session.process_id());
     }
 
     #[test]

@@ -30,10 +30,11 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::context::{SessionState, TaskContext};
 use datafusion::logical_expr::{ExprSchemable, LogicalPlan, UserDefinedLogicalNodeCore};
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExprRef};
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, Partitioning, PlanProperties,
-    RecordBatchStream, SendableRecordBatchStream,
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, RecordBatchStream,
+    SendableRecordBatchStream,
 };
 use datafusion::physical_planner::PhysicalPlanner;
 use datafusion::prelude::{col, lit, Expr};
@@ -112,7 +113,8 @@ impl EmptyMetric {
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(result_schema.clone()),
             Partitioning::UnknownPartitioning(1),
-            ExecutionMode::Bounded,
+            EmissionType::Incremental,
+            Boundedness::Bounded,
         ));
         Ok(Arc::new(EmptyMetricExec {
             start: self.start,
@@ -257,7 +259,11 @@ impl ExecutionPlan for EmptyMetricExec {
     }
 
     fn statistics(&self) -> DataFusionResult<Statistics> {
-        let estimated_row_num = (self.end - self.start) as f64 / self.interval as f64;
+        let estimated_row_num = if self.end > self.start {
+            (self.end - self.start) as f64 / self.interval as f64
+        } else {
+            0.0
+        };
         let total_byte_size = estimated_row_num * std::mem::size_of::<Millisecond>() as f64;
 
         Ok(Statistics {

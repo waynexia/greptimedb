@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use client::{OutputData, DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
-use common_meta::key::{RegionDistribution, TableMetadataManagerRef};
+use common_meta::key::{RegionDistribution, RegionRoleSet, TableMetadataManagerRef};
 use common_meta::peer::Peer;
 use common_query::Output;
 use common_recordbatch::RecordBatches;
@@ -32,10 +32,13 @@ use datatypes::vectors::{Helper, UInt64Vector};
 use frontend::error::Result as FrontendResult;
 use frontend::instance::Instance;
 use futures::future::BoxFuture;
+use meta_srv::error;
 use meta_srv::error::Result as MetaResult;
 use meta_srv::metasrv::SelectorContext;
-use meta_srv::procedure::region_migration::RegionMigrationProcedureTask;
-use meta_srv::selector::{Namespace, Selector, SelectorOptions};
+use meta_srv::procedure::region_migration::{
+    RegionMigrationProcedureTask, RegionMigrationTriggerReason,
+};
+use meta_srv::selector::{Selector, SelectorOptions};
 use servers::query_handler::sql::SqlQueryHandler;
 use session::context::{QueryContext, QueryContextRef};
 use store_api::storage::RegionId;
@@ -143,7 +146,7 @@ pub async fn test_region_migration(store_type: StorageType, endpoints: Vec<Strin
     let table_id = prepare_testing_table(&cluster).await;
 
     // Inserts data
-    let results = insert_values(&cluster.frontend, logical_timer).await;
+    let results = insert_values(cluster.fe_instance(), logical_timer).await;
     logical_timer += 1000;
     for result in results {
         assert!(matches!(result.unwrap().data, OutputData::AffectedRows(1)));
@@ -165,22 +168,27 @@ pub async fn test_region_migration(store_type: StorageType, endpoints: Vec<Strin
         to_regions
     );
 
-    let region_id = RegionId::new(table_id, from_regions[0]);
+    let region_id = RegionId::new(table_id, from_regions.leader_regions[0]);
     // Trigger region migration.
     let procedure = region_migration_manager
         .submit_procedure(RegionMigrationProcedureTask::new(
-            0,
             region_id,
             peer_factory(from_peer_id),
             peer_factory(to_peer_id),
             Duration::from_millis(1000),
+            RegionMigrationTriggerReason::Manual,
         ))
         .await
         .unwrap();
     info!("Started region procedure: {}!", procedure.unwrap());
 
     // Prepares expected region distribution.
-    to_regions.extend(from_regions);
+    to_regions
+        .leader_regions
+        .extend(from_regions.leader_regions);
+    to_regions
+        .follower_regions
+        .extend(from_regions.follower_regions);
     // Keeps asc order.
     to_regions.sort();
     distribution.insert(to_peer_id, to_regions);
@@ -205,26 +213,26 @@ pub async fn test_region_migration(store_type: StorageType, endpoints: Vec<Strin
     .await;
 
     // Inserts more table.
-    let results = insert_values(&cluster.frontend, logical_timer).await;
+    let results = insert_values(cluster.fe_instance(), logical_timer).await;
     for result in results {
         assert!(matches!(result.unwrap().data, OutputData::AffectedRows(1)));
     }
 
     // Asserts the writes.
-    assert_values(&cluster.frontend).await;
+    assert_values(cluster.fe_instance()).await;
 
     // Triggers again.
-    let procedure = region_migration_manager
+    let err = region_migration_manager
         .submit_procedure(RegionMigrationProcedureTask::new(
-            0,
             region_id,
             peer_factory(from_peer_id),
             peer_factory(to_peer_id),
             Duration::from_millis(1000),
+            RegionMigrationTriggerReason::Manual,
         ))
         .await
-        .unwrap();
-    assert!(procedure.is_none());
+        .unwrap_err();
+    assert!(matches!(err, error::Error::RegionMigrated { .. }));
 }
 
 /// A naive metric table region migration test by SQL function
@@ -280,7 +288,7 @@ pub async fn test_metric_table_region_migration_by_sql(
 
     // Inserts values
     run_sql(
-        &cluster.frontend,
+        cluster.fe_instance(),
         r#"INSERT INTO t1 VALUES ('host1',0, 0), ('host2', 1, 1);"#,
         query_ctx.clone(),
     )
@@ -288,7 +296,7 @@ pub async fn test_metric_table_region_migration_by_sql(
     .unwrap();
 
     run_sql(
-        &cluster.frontend,
+        cluster.fe_instance(),
         r#"INSERT INTO t2 VALUES ('job1', 0, 0), ('job2', 1, 1);"#,
         query_ctx.clone(),
     )
@@ -301,10 +309,10 @@ pub async fn test_metric_table_region_migration_by_sql(
     let (from_peer_id, from_regions) = distribution.pop_first().unwrap();
     info!(
         "Selecting from peer: {from_peer_id}, and regions: {:?}",
-        from_regions[0]
+        from_regions.leader_regions[0]
     );
     let to_peer_id = (from_peer_id + 1) % 3;
-    let region_id = RegionId::new(table_id, from_regions[0]);
+    let region_id = RegionId::new(table_id, from_regions.leader_regions[0]);
     // Trigger region migration.
     let procedure_id =
         trigger_migration_by_sql(&cluster, region_id.as_u64(), from_peer_id, to_peer_id).await;
@@ -312,7 +320,7 @@ pub async fn test_metric_table_region_migration_by_sql(
     info!("Started region procedure: {}!", procedure_id);
 
     // Waits condition by checking procedure state
-    let frontend = cluster.frontend.clone();
+    let frontend = cluster.fe_instance().clone();
     wait_condition(
         Duration::from_secs(10),
         Box::pin(async move {
@@ -332,6 +340,7 @@ pub async fn test_metric_table_region_migration_by_sql(
 
     let result = cluster
         .frontend
+        .instance
         .do_query("select * from t1", query_ctx.clone())
         .await
         .remove(0);
@@ -347,6 +356,7 @@ pub async fn test_metric_table_region_migration_by_sql(
 
     let result = cluster
         .frontend
+        .instance
         .do_query("select * from t2", query_ctx)
         .await
         .remove(0);
@@ -411,7 +421,7 @@ pub async fn test_region_migration_by_sql(store_type: StorageType, endpoints: Ve
     let table_id = prepare_testing_table(&cluster).await;
 
     // Inserts data
-    let results = insert_values(&cluster.frontend, logical_timer).await;
+    let results = insert_values(cluster.fe_instance(), logical_timer).await;
     logical_timer += 1000;
     for result in results {
         assert!(matches!(result.unwrap().data, OutputData::AffectedRows(1)));
@@ -435,7 +445,7 @@ pub async fn test_region_migration_by_sql(store_type: StorageType, endpoints: Ve
         to_regions
     );
 
-    let region_id = RegionId::new(table_id, from_regions[0]);
+    let region_id = RegionId::new(table_id, from_regions.leader_regions[0]);
     // Trigger region migration.
     let procedure_id =
         trigger_migration_by_sql(&cluster, region_id.as_u64(), from_peer_id, to_peer_id).await;
@@ -443,7 +453,7 @@ pub async fn test_region_migration_by_sql(store_type: StorageType, endpoints: Ve
     info!("Started region procedure: {}!", procedure_id);
 
     // Waits condition by checking procedure state
-    let frontend = cluster.frontend.clone();
+    let frontend = cluster.fe_instance().clone();
     wait_condition(
         Duration::from_secs(10),
         Box::pin(async move {
@@ -462,26 +472,26 @@ pub async fn test_region_migration_by_sql(store_type: StorageType, endpoints: Ve
     .await;
 
     // Inserts more table.
-    let results = insert_values(&cluster.frontend, logical_timer).await;
+    let results = insert_values(cluster.fe_instance(), logical_timer).await;
     for result in results {
         assert!(matches!(result.unwrap().data, OutputData::AffectedRows(1)));
     }
 
     // Asserts the writes.
-    assert_values(&cluster.frontend).await;
+    assert_values(cluster.fe_instance()).await;
 
     // Triggers again.
-    let procedure = region_migration_manager
+    let err = region_migration_manager
         .submit_procedure(RegionMigrationProcedureTask::new(
-            0,
             region_id,
             peer_factory(from_peer_id),
             peer_factory(to_peer_id),
             Duration::from_millis(1000),
+            RegionMigrationTriggerReason::Manual,
         ))
         .await
-        .unwrap();
-    assert!(procedure.is_none());
+        .unwrap_err();
+    assert!(matches!(err, error::Error::RegionMigrated { .. }));
 
     let new_distribution = find_region_distribution_by_sql(&cluster, TEST_TABLE_NAME).await;
 
@@ -542,7 +552,7 @@ pub async fn test_region_migration_multiple_regions(
     let table_id = prepare_testing_table(&cluster).await;
 
     // Inserts data
-    let results = insert_values(&cluster.frontend, logical_timer).await;
+    let results = insert_values(cluster.fe_instance(), logical_timer).await;
     logical_timer += 1000;
     for result in results {
         assert!(matches!(result.unwrap().data, OutputData::AffectedRows(1)));
@@ -558,12 +568,12 @@ pub async fn test_region_migration_multiple_regions(
     let (peer_2, peer_2_regions) = distribution.pop_first().unwrap();
 
     // Picks the peer only contains as from peer.
-    let ((from_peer_id, from_regions), (to_peer_id, mut to_regions)) = if peer_1_regions.len() == 1
-    {
-        ((peer_1, peer_1_regions), (peer_2, peer_2_regions))
-    } else {
-        ((peer_2, peer_2_regions), (peer_1, peer_1_regions))
-    };
+    let ((from_peer_id, from_regions), (to_peer_id, mut to_regions)) =
+        if peer_1_regions.leader_regions.len() == 1 {
+            ((peer_1, peer_1_regions), (peer_2, peer_2_regions))
+        } else {
+            ((peer_2, peer_2_regions), (peer_1, peer_1_regions))
+        };
 
     info!(
         "Selecting from peer: {from_peer_id}, and regions: {:?}",
@@ -574,22 +584,27 @@ pub async fn test_region_migration_multiple_regions(
         to_regions
     );
 
-    let region_id = RegionId::new(table_id, from_regions[0]);
+    let region_id = RegionId::new(table_id, from_regions.leader_regions[0]);
     // Trigger region migration.
     let procedure = region_migration_manager
         .submit_procedure(RegionMigrationProcedureTask::new(
-            0,
             region_id,
             peer_factory(from_peer_id),
             peer_factory(to_peer_id),
             Duration::from_millis(1000),
+            RegionMigrationTriggerReason::Manual,
         ))
         .await
         .unwrap();
     info!("Started region procedure: {}!", procedure.unwrap());
 
     // Prepares expected region distribution.
-    to_regions.extend(from_regions);
+    to_regions
+        .leader_regions
+        .extend(from_regions.leader_regions);
+    to_regions
+        .follower_regions
+        .extend(from_regions.follower_regions);
     // Keeps asc order.
     to_regions.sort();
     distribution.insert(to_peer_id, to_regions);
@@ -614,26 +629,26 @@ pub async fn test_region_migration_multiple_regions(
     .await;
 
     // Inserts more table.
-    let results = insert_values(&cluster.frontend, logical_timer).await;
+    let results = insert_values(cluster.fe_instance(), logical_timer).await;
     for result in results {
         assert!(matches!(result.unwrap().data, OutputData::AffectedRows(1)));
     }
 
     // Asserts the writes.
-    assert_values(&cluster.frontend).await;
+    assert_values(cluster.fe_instance()).await;
 
     // Triggers again.
-    let procedure = region_migration_manager
+    let err = region_migration_manager
         .submit_procedure(RegionMigrationProcedureTask::new(
-            0,
             region_id,
             peer_factory(from_peer_id),
             peer_factory(to_peer_id),
             Duration::from_millis(1000),
+            RegionMigrationTriggerReason::Manual,
         ))
         .await
-        .unwrap();
-    assert!(procedure.is_none());
+        .unwrap_err();
+    assert!(matches!(err, error::Error::RegionMigrated { .. }));
 }
 
 /// A region migration test for a region server contains all regions of the table.
@@ -687,7 +702,7 @@ pub async fn test_region_migration_all_regions(store_type: StorageType, endpoint
     let table_id = prepare_testing_table(&cluster).await;
 
     // Inserts data
-    let results = insert_values(&cluster.frontend, logical_timer).await;
+    let results = insert_values(cluster.fe_instance(), logical_timer).await;
     logical_timer += 1000;
     for result in results {
         assert!(matches!(result.unwrap().data, OutputData::AffectedRows(1)));
@@ -701,7 +716,7 @@ pub async fn test_region_migration_all_regions(store_type: StorageType, endpoint
     let region_migration_manager = cluster.metasrv.region_migration_manager();
     let (from_peer_id, mut from_regions) = distribution.pop_first().unwrap();
     let to_peer_id = 1;
-    let mut to_regions = Vec::new();
+    let mut to_regions = RegionRoleSet::default();
     info!(
         "Selecting from peer: {from_peer_id}, and regions: {:?}",
         from_regions
@@ -711,22 +726,24 @@ pub async fn test_region_migration_all_regions(store_type: StorageType, endpoint
         to_regions
     );
 
-    let region_id = RegionId::new(table_id, from_regions[0]);
+    let region_id = RegionId::new(table_id, from_regions.leader_regions[0]);
     // Trigger region migration.
     let procedure = region_migration_manager
         .submit_procedure(RegionMigrationProcedureTask::new(
-            0,
             region_id,
             peer_factory(from_peer_id),
             peer_factory(to_peer_id),
             Duration::from_millis(1000),
+            RegionMigrationTriggerReason::Manual,
         ))
         .await
         .unwrap();
     info!("Started region procedure: {}!", procedure.unwrap());
 
     // Prepares expected region distribution.
-    to_regions.push(from_regions.remove(0));
+    to_regions
+        .leader_regions
+        .push(from_regions.leader_regions.remove(0));
     // Keeps asc order.
     to_regions.sort();
     distribution.insert(to_peer_id, to_regions);
@@ -752,26 +769,26 @@ pub async fn test_region_migration_all_regions(store_type: StorageType, endpoint
     .await;
 
     // Inserts more table.
-    let results = insert_values(&cluster.frontend, logical_timer).await;
+    let results = insert_values(cluster.fe_instance(), logical_timer).await;
     for result in results {
         assert!(matches!(result.unwrap().data, OutputData::AffectedRows(1)));
     }
 
     // Asserts the writes.
-    assert_values(&cluster.frontend).await;
+    assert_values(cluster.fe_instance()).await;
 
     // Triggers again.
-    let procedure = region_migration_manager
+    let err = region_migration_manager
         .submit_procedure(RegionMigrationProcedureTask::new(
-            0,
             region_id,
             peer_factory(from_peer_id),
             peer_factory(to_peer_id),
             Duration::from_millis(1000),
+            RegionMigrationTriggerReason::Manual,
         ))
         .await
-        .unwrap();
-    assert!(procedure.is_none());
+        .unwrap_err();
+    assert!(matches!(err, error::Error::RegionMigrated { .. }));
 }
 
 pub async fn test_region_migration_incorrect_from_peer(
@@ -827,7 +844,7 @@ pub async fn test_region_migration_incorrect_from_peer(
     let table_id = prepare_testing_table(&cluster).await;
 
     // Inserts data
-    let results = insert_values(&cluster.frontend, logical_timer).await;
+    let results = insert_values(cluster.fe_instance(), logical_timer).await;
     for result in results {
         assert!(matches!(result.unwrap().data, OutputData::AffectedRows(1)));
     }
@@ -842,18 +859,18 @@ pub async fn test_region_migration_incorrect_from_peer(
     // Trigger region migration.
     let err = region_migration_manager
         .submit_procedure(RegionMigrationProcedureTask::new(
-            0,
             region_id,
             peer_factory(5),
             peer_factory(1),
             Duration::from_millis(1000),
+            RegionMigrationTriggerReason::Manual,
         ))
         .await
         .unwrap_err();
 
     assert!(matches!(
         err,
-        meta_srv::error::Error::InvalidArguments { .. }
+        meta_srv::error::Error::LeaderPeerChanged { .. }
     ));
 }
 
@@ -910,7 +927,7 @@ pub async fn test_region_migration_incorrect_region_id(
     let table_id = prepare_testing_table(&cluster).await;
 
     // Inserts data
-    let results = insert_values(&cluster.frontend, logical_timer).await;
+    let results = insert_values(cluster.fe_instance(), logical_timer).await;
     for result in results {
         assert!(matches!(result.unwrap().data, OutputData::AffectedRows(1)));
     }
@@ -925,11 +942,11 @@ pub async fn test_region_migration_incorrect_region_id(
     // Trigger region migration.
     let err = region_migration_manager
         .submit_procedure(RegionMigrationProcedureTask::new(
-            0,
             region_id,
             peer_factory(2),
             peer_factory(1),
             Duration::from_millis(1000),
+            RegionMigrationTriggerReason::Manual,
         ))
         .await
         .unwrap_err();
@@ -957,7 +974,6 @@ impl Selector for ConstNodeSelector {
 
     async fn select(
         &self,
-        _ns: Namespace,
         _ctx: &Self::Context,
         _opts: SelectorOptions,
     ) -> MetaResult<Self::Output> {
@@ -996,22 +1012,35 @@ async fn assert_values(instance: &Arc<Instance>) {
 
 async fn prepare_testing_metric_table(cluster: &GreptimeDbCluster) -> TableId {
     let sql = r#"CREATE TABLE phy (ts timestamp time index, val double) engine=metric with ("physical_metric_table" = "");"#;
-    let mut result = cluster.frontend.do_query(sql, QueryContext::arc()).await;
+    let mut result = cluster
+        .frontend
+        .instance
+        .do_query(sql, QueryContext::arc())
+        .await;
     let output = result.remove(0).unwrap();
     assert!(matches!(output.data, OutputData::AffectedRows(0)));
 
     let sql = r#"CREATE TABLE t1 (ts timestamp time index, val double, host string primary key) engine = metric with ("on_physical_table" = "phy");"#;
-    let mut result = cluster.frontend.do_query(sql, QueryContext::arc()).await;
+    let mut result = cluster
+        .frontend
+        .instance
+        .do_query(sql, QueryContext::arc())
+        .await;
     let output = result.remove(0).unwrap();
     assert!(matches!(output.data, OutputData::AffectedRows(0)));
 
     let sql = r#"CREATE TABLE t2 (ts timestamp time index, job string primary key, val double) engine = metric with ("on_physical_table" = "phy");"#;
-    let mut result = cluster.frontend.do_query(sql, QueryContext::arc()).await;
+    let mut result = cluster
+        .frontend
+        .instance
+        .do_query(sql, QueryContext::arc())
+        .await;
     let output = result.remove(0).unwrap();
     assert!(matches!(output.data, OutputData::AffectedRows(0)));
 
     let table = cluster
         .frontend
+        .instance
         .catalog_manager()
         .table(DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, "phy", None)
         .await
@@ -1032,12 +1061,17 @@ async fn prepare_testing_table(cluster: &GreptimeDbCluster) -> TableId {
         i > 50
     )"
     );
-    let mut result = cluster.frontend.do_query(&sql, QueryContext::arc()).await;
+    let mut result = cluster
+        .frontend
+        .instance
+        .do_query(&sql, QueryContext::arc())
+        .await;
     let output = result.remove(0).unwrap();
     assert!(matches!(output.data, OutputData::AffectedRows(0)));
 
     let table = cluster
         .frontend
+        .instance
         .catalog_manager()
         .table(
             DEFAULT_CATALOG_NAME,
@@ -1071,7 +1105,7 @@ async fn find_region_distribution_by_sql(
     let query_ctx = QueryContext::arc();
 
     let OutputData::Stream(stream) = run_sql(
-        &cluster.frontend,
+        cluster.fe_instance(),
         &format!(
             r#"select b.peer_id as datanode_id,
                            a.greptime_partition_id as region_id
@@ -1109,7 +1143,7 @@ async fn find_region_distribution_by_sql(
             distribution
                 .entry(datanode_id)
                 .or_default()
-                .push(region_id.region_number());
+                .add_leader_region(region_id.region_number());
         }
     }
 
@@ -1124,7 +1158,7 @@ async fn trigger_migration_by_sql(
     to_peer_id: u64,
 ) -> String {
     let OutputData::RecordBatches(recordbatches) = run_sql(
-        &cluster.frontend,
+        cluster.fe_instance(),
         &format!("admin migrate_region({region_id}, {from_peer_id}, {to_peer_id})"),
         QueryContext::arc(),
     )
