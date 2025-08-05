@@ -15,12 +15,12 @@
 use std::collections::BTreeSet;
 use std::ops::Range;
 
-use fastbloom::BloomFilter;
 use greptime_proto::v1::index::BloomFilterMeta;
 use itertools::Itertools;
 
 use crate::bloom_filter::error::Result;
 use crate::bloom_filter::reader::BloomFilterReader;
+use crate::bloom_filter::BloomFilter;
 use crate::Bytes;
 
 /// `InListPredicate` contains a list of acceptable values. A value needs to match at least

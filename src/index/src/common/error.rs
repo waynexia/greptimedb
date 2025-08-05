@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Common error types shared by probabilistic filters
+
 use std::any::Any;
 
 use common_error::ext::{BoxedError, ErrorExt};
@@ -19,10 +21,11 @@ use common_error::status_code::StatusCode;
 use common_macro::stack_trace_debug;
 use snafu::{Location, Snafu};
 
+/// Common error variants shared by all filter implementations
 #[derive(Snafu)]
 #[snafu(visibility(pub))]
 #[stack_trace_debug]
-pub enum Error {
+pub enum CommonFilterError {
     #[snafu(display("IO error"))]
     Io {
         #[snafu(source)]
@@ -46,14 +49,14 @@ pub enum Error {
         location: Location,
     },
 
-    #[snafu(display("File size too small for bloom filter"))]
+    #[snafu(display("File size {size} is too small for filter"))]
     FileSizeTooSmall {
         size: u64,
         #[snafu(implicit)]
         location: Location,
     },
 
-    #[snafu(display("Unexpected bloom filter meta size"))]
+    #[snafu(display("Unexpected filter meta size: max {max_meta_size}, actual {actual_meta_size}"))]
     UnexpectedMetaSize {
         max_meta_size: u64,
         actual_meta_size: u64,
@@ -74,36 +77,18 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
-
-    #[snafu(display("Failed to serialize bloom filter"))]
-    SerializeBloomFilter {
-        #[snafu(source)]
-        error: bincode::Error,
-        #[snafu(implicit)]
-        location: Location,
-    },
-
-    #[snafu(display("Failed to deserialize bloom filter"))]
-    DeserializeBloomFilter {
-        #[snafu(source)]
-        error: bincode::Error,
-        #[snafu(implicit)]
-        location: Location,
-    },
 }
 
-impl ErrorExt for Error {
+impl ErrorExt for CommonFilterError {
     fn status_code(&self) -> StatusCode {
-        use Error::*;
+        use CommonFilterError::*;
 
         match self {
             Io { .. }
             | FileSizeTooSmall { .. }
             | UnexpectedMetaSize { .. }
             | DecodeProto { .. }
-            | InvalidIntermediateMagic { .. }
-            | SerializeBloomFilter { .. }
-            | DeserializeBloomFilter { .. } => StatusCode::Unexpected,
+            | InvalidIntermediateMagic { .. } => StatusCode::Unexpected,
 
             Intermediate { source, .. } => source.status_code(),
             External { source, .. } => source.status_code(),
@@ -115,4 +100,4 @@ impl ErrorExt for Error {
     }
 }
 
-pub type Result<T> = std::result::Result<T, Error>;
+pub type CommonResult<T> = std::result::Result<T, CommonFilterError>;

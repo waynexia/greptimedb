@@ -17,21 +17,11 @@ use std::ops::Range;
 use async_trait::async_trait;
 use bytes::Bytes;
 use common_base::range_read::RangeReader;
-use fastbloom::BloomFilter;
 use greptime_proto::v1::index::{BloomFilterLoc, BloomFilterMeta};
-use prost::Message;
-use snafu::{ensure, ResultExt};
 
-use crate::bloom_filter::error::{
-    DecodeProtoSnafu, FileSizeTooSmallSnafu, IoSnafu, Result, UnexpectedMetaSizeSnafu,
-};
-use crate::bloom_filter::SEED;
-
-/// Minimum size of the bloom filter, which is the size of the length of the bloom filter.
-const BLOOM_META_LEN_SIZE: u64 = 4;
-
-/// Default prefetch size of bloom filter meta.
-pub const DEFAULT_PREFETCH_SIZE: u64 = 8192; // 8KiB
+use crate::bloom_filter::error::{Error, Result};
+use crate::bloom_filter::BloomFilter;
+use crate::common::reader::{FilterReader, FilterReaderImpl};
 
 /// `BloomFilterReader` reads the bloom filter from the file.
 #[async_trait]
@@ -60,10 +50,8 @@ pub trait BloomFilterReader: Sync {
             .chunks_exact(std::mem::size_of::<u64>())
             .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
-        let bm = BloomFilter::from_vec(vec)
-            .seed(&SEED)
-            .expected_items(loc.element_count as _);
-        Ok(bm)
+        let bf = BloomFilter::from_vec(vec, loc.element_count as usize);
+        Ok(bf)
     }
 
     async fn bloom_filter_vec(&self, locs: &[BloomFilterLoc]) -> Result<Vec<BloomFilter>> {
@@ -79,10 +67,8 @@ pub trait BloomFilterReader: Sync {
                 .chunks_exact(std::mem::size_of::<u64>())
                 .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
                 .collect();
-            let bm = BloomFilter::from_vec(vec)
-                .seed(&SEED)
-                .expected_items(loc.element_count as _);
-            result.push(bm);
+            let bf = BloomFilter::from_vec(vec, loc.element_count as usize);
+            result.push(bf);
         }
 
         Ok(result)
@@ -90,122 +76,108 @@ pub trait BloomFilterReader: Sync {
 }
 
 /// `BloomFilterReaderImpl` reads the bloom filter from the file.
+/// 
+/// This implementation delegates to the common FilterReaderImpl for shared functionality
+/// while maintaining backward compatibility with the existing BloomFilter API.
 pub struct BloomFilterReaderImpl<R: RangeReader> {
-    /// The underlying reader.
-    reader: R,
+    /// The underlying generic reader.
+    inner: FilterReaderImpl<R, BloomFilter>,
 }
 
 impl<R: RangeReader> BloomFilterReaderImpl<R> {
     /// Creates a new `BloomFilterReaderImpl` with the given reader.
     pub fn new(reader: R) -> Self {
-        Self { reader }
+        Self {
+            inner: FilterReaderImpl::new(reader),
+        }
     }
 }
 
 #[async_trait]
 impl<R: RangeReader> BloomFilterReader for BloomFilterReaderImpl<R> {
     async fn range_read(&self, offset: u64, size: u32) -> Result<Bytes> {
-        self.reader
-            .read(offset..offset + size as u64)
+        self.inner
+            .range_read(offset, size)
             .await
-            .context(IoSnafu)
+            .map_err(convert_common_error)
     }
 
     async fn read_vec(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
-        self.reader.read_vec(ranges).await.context(IoSnafu)
+        self.inner
+            .read_vec(ranges)
+            .await
+            .map_err(convert_common_error)
     }
 
     async fn metadata(&self) -> Result<BloomFilterMeta> {
-        let metadata = self.reader.metadata().await.context(IoSnafu)?;
-        let file_size = metadata.content_length;
-
-        let mut meta_reader =
-            BloomFilterMetaReader::new(&self.reader, file_size, Some(DEFAULT_PREFETCH_SIZE));
-        meta_reader.metadata().await
-    }
-}
-
-/// `BloomFilterMetaReader` reads the metadata of the bloom filter.
-struct BloomFilterMetaReader<R: RangeReader> {
-    reader: R,
-    file_size: u64,
-    prefetch_size: u64,
-}
-
-impl<R: RangeReader> BloomFilterMetaReader<R> {
-    pub fn new(reader: R, file_size: u64, prefetch_size: Option<u64>) -> Self {
-        Self {
-            reader,
-            file_size,
-            prefetch_size: prefetch_size
-                .unwrap_or(BLOOM_META_LEN_SIZE)
-                .max(BLOOM_META_LEN_SIZE),
-        }
-    }
-
-    /// Reads the metadata of the bloom filter.
-    ///
-    /// It will first prefetch some bytes from the end of the file,
-    /// then parse the metadata from the prefetch bytes.
-    pub async fn metadata(&mut self) -> Result<BloomFilterMeta> {
-        ensure!(
-            self.file_size >= BLOOM_META_LEN_SIZE,
-            FileSizeTooSmallSnafu {
-                size: self.file_size,
-            }
-        );
-
-        let meta_start = self.file_size.saturating_sub(self.prefetch_size);
-        let suffix = self
-            .reader
-            .read(meta_start..self.file_size)
+        self.inner
+            .metadata()
             .await
-            .context(IoSnafu)?;
-        let suffix_len = suffix.len();
-        let length = u32::from_le_bytes(Self::read_tailing_four_bytes(&suffix)?) as u64;
-        self.validate_meta_size(length)?;
-
-        if length > suffix_len as u64 - BLOOM_META_LEN_SIZE {
-            let metadata_start = self.file_size - length - BLOOM_META_LEN_SIZE;
-            let meta = self
-                .reader
-                .read(metadata_start..self.file_size - BLOOM_META_LEN_SIZE)
-                .await
-                .context(IoSnafu)?;
-            BloomFilterMeta::decode(meta).context(DecodeProtoSnafu)
-        } else {
-            let metadata_start = self.file_size - length - BLOOM_META_LEN_SIZE - meta_start;
-            let meta = &suffix[metadata_start as usize..suffix_len - BLOOM_META_LEN_SIZE as usize];
-            BloomFilterMeta::decode(meta).context(DecodeProtoSnafu)
-        }
+            .map_err(convert_common_error)
     }
 
-    fn read_tailing_four_bytes(suffix: &[u8]) -> Result<[u8; 4]> {
-        let suffix_len = suffix.len();
-        ensure!(
-            suffix_len >= 4,
-            FileSizeTooSmallSnafu {
-                size: suffix_len as u64
-            }
-        );
-        let mut bytes = [0; 4];
-        bytes.copy_from_slice(&suffix[suffix_len - 4..suffix_len]);
-
-        Ok(bytes)
+    async fn bloom_filter(&self, loc: &BloomFilterLoc) -> Result<BloomFilter> {
+        // Use custom deserialization with element_count parameter
+        self.inner
+            .filter_with_params(
+                loc,
+                loc.element_count as usize,
+                |bytes, element_count| {
+                    let vec = bytes
+                        .chunks_exact(std::mem::size_of::<u64>())
+                        .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+                        .collect();
+                    Ok(BloomFilter::from_vec(vec, element_count))
+                },
+            )
+            .await
+            .map_err(convert_common_error)
     }
 
-    fn validate_meta_size(&self, length: u64) -> Result<()> {
-        let max_meta_size = self.file_size - BLOOM_META_LEN_SIZE;
-        ensure!(
-            length <= max_meta_size,
-            UnexpectedMetaSizeSnafu {
-                max_meta_size,
-                actual_meta_size: length,
-            }
-        );
-        Ok(())
+    async fn bloom_filter_vec(&self, locs: &[BloomFilterLoc]) -> Result<Vec<BloomFilter>> {
+        // Use custom vector deserialization with element_count parameter  
+        self.inner
+            .filter_vec_with_params(
+                locs,
+                |loc| loc.element_count as usize,
+                |bytes, element_count| {
+                    let vec = bytes
+                        .chunks_exact(std::mem::size_of::<u64>())
+                        .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+                        .collect();
+                    Ok(BloomFilter::from_vec(vec, element_count))
+                },
+            )
+            .await
+            .map_err(convert_common_error)
     }
 }
+
+/// Helper function to convert common filter errors to bloom filter errors
+fn convert_common_error(e: crate::common::CommonFilterError) -> Error {
+    match e {
+        crate::common::CommonFilterError::Io { error, location } => Error::Io { error, location },
+        crate::common::CommonFilterError::FileSizeTooSmall { size, location } => {
+            Error::FileSizeTooSmall { size, location }
+        }
+        crate::common::CommonFilterError::UnexpectedMetaSize { max_meta_size, actual_meta_size, location } => {
+            Error::UnexpectedMetaSize { max_meta_size, actual_meta_size, location }
+        }
+        crate::common::CommonFilterError::DecodeProto { error, location } => {
+            Error::DecodeProto { error, location }
+        }
+        crate::common::CommonFilterError::InvalidIntermediateMagic { invalid, location } => {
+            Error::InvalidIntermediateMagic { invalid, location }
+        }
+        crate::common::CommonFilterError::Intermediate { source, location } => {
+            Error::Intermediate { source, location }
+        }
+        crate::common::CommonFilterError::External { source, location } => {
+            Error::External { source, location }
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -249,26 +221,23 @@ mod tests {
     #[tokio::test]
     async fn test_bloom_filter_meta_reader() {
         let bytes = mock_bloom_filter_bytes().await;
-        let file_size = bytes.len() as u64;
 
-        for prefetch in [0u64, file_size / 2, file_size, file_size + 10] {
-            let mut reader =
-                BloomFilterMetaReader::new(bytes.clone(), file_size as _, Some(prefetch));
-            let meta = reader.metadata().await.unwrap();
+        // Use BloomFilterReaderImpl instead of BloomFilterMetaReader
+        let reader = BloomFilterReaderImpl::new(bytes);
+        let meta = reader.metadata().await.unwrap();
 
-            assert_eq!(meta.rows_per_segment, 2);
-            assert_eq!(meta.segment_count, 2);
-            assert_eq!(meta.row_count, 3);
-            assert_eq!(meta.bloom_filter_locs.len(), 2);
+        assert_eq!(meta.rows_per_segment, 2);
+        assert_eq!(meta.segment_count, 2);
+        assert_eq!(meta.row_count, 3);
+        assert_eq!(meta.bloom_filter_locs.len(), 2);
 
-            assert_eq!(meta.bloom_filter_locs[0].offset, 0);
-            assert_eq!(meta.bloom_filter_locs[0].element_count, 4);
-            assert_eq!(
-                meta.bloom_filter_locs[1].offset,
-                meta.bloom_filter_locs[0].size
-            );
-            assert_eq!(meta.bloom_filter_locs[1].element_count, 2);
-        }
+        assert_eq!(meta.bloom_filter_locs[0].offset, 0);
+        assert_eq!(meta.bloom_filter_locs[0].element_count, 4);
+        assert_eq!(
+            meta.bloom_filter_locs[1].offset,
+            meta.bloom_filter_locs[0].size
+        );
+        assert_eq!(meta.bloom_filter_locs[1].element_count, 2);
     }
 
     #[tokio::test]

@@ -32,6 +32,7 @@ use common_base::bytes::Bytes;
 use snafu::ResultExt;
 use xorf::{BinaryFuse8, Filter};
 
+use crate::common::{CommonResult, ProbabilisticFilter};
 use crate::xor_filter::error::{
     CreateXorFilterSnafu, DeserializeXorFilterSnafu, Result, SerializeXorFilterSnafu,
 };
@@ -97,6 +98,54 @@ impl PartialEq for XorFilter {
 
 impl AsRef<dyn Any> for XorFilter {
     fn as_ref(&self) -> &dyn Any {
+        self
+    }
+}
+
+impl ProbabilisticFilter for XorFilter {
+    fn contains(&self, key: u64) -> bool {
+        // Call the inner filter's contains method directly
+        self.filter.contains(&key)
+    }
+
+    fn serialize(&self) -> CommonResult<Bytes> {
+        // Use bincode directly to avoid recursive calls
+        let bytes = bincode::serialize(&self.filter).map_err(|e| {
+            crate::common::CommonFilterError::External {
+                source: common_error::ext::BoxedError::new(
+                    crate::xor_filter::error::Error::SerializeXorFilter {
+                        error: e,
+                        location: snafu::Location::new(file!(), line!(), 0),
+                    }
+                ),
+                location: snafu::Location::new(file!(), line!(), 0),
+            }
+        })?;
+        Ok(Bytes::from(bytes))
+    }
+
+    fn deserialize(bytes: &[u8]) -> CommonResult<Self> {
+        // Use bincode directly to avoid recursive calls
+        let filter: BinaryFuse8 = bincode::deserialize(bytes).map_err(|e| {
+            crate::common::CommonFilterError::External {
+                source: common_error::ext::BoxedError::new(
+                    crate::xor_filter::error::Error::DeserializeXorFilter {
+                        error: e,
+                        location: snafu::Location::new(file!(), line!(), 0),
+                    }
+                ),
+                location: snafu::Location::new(file!(), line!(), 0),
+            }
+        })?;
+        Ok(Self { filter })
+    }
+
+    fn memory_usage(&self) -> usize {
+        // Calculate memory usage directly to avoid recursive calls
+        std::mem::size_of::<BinaryFuse8>()
+    }
+
+    fn as_any(&self) -> &dyn Any {
         self
     }
 }

@@ -14,7 +14,7 @@
 
 use std::ops::Range;
 
-use greptime_proto::v1::index::XorFilterMeta;
+use greptime_proto::v1::index::BloomFilterMeta as XorFilterMeta;
 use itertools::Itertools;
 
 use crate::xor_filter::error::Result;
@@ -48,7 +48,7 @@ impl XorFilterApplier {
         let deduped_locs = locs
             .iter()
             .dedup()
-            .map(|i| self.meta.xor_filter_locs[*i as usize])
+            .map(|i| self.meta.bloom_filter_locs[*i as usize])
             .collect::<Vec<_>>();
         let xfs = self.reader.xor_filter_vec(&deduped_locs).await?;
 
@@ -56,7 +56,7 @@ impl XorFilterApplier {
         for ((_, mut group), filter) in locs
             .iter()
             .zip(start_seg..end_seg)
-            .group_by(|(x, _)| **x)
+            .chunk_by(|(x, _)| **x)
             .into_iter()
             .zip(xfs.iter())
         {
@@ -90,12 +90,10 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
 
-    use arrow_array::UInt64Array;
     use futures::io::Cursor;
 
     use super::*;
     use crate::external_provider::MockExternalTempFileProvider;
-    use crate::value_hasher::ArrayValueHasher;
     use crate::xor_filter::creator::{XorFilterCreator, XorFilterSegmentBuilder};
     use crate::xor_filter::reader::XorFilterReaderImpl;
 
@@ -109,8 +107,6 @@ mod tests {
             Arc::new(AtomicUsize::new(0)),
             None,
         );
-
-        let hasher = ArrayValueHasher::default();
 
         // Segment 0: values 1-4
         let mut segment_builder = XorFilterSegmentBuilder::new();

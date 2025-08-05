@@ -86,7 +86,7 @@ impl Decoder for IntermediateXorFilterCodecV1 {
             return Ok(None);
         }
 
-        let keys_count = u64::from_le_bytes(s[0..u64_size].try_into().unwrap()) as usize;
+        let _keys_count = u64::from_le_bytes(s[0..u64_size].try_into().unwrap()) as usize;
         let keys_size = u64::from_le_bytes(s[u64_size..n_size].try_into().unwrap()) as usize;
 
         if s.len() < n_size + keys_size {

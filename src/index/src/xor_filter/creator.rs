@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use asynchronous_codec::{FramedRead, FramedWrite};
 use futures::{stream, AsyncWrite, AsyncWriteExt, Stream, StreamExt};
-use greptime_proto::v1::index::{XorFilterLoc, XorFilterMeta};
+use greptime_proto::v1::index::{BloomFilterLoc as XorFilterLoc, BloomFilterMeta as XorFilterMeta};
 use prost::Message;
 use snafu::ResultExt;
 
@@ -376,7 +376,7 @@ impl XorFilterCreator {
         if self.accumulated_row_count % self.rows_per_segment != 0 {
             // Finalize the current segment if there's any data
             let segment = std::mem::take(&mut self.current_segment_builder).finalize();
-            if (!segment.keys.is_empty()) {
+            if !segment.keys.is_empty() {
                 self.finalized_xor_filters.add(segment).await?;
             }
         }
@@ -398,12 +398,12 @@ impl XorFilterCreator {
             writer.write_all(&bytes).await.context(IoSnafu)?;
 
             let size = bytes.len() as u64;
-            meta.xor_filter_locs.push(XorFilterLoc {
-                offset: meta.xor_filter_size as _,
+            meta.bloom_filter_locs.push(XorFilterLoc {
+                offset: meta.bloom_filter_size as _,
                 size,
                 element_count: segment.keys.len() as _,
             });
-            meta.xor_filter_size += size;
+            meta.bloom_filter_size += size;
         }
 
         let meta_bytes = meta.encode_to_vec();
@@ -485,23 +485,23 @@ mod tests {
         assert_eq!(meta.segment_count, 2);
         assert_eq!(meta.row_count, 3);
         assert_eq!(
-            meta.xor_filter_size as usize + meta_bytes.len() + 4,
+            meta.bloom_filter_size as usize + meta_bytes.len() + 4,
             total_size
         );
 
-        assert_eq!(meta.xor_filter_locs.len(), 2);
+        assert_eq!(meta.bloom_filter_locs.len(), 2);
 
         // Verify the XOR filters by reading their locations and deserializing
-        let xf0_bytes = &bytes[meta.xor_filter_locs[0].offset as usize
-            ..(meta.xor_filter_locs[0].offset + meta.xor_filter_locs[0].size) as usize];
+        let xf0_bytes = &bytes[meta.bloom_filter_locs[0].offset as usize
+            ..(meta.bloom_filter_locs[0].offset + meta.bloom_filter_locs[0].size) as usize];
         let xf0 = XorFilter::deserialize(xf0_bytes).unwrap();
         assert!(xf0.contains(1));
         assert!(xf0.contains(2));
         assert!(xf0.contains(3));
         assert!(xf0.contains(4));
 
-        let xf1_bytes = &bytes[meta.xor_filter_locs[1].offset as usize
-            ..(meta.xor_filter_locs[1].offset + meta.xor_filter_locs[1].size) as usize];
+        let xf1_bytes = &bytes[meta.bloom_filter_locs[1].offset as usize
+            ..(meta.bloom_filter_locs[1].offset + meta.bloom_filter_locs[1].size) as usize];
         let xf1 = XorFilter::deserialize(xf1_bytes).unwrap();
         assert!(xf1.contains(5));
         assert!(xf1.contains(6));
@@ -544,7 +544,7 @@ mod tests {
 
         // We should have 3 segments but only 2 unique XOR filters
         assert_eq!(meta.segment_count, 3);
-        assert_eq!(meta.xor_filter_locs.len(), 2);
+        assert_eq!(meta.bloom_filter_locs.len(), 2);
 
         // The third segment should point to the second XOR filter
         assert_eq!(meta.segment_loc_indices[2], 1);
@@ -580,16 +580,16 @@ mod tests {
         assert_eq!(meta.row_count, 3);
 
         // Verify the XOR filters by reading their locations and deserializing
-        let xf0_bytes = &bytes[meta.xor_filter_locs[0].offset as usize
-            ..(meta.xor_filter_locs[0].offset + meta.xor_filter_locs[0].size) as usize];
+        let xf0_bytes = &bytes[meta.bloom_filter_locs[0].offset as usize
+            ..(meta.bloom_filter_locs[0].offset + meta.bloom_filter_locs[0].size) as usize];
         let xf0 = XorFilter::deserialize(xf0_bytes).unwrap();
         assert!(xf0.contains(1));
         assert!(xf0.contains(2));
         assert!(xf0.contains(3));
         assert!(xf0.contains(4));
 
-        let xf1_bytes = &bytes[meta.xor_filter_locs[1].offset as usize
-            ..(meta.xor_filter_locs[1].offset + meta.xor_filter_locs[1].size) as usize];
+        let xf1_bytes = &bytes[meta.bloom_filter_locs[1].offset as usize
+            ..(meta.bloom_filter_locs[1].offset + meta.bloom_filter_locs[1].size) as usize];
         let xf1 = XorFilter::deserialize(xf1_bytes).unwrap();
         assert!(xf1.contains(5));
         assert!(xf1.contains(6));
@@ -627,9 +627,9 @@ mod tests {
         let mut found_1_2 = false;
         let mut found_3_4 = false;
 
-        for i in 0..meta.xor_filter_locs.len() {
-            let xf_bytes = &bytes[meta.xor_filter_locs[i].offset as usize
-                ..(meta.xor_filter_locs[i].offset + meta.xor_filter_locs[i].size) as usize];
+        for i in 0..meta.bloom_filter_locs.len() {
+            let xf_bytes = &bytes[meta.bloom_filter_locs[i].offset as usize
+                ..(meta.bloom_filter_locs[i].offset + meta.bloom_filter_locs[i].size) as usize];
             let xf = XorFilter::deserialize(xf_bytes).unwrap();
 
             if xf.contains(1) && xf.contains(2) {

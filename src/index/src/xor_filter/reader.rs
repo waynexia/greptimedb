@@ -17,177 +17,114 @@ use std::ops::Range;
 use async_trait::async_trait;
 use bytes::Bytes;
 use common_base::range_read::RangeReader;
-use greptime_proto::v1::index::{XorFilterLoc, XorFilterMeta};
-use prost::Message;
-use snafu::{ensure, ResultExt};
+use greptime_proto::v1::index::{BloomFilterLoc as XorFilterLoc, BloomFilterMeta as XorFilterMeta};
 
+use crate::common::reader::{FilterReader, FilterReaderImpl};
 use crate::xor_filter::error::*;
 use crate::xor_filter::XorFilter;
-
-/// Minimum size of the XOR filter, which is the size of the length of the XOR filter.
-const XOR_META_LEN_SIZE: u64 = 4;
 
 /// Default prefetch size of XOR filter meta.
 pub const DEFAULT_PREFETCH_SIZE: u64 = 8192; // 8KiB
 
 /// `XorFilterReader` reads the XOR filter from the file.
+/// 
+/// This trait provides backward compatibility with the existing XOR filter API
+/// while delegating to the common FilterReader implementation.
 #[async_trait]
 pub trait XorFilterReader: Sync {
     /// Reads range of bytes from the file.
     async fn range_read(&self, offset: u64, size: u32) -> Result<Bytes>;
 
     /// Reads bunch of ranges from the file.
-    async fn read_vec(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
-        let mut results = Vec::with_capacity(ranges.len());
-        for range in ranges {
-            let size = (range.end - range.start) as u32;
-            let data = self.range_read(range.start, size).await?;
-            results.push(data);
-        }
-        Ok(results)
-    }
+    async fn read_vec(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>>;
 
     /// Reads the meta information of the XOR filter.
     async fn metadata(&self) -> Result<XorFilterMeta>;
 
     /// Reads a XOR filter with the given location.
-    async fn xor_filter(&self, loc: &XorFilterLoc) -> Result<XorFilter> {
-        let bytes = self.range_read(loc.offset, loc.size as _).await?;
-        XorFilter::deserialize(&bytes)
-    }
+    async fn xor_filter(&self, loc: &XorFilterLoc) -> Result<XorFilter>;
 
-    async fn xor_filter_vec(&self, locs: &[XorFilterLoc]) -> Result<Vec<XorFilter>> {
-        let ranges = locs
-            .iter()
-            .map(|l| l.offset..l.offset + l.size)
-            .collect::<Vec<_>>();
-        let bss = self.read_vec(&ranges).await?;
-
-        let mut result = Vec::with_capacity(bss.len());
-        for bs in bss {
-            let filter = XorFilter::deserialize(&bs)?;
-            result.push(filter);
-        }
-
-        Ok(result)
-    }
+    /// Reads multiple XOR filters with the given locations.
+    async fn xor_filter_vec(&self, locs: &[XorFilterLoc]) -> Result<Vec<XorFilter>>;
 }
 
 /// `XorFilterReaderImpl` reads the XOR filter from the file.
+/// 
+/// This implementation delegates to the common FilterReaderImpl for shared functionality.
 pub struct XorFilterReaderImpl<R: RangeReader> {
-    /// The underlying reader.
-    reader: R,
+    /// The underlying generic reader.
+    inner: FilterReaderImpl<R, XorFilter>,
 }
 
 impl<R: RangeReader> XorFilterReaderImpl<R> {
     /// Creates a new `XorFilterReaderImpl` with the given reader.
     pub fn new(reader: R) -> Self {
-        Self { reader }
+        Self {
+            inner: FilterReaderImpl::new(reader),
+        }
     }
 }
 
 #[async_trait]
 impl<R: RangeReader> XorFilterReader for XorFilterReaderImpl<R> {
     async fn range_read(&self, offset: u64, size: u32) -> Result<Bytes> {
-        self.reader
-            .read(offset..offset + size as u64)
+        self.inner
+            .range_read(offset, size)
             .await
-            .context(IoSnafu)
+            .map_err(convert_common_error)
     }
 
     async fn read_vec(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
-        self.reader.read_vec(ranges).await.context(IoSnafu)
+        self.inner
+            .read_vec(ranges)
+            .await
+            .map_err(convert_common_error)
     }
 
     async fn metadata(&self) -> Result<XorFilterMeta> {
-        let metadata = self.reader.metadata().await.context(IoSnafu)?;
-        let file_size = metadata.content_length;
-
-        let mut meta_reader =
-            XorFilterMetaReader::new(&self.reader, file_size, Some(DEFAULT_PREFETCH_SIZE));
-        meta_reader.metadata().await
-    }
-}
-
-/// `XorFilterMetaReader` reads the metadata of the XOR filter.
-struct XorFilterMetaReader<R: RangeReader> {
-    reader: R,
-    file_size: u64,
-    prefetch_size: u64,
-}
-
-impl<R: RangeReader> XorFilterMetaReader<R> {
-    pub fn new(reader: R, file_size: u64, prefetch_size: Option<u64>) -> Self {
-        Self {
-            reader,
-            file_size,
-            prefetch_size: prefetch_size
-                .unwrap_or(XOR_META_LEN_SIZE)
-                .max(XOR_META_LEN_SIZE),
-        }
-    }
-
-    /// Reads the metadata of the XOR filter.
-    ///
-    /// It will first prefetch some bytes from the end of the file,
-    /// then parse the metadata from the prefetch bytes.
-    pub async fn metadata(&mut self) -> Result<XorFilterMeta> {
-        ensure!(
-            self.file_size >= XOR_META_LEN_SIZE,
-            FileSizeTooSmallSnafu {
-                size: self.file_size,
-            }
-        );
-
-        let meta_start = self.file_size.saturating_sub(self.prefetch_size);
-        let suffix = self
-            .reader
-            .read(meta_start..self.file_size)
+        self.inner
+            .metadata()
             .await
-            .context(IoSnafu)?;
-        let suffix_len = suffix.len();
-        let length = u32::from_le_bytes(Self::read_tailing_four_bytes(&suffix)?) as u64;
-        self.validate_meta_size(length)?;
+            .map_err(convert_common_error)
+    }
 
-        if length > suffix_len as u64 - XOR_META_LEN_SIZE {
-            let metadata_start = self.file_size - length - XOR_META_LEN_SIZE;
-            let meta = self
-                .reader
-                .read(metadata_start..self.file_size - XOR_META_LEN_SIZE)
-                .await
-                .context(IoSnafu)?;
-            XorFilterMeta::decode(meta).context(DecodeProtoSnafu)
-        } else {
-            let metadata_start = self.file_size - length - XOR_META_LEN_SIZE - meta_start;
-            let meta = &suffix[metadata_start as usize..suffix_len - XOR_META_LEN_SIZE as usize];
-            XorFilterMeta::decode(meta).context(DecodeProtoSnafu)
+    async fn xor_filter(&self, loc: &XorFilterLoc) -> Result<XorFilter> {
+        self.inner
+            .filter(loc)
+            .await
+            .map_err(convert_common_error)
+    }
+
+    async fn xor_filter_vec(&self, locs: &[XorFilterLoc]) -> Result<Vec<XorFilter>> {
+        self.inner
+            .filter_vec(locs)
+            .await
+            .map_err(convert_common_error)
+    }
+}
+
+/// Helper function to convert common filter errors to XOR filter errors
+fn convert_common_error(e: crate::common::CommonFilterError) -> Error {
+    match e {
+        crate::common::CommonFilterError::Io { error, location } => Error::Io { error, location },
+        crate::common::CommonFilterError::FileSizeTooSmall { size, location } => {
+            Error::FileSizeTooSmall { size, location }
         }
-    }
-
-    fn read_tailing_four_bytes(suffix: &[u8]) -> Result<[u8; 4]> {
-        let suffix_len = suffix.len();
-        ensure!(
-            suffix_len >= 4,
-            FileSizeTooSmallSnafu {
-                size: suffix_len as u64
-            }
-        );
-        let mut bytes = [0; 4];
-        bytes.copy_from_slice(&suffix[suffix_len - 4..suffix_len]);
-
-        Ok(bytes)
-    }
-
-    fn validate_meta_size(&self, length: u64) -> Result<()> {
-        let max_meta_size = self.file_size - XOR_META_LEN_SIZE;
-        ensure!(
-            length <= max_meta_size,
-            UnexpectedMetaSizeSnafu {
-                max_meta_size,
-                actual_meta_size: length,
-            }
-        );
-        Ok(())
+        crate::common::CommonFilterError::UnexpectedMetaSize { max_meta_size, actual_meta_size, location } => {
+            Error::UnexpectedMetaSize { max_meta_size, actual_meta_size, location }
+        }
+        crate::common::CommonFilterError::DecodeProto { error, location } => {
+            Error::DecodeProto { error, location }
+        }
+        crate::common::CommonFilterError::InvalidIntermediateMagic { invalid, location } => {
+            Error::InvalidIntermediateMagic { invalid, location }
+        }
+        crate::common::CommonFilterError::Intermediate { source, location } => {
+            Error::Intermediate { source, location }
+        }
+        crate::common::CommonFilterError::External { source, location } => {
+            Error::External { source, location }
+        }
     }
 }
 
@@ -200,7 +137,6 @@ mod tests {
 
     use super::*;
     use crate::external_provider::MockExternalTempFileProvider;
-    use crate::value_hasher::ArrayValueHasher;
     use crate::xor_filter::creator::{XorFilterCreator, XorFilterSegmentBuilder};
 
     async fn mock_xor_filter_bytes() -> Vec<u8> {
@@ -235,23 +171,23 @@ mod tests {
     #[tokio::test]
     async fn test_xor_filter_meta_reader() {
         let bytes = mock_xor_filter_bytes().await;
-        let file_size = bytes.len() as u64;
 
-        for prefetch in [0u64, file_size / 2, file_size, file_size + 10] {
-            let mut reader =
-                XorFilterMetaReader::new(bytes.clone(), file_size as _, Some(prefetch));
-            let meta = reader.metadata().await.unwrap();
+        // Test the metadata reading functionality through XorFilterReaderImpl
+        let reader = XorFilterReaderImpl::new(bytes);
+        let meta = reader.metadata().await.unwrap();
 
-            assert_eq!(meta.rows_per_segment, 2);
-            assert_eq!(meta.segment_count, 3);
-            assert_eq!(meta.row_count, 3);
-            assert_eq!(meta.xor_filter_locs.len(), 3);
+        assert_eq!(meta.rows_per_segment, 2);
+        assert_eq!(meta.segment_count, 3);
+        assert_eq!(meta.row_count, 3);
+        assert_eq!(meta.bloom_filter_locs.len(), 3);
 
-            assert_eq!(meta.xor_filter_locs[0].offset, 0);
-            assert_eq!(meta.xor_filter_locs[0].element_count, 2);
-            assert_eq!(meta.xor_filter_locs[1].offset, meta.xor_filter_locs[0].size);
-            assert_eq!(meta.xor_filter_locs[1].element_count, 2);
-        }
+        assert_eq!(meta.bloom_filter_locs[0].offset, 0);
+        assert_eq!(meta.bloom_filter_locs[0].element_count, 2);
+        assert_eq!(
+            meta.bloom_filter_locs[1].offset,
+            meta.bloom_filter_locs[0].size
+        );
+        assert_eq!(meta.bloom_filter_locs[1].element_count, 2);
     }
 
     #[tokio::test]
@@ -261,16 +197,16 @@ mod tests {
         let reader = XorFilterReaderImpl::new(bytes);
         let meta = reader.metadata().await.unwrap();
 
-        assert_eq!(meta.xor_filter_locs.len(), 3);
-        let xf = reader.xor_filter(&meta.xor_filter_locs[0]).await.unwrap();
+        assert_eq!(meta.bloom_filter_locs.len(), 3);
+        let xf = reader.xor_filter(&meta.bloom_filter_locs[0]).await.unwrap();
         assert!(xf.contains(1));
         assert!(xf.contains(2));
 
-        let xf = reader.xor_filter(&meta.xor_filter_locs[1]).await.unwrap();
+        let xf = reader.xor_filter(&meta.bloom_filter_locs[1]).await.unwrap();
         assert!(xf.contains(3));
         assert!(xf.contains(4));
 
-        let xf = reader.xor_filter(&meta.xor_filter_locs[2]).await.unwrap();
+        let xf = reader.xor_filter(&meta.bloom_filter_locs[2]).await.unwrap();
         assert!(xf.contains(5));
         assert!(xf.contains(6));
     }
