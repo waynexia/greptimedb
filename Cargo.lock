@@ -6107,7 +6107,7 @@ name = "index"
 version = "0.16.0"
 dependencies = [
  "ahash 0.8.11",
- "arrow-array",
+ "arrow-array 54.2.1",
  "async-trait",
  "asynchronous-codec",
  "bincode",
@@ -14976,7 +14976,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf24c008fe464f5d8f58b8d16a1ab7e930bd73b2a6933ff8704c414b2bed7f92"
 dependencies = [
  "libm",
- "rand",
+ "rand 0.8.5",
  "serde",
 ]
 
