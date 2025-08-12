@@ -22,14 +22,13 @@ use common_meta::key::table_route::{PhysicalTableRouteValue, TableRouteManager};
 use common_meta::kv_backend::KvBackendRef;
 use common_meta::peer::Peer;
 use common_meta::rpc::router::{self, RegionRoute};
-use snafu::{ensure, OptionExt, ResultExt};
+use snafu::{OptionExt, ResultExt};
 use store_api::metric_engine_consts::LOGICAL_TABLE_METADATA_KEY;
 use store_api::storage::{RegionId, RegionNumber};
 use table::metadata::{TableId, TableInfo};
 
 use crate::error::{
-    FindLeaderSnafu, FindTableRoutesSnafu, Result, TableRouteManagerSnafu, TableRouteNotFoundSnafu,
-    UnexpectedSnafu,
+    FindLeaderSnafu, Result, TableRouteManagerSnafu, TableRouteNotFoundSnafu, UnexpectedSnafu,
 };
 use crate::expr::PartitionExpr;
 use crate::multi_dim::MultiDimPartitionRule;
@@ -126,28 +125,62 @@ impl PartitionRuleManager {
     }
 
     pub async fn find_table_partitions(&self, table_id: TableId) -> Result<Vec<PartitionInfo>> {
-        let region_routes = &self
-            .find_physical_table_route(table_id)
-            .await?
-            .region_routes;
-        ensure!(!region_routes.is_empty(), FindTableRoutesSnafu { table_id });
-
-        create_partitions_from_region_routes(table_id, region_routes)
+        let mut batch_results = self.batch_find_table_partitions(&[table_id]).await?;
+        batch_results.remove(&table_id).ok_or_else(|| {
+            UnexpectedSnafu {
+                err_msg: format!("Failed to find partitions for table {}", table_id),
+            }
+            .build()
+        })
     }
 
     pub async fn batch_find_table_partitions(
         &self,
         table_ids: &[TableId],
     ) -> Result<HashMap<TableId, Vec<PartitionInfo>>> {
-        let batch_region_routes = self.batch_find_region_routes(table_ids).await?;
+        // Batch lookup all table routes to classify logical vs physical
+        let mut logical_table_ids = Vec::new();
+        let mut physical_table_ids = Vec::new();
+
+        for &table_id in table_ids {
+            let table_route = self
+                .table_route_cache
+                .get(table_id)
+                .await
+                .context(TableRouteManagerSnafu)?
+                .context(TableRouteNotFoundSnafu { table_id })?;
+
+            match table_route.as_ref() {
+                TableRoute::Logical(_) => logical_table_ids.push(table_id),
+                TableRoute::Physical(_) => physical_table_ids.push(table_id),
+            }
+        }
 
         let mut results = HashMap::with_capacity(table_ids.len());
 
-        for (table_id, region_routes) in batch_region_routes {
-            results.insert(
-                table_id,
-                create_partitions_from_region_routes(table_id, &region_routes)?,
-            );
+        // Handle physical tables with existing batch logic
+        if !physical_table_ids.is_empty() {
+            let batch_region_routes = self.batch_find_region_routes(&physical_table_ids).await?;
+            for (table_id, region_routes) in batch_region_routes {
+                let partitions = create_partitions_from_region_routes(table_id, &region_routes)?;
+                results.insert(table_id, partitions);
+            }
+        }
+
+        //  Handle logical tables individually (must fetch TableInfo)
+        for logical_table_id in logical_table_ids {
+            let logical_table_info = self.get_table_info(logical_table_id).await?;
+            let physical_table_id = self.get_physical_table_id(&logical_table_info).await?;
+
+            // Get physical table's partitions directly (avoid recursion)
+            let region_routes = &self
+                .find_physical_table_route(physical_table_id)
+                .await?
+                .region_routes;
+
+            // Create partitions with logical table ID (maintains existing semantics)
+            let partitions = create_partitions_from_region_routes(logical_table_id, region_routes)?;
+            results.insert(logical_table_id, partitions);
         }
 
         Ok(results)
