@@ -22,13 +22,14 @@ use common_meta::key::table_route::{PhysicalTableRouteValue, TableRouteManager};
 use common_meta::kv_backend::KvBackendRef;
 use common_meta::peer::Peer;
 use common_meta::rpc::router::{self, RegionRoute};
-use snafu::{OptionExt, ResultExt};
+use snafu::{ensure, OptionExt, ResultExt};
 use store_api::metric_engine_consts::LOGICAL_TABLE_METADATA_KEY;
 use store_api::storage::{RegionId, RegionNumber};
 use table::metadata::{TableId, TableInfo};
 
 use crate::error::{
-    FindLeaderSnafu, Result, TableRouteManagerSnafu, TableRouteNotFoundSnafu, UnexpectedSnafu,
+    FindLeaderSnafu, FindTableRoutesSnafu, Result, TableRouteManagerSnafu, TableRouteNotFoundSnafu,
+    UnexpectedSnafu,
 };
 use crate::expr::PartitionExpr;
 use crate::multi_dim::MultiDimPartitionRule;
@@ -124,22 +125,26 @@ impl PartitionRuleManager {
         Ok(table_region_routes)
     }
 
+    /// Fetch partitions for a single table.
+    ///
+    /// Will return physical table partitions for logical tables.
     pub async fn find_table_partitions(&self, table_id: TableId) -> Result<Vec<PartitionInfo>> {
-        let mut batch_results = self.batch_find_table_partitions(&[table_id]).await?;
-        batch_results.remove(&table_id).ok_or_else(|| {
-            UnexpectedSnafu {
-                err_msg: format!("Failed to find partitions for table {}", table_id),
-            }
-            .build()
-        })
+        let region_routes = &self
+            .find_physical_table_route(table_id)
+            .await?
+            .region_routes;
+        ensure!(!region_routes.is_empty(), FindTableRoutesSnafu { table_id });
+
+        create_partitions_from_region_routes(table_id, region_routes)
     }
 
+    /// Fetch partitions for multiple tables in one batch.
+    ///
+    /// Will return physical table partitions for logical tables.
     pub async fn batch_find_table_partitions(
         &self,
         table_ids: &[TableId],
     ) -> Result<HashMap<TableId, Vec<PartitionInfo>>> {
-        // Ultra-optimized: batch_find_region_routes already handles logical->physical mapping,
-        // deduplication, and preserves original table IDs in results
         let batch_region_routes = self.batch_find_region_routes(table_ids).await?;
         let mut results = HashMap::with_capacity(batch_region_routes.len());
 
