@@ -138,49 +138,14 @@ impl PartitionRuleManager {
         &self,
         table_ids: &[TableId],
     ) -> Result<HashMap<TableId, Vec<PartitionInfo>>> {
-        // Batch lookup all table routes to classify logical vs physical
-        let mut logical_table_ids = Vec::new();
-        let mut physical_table_ids = Vec::new();
+        // Ultra-optimized: batch_find_region_routes already handles logical->physical mapping,
+        // deduplication, and preserves original table IDs in results
+        let batch_region_routes = self.batch_find_region_routes(table_ids).await?;
+        let mut results = HashMap::with_capacity(batch_region_routes.len());
 
-        for &table_id in table_ids {
-            let table_route = self
-                .table_route_cache
-                .get(table_id)
-                .await
-                .context(TableRouteManagerSnafu)?
-                .context(TableRouteNotFoundSnafu { table_id })?;
-
-            match table_route.as_ref() {
-                TableRoute::Logical(_) => logical_table_ids.push(table_id),
-                TableRoute::Physical(_) => physical_table_ids.push(table_id),
-            }
-        }
-
-        let mut results = HashMap::with_capacity(table_ids.len());
-
-        // Handle physical tables with existing batch logic
-        if !physical_table_ids.is_empty() {
-            let batch_region_routes = self.batch_find_region_routes(&physical_table_ids).await?;
-            for (table_id, region_routes) in batch_region_routes {
-                let partitions = create_partitions_from_region_routes(table_id, &region_routes)?;
-                results.insert(table_id, partitions);
-            }
-        }
-
-        //  Handle logical tables individually (must fetch TableInfo)
-        for logical_table_id in logical_table_ids {
-            let logical_table_info = self.get_table_info(logical_table_id).await?;
-            let physical_table_id = self.get_physical_table_id(&logical_table_info).await?;
-
-            // Get physical table's partitions directly (avoid recursion)
-            let region_routes = &self
-                .find_physical_table_route(physical_table_id)
-                .await?
-                .region_routes;
-
-            // Create partitions with logical table ID (maintains existing semantics)
-            let partitions = create_partitions_from_region_routes(logical_table_id, region_routes)?;
-            results.insert(logical_table_id, partitions);
+        for (table_id, region_routes) in batch_region_routes {
+            let partitions = create_partitions_from_region_routes(table_id, &region_routes)?;
+            results.insert(table_id, partitions);
         }
 
         Ok(results)
