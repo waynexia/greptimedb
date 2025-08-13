@@ -669,16 +669,24 @@ async fn open_all_regions(
             ignore_nonexistent_region,
         )
         .await?;
-    ensure!(
-        open_regions.len() == num_regions,
-        error::UnexpectedSnafu {
-            violated: format!(
-                "Expected to open {} of regions, only {} of regions has opened",
-                num_regions,
-                open_regions.len()
-            )
-        }
-    );
+    if !ignore_nonexistent_region {
+        ensure!(
+            open_regions.len() == num_regions,
+            error::UnexpectedSnafu {
+                violated: format!(
+                    "Expected to open {} of regions, only {} of regions has opened",
+                    num_regions,
+                    open_regions.len()
+                )
+            }
+        );
+    } else if open_regions.len() != num_regions {
+        warn!(
+            "ignore nonexistent region, expected to open {} of regions, only {} of regions has opened",
+            num_regions,
+            open_regions.len()
+        );
+    }
 
     for region_id in open_regions {
         if open_with_writable {
@@ -697,6 +705,7 @@ async fn open_all_regions(
             follower_regions.len()
         );
         let mut region_requests = Vec::with_capacity(follower_regions.len());
+        let num_regions = follower_regions.len();
         for (region_id, engine, store_path, options) in follower_regions {
             let table_dir = table_dir(&store_path, region_id.table_id());
             region_requests.push((
@@ -719,16 +728,24 @@ async fn open_all_regions(
             )
             .await?;
 
-        ensure!(
-            open_regions.len() == num_regions,
-            error::UnexpectedSnafu {
-                violated: format!(
-                    "Expected to open {} of follower regions, only {} of regions has opened",
-                    num_regions,
-                    open_regions.len()
-                )
-            }
-        );
+        if !ignore_nonexistent_region {
+            ensure!(
+                open_regions.len() == num_regions,
+                error::UnexpectedSnafu {
+                    violated: format!(
+                        "Expected to open {} of follower regions, only {} of regions has opened",
+                        num_regions,
+                        open_regions.len()
+                    )
+                }
+            );
+        } else if open_regions.len() != num_regions {
+            warn!(
+                "ignore nonexistent region, expected to open {} of follower regions, only {} of regions has opened",
+                num_regions,
+                open_regions.len()
+            );
+        }
     }
 
     info!("all regions are opened");

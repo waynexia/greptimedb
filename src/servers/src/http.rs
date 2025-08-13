@@ -1051,6 +1051,10 @@ impl HttpServer {
                 routing::get(handler::sql_parse).post(handler::sql_parse),
             )
             .route(
+                "/sql/format",
+                routing::get(handler::sql_format).post(handler::sql_format),
+            )
+            .route(
                 "/promql",
                 routing::get(handler::promql).post(handler::promql),
             )
@@ -1268,6 +1272,7 @@ mod test {
     use query::parser::PromQuery;
     use query::query_engine::DescribeResult;
     use session::context::QueryContextRef;
+    use sql::statements::statement::Statement;
     use tokio::sync::mpsc;
     use tokio::time::Instant;
 
@@ -1298,6 +1303,7 @@ mod test {
 
         async fn do_exec_plan(
             &self,
+            _stmt: Option<Statement>,
             _plan: LogicalPlan,
             _query_ctx: QueryContextRef,
         ) -> std::result::Result<Output, Self::Error> {

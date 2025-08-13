@@ -15,6 +15,7 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::str::FromStr;
+use std::time::Duration;
 
 use api::prom_store::remote::label_matcher::Type as MatcherType;
 use api::prom_store::remote::{
@@ -23,8 +24,13 @@ use api::prom_store::remote::{
 use auth::user_provider_from_option;
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use chrono::Utc;
-use common_catalog::consts::{trace_services_table_name, TRACE_TABLE_NAME};
+use common_catalog::consts::{
+    trace_services_table_name, DEFAULT_PRIVATE_SCHEMA_NAME, TRACE_TABLE_NAME,
+};
 use common_error::status_code::StatusCode as ErrorCode;
+use common_frontend::slow_query_event::{
+    SLOW_QUERY_TABLE_NAME, SLOW_QUERY_TABLE_QUERY_COLUMN_NAME,
+};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use log_query::{Context, Limit, LogQuery, TimeFilter};
@@ -55,6 +61,7 @@ use tests_integration::test_util::{
     setup_test_http_app_with_frontend_and_user_provider, setup_test_prom_app_with_frontend,
     StorageType,
 };
+use urlencoding::encode;
 use yaml_rust::YamlLoader;
 
 #[macro_export]
@@ -88,6 +95,7 @@ macro_rules! http_tests {
 
                 test_http_auth,
                 test_sql_api,
+                test_http_sql_slow_query,
                 test_prometheus_promql_api,
                 test_prom_http_api,
                 test_metrics_api,
@@ -539,6 +547,75 @@ pub async fn test_sql_api(store_type: StorageType) {
         .text()
         .await;
     assert!(res.contains("TIME_ZONE") && res.contains("UTC"));
+    guard.remove_all().await;
+}
+
+#[tokio::test]
+async fn test_sql_format_api() {
+    let (app, mut guard) =
+        setup_test_http_app_with_frontend(StorageType::File, "sql_format_api").await;
+    let client = TestClient::new(app).await;
+
+    // missing sql
+    let res = client.get("/v1/sql/format").send().await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    let body = serde_json::from_str::<ErrorResponse>(&res.text().await).unwrap();
+    assert_eq!(body.code(), 1004);
+    assert_eq!(body.error(), "sql parameter is required.");
+
+    // with sql
+    let res = client
+        .get("/v1/sql/format?sql=select%201%20as%20x")
+        .send()
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let json: serde_json::Value = serde_json::from_str(&res.text().await).unwrap();
+    let formatted = json
+        .get("formatted")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert_eq!(formatted, "SELECT 1 AS x;");
+
+    // complex query
+    let complex_query = "WITH RECURSIVE slow_cte AS (SELECT 1 AS n, md5(random()) AS hash UNION ALL SELECT n + 1, md5(concat(hash, n)) FROM slow_cte WHERE n < 4500) SELECT COUNT(*) FROM slow_cte";
+    let encoded_complex_query = encode(complex_query);
+
+    let query_params = format!("/v1/sql/format?sql={encoded_complex_query}");
+    let res = client.get(&query_params).send().await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let json: serde_json::Value = serde_json::from_str(&res.text().await).unwrap();
+    let formatted = json
+        .get("formatted")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert_eq!(formatted, "WITH RECURSIVE slow_cte AS (SELECT 1 AS n, md5(random()) AS hash UNION ALL SELECT n + 1, md5(concat(hash, n)) FROM slow_cte WHERE n < 4500) SELECT COUNT(*) FROM slow_cte;");
+
+    guard.remove_all().await;
+}
+
+pub async fn test_http_sql_slow_query(store_type: StorageType) {
+    let (app, mut guard) = setup_test_http_app_with_frontend(store_type, "sql_api").await;
+    let client = TestClient::new(app).await;
+
+    let slow_query = "WITH RECURSIVE slow_cte AS (SELECT 1 AS n, md5(random()) AS hash UNION ALL SELECT n + 1, md5(concat(hash, n)) FROM slow_cte WHERE n < 4500) SELECT COUNT(*) FROM slow_cte";
+    let encoded_slow_query = encode(slow_query);
+
+    let query_params = format!("/v1/sql?sql={encoded_slow_query}");
+    let res = client.get(&query_params).send().await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Wait for the slow query to be recorded.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let table = format!("{}.{}", DEFAULT_PRIVATE_SCHEMA_NAME, SLOW_QUERY_TABLE_NAME);
+    let query = format!("SELECT {} FROM {table}", SLOW_QUERY_TABLE_QUERY_COLUMN_NAME);
+
+    let expected = format!(r#"[["{}"]]"#, slow_query);
+    validate_data("test_http_sql_slow_query", &client, &query, &expected).await;
+
     guard.remove_all().await;
 }
 
@@ -1240,6 +1317,7 @@ experimental_frontend_scan_timeout = "30s"
 experimental_frontend_activity_timeout = "1m"
 experimental_max_filter_num_per_query = 20
 experimental_time_window_merge_threshold = 3
+read_preference = "Leader"
 
 [logging]
 max_log_files = 720
@@ -1305,9 +1383,9 @@ write_interval = "30s"
 [slow_query]
 enable = true
 record_type = "system_table"
-threshold = "30s"
+threshold = "1s"
 sample_ratio = 1.0
-ttl = "30d"
+ttl = "2months 29days 2h 52m 48s"
 
 [query]
 parallelism = 0
@@ -4980,7 +5058,7 @@ pub async fn test_log_query(store_type: StorageType) {
             fetch: Some(1),
         },
         columns: vec!["ts".to_string(), "message".to_string()],
-        filters: vec![],
+        filters: Default::default(),
         context: Context::None,
         exprs: vec![],
     };
